@@ -5,7 +5,7 @@ import random
 from random import randint
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from flask import Flask, request, redirect
+from flask import Flask, request, redirect,app
 import threading
 import aiohttp
 import asyncio
@@ -75,14 +75,16 @@ async def fetch_lyric(ctx, *, song_name: str):
     await ctx.reply(lyric)
 
 #——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+'''
 #Spotify模块
 # Spotify API认证
 app = Flask(__name__)
 sp_oauth = SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
                         client_secret=config['SPOTIPY_CLIENT_SECRET'],
                         redirect_uri=config['SPOTIPY_REDIRECT_URI'],
-                        scope="user-library-read")
-token_info = None
+                        #scope="user-library-read")
+                        scope='playlist-modify-private user-modify-playback-state')
+token_info = sp_oauth.get_cached_token()
 #Flask服务器
 @app.route('/')
 def index():
@@ -111,23 +113,115 @@ def get_spotify_token():
         response = input("请输入重定向后的URL: ")
         code = sp_oauth.parse_response_code(response)
         token_info = sp_oauth.get_access_token(code)
+        
     return token_info['access_token']
+
 # 获取Spotify API客户端
 token = get_spotify_token()
-sp = spotipy.Spotify(auth=token)
+#sp = spotipy.Spotify(auth=token)
+spotify = spotipy.Spotify(auth=token_info['access_token'])
 #Spotofy机器人
-@bot.command(name='play')
-async def play_song(ctx: Message, *, song_name: str):
-    results = sp.search(q=song_name, type='track', limit=1)
-    if results['tracks']['items']:
-        track = results['tracks']['items'][0]
-        track_name = track['name']
-        track_artists = ', '.join(artist['name'] for artist in track['artists'])
-        track_url = track['external_urls']['spotify']
-        response = f"正在播放: {track_name} - {track_artists}\n{track_url}"
+#@bot.command(name='play')
+#async def play_song(ctx: Message, *, song_name: str):
+    #results = sp.search(q=song_name, type='track', limit=1)
+    #if results['tracks']['items']:
+        #track = results['tracks']['items'][0]
+        #track_name = track['name']
+        #track_artists = ', '.join(artist['name'] for artist in track['artists'])
+        #track_url = track['external_urls']['spotify']
+        #response = f"正在播放: {track_name} - {track_artists}\n{track_url}"
+    #else:
+        #response = "未找到相关歌曲"
+    #await ctx.reply(response)
+
+
+
+#添加播放队列
+@bot.command(name='music')
+async def music_cmd(msg: Message, *, song_name: str):
+    results = spotify.search(q=song_name, limit=1, type='track')
+    tracks = results['tracks']['items']
+    
+    if tracks:
+        track_uri = tracks[0]['uri']
+        spotify.add_to_queue(track_uri)
+        await msg.reply(f'已将 {tracks[0]["name"]} 添加到播放队列。')
     else:
-        response = "未找到相关歌曲"
-    await ctx.reply(response)
+        await msg.reply('未找到相关歌曲。')
+'''
+
+
+
+app = Flask(__name__)
+
+sp_oauth = SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
+                        client_secret=config['SPOTIPY_CLIENT_SECRET'],
+                        redirect_uri=config['SPOTIPY_REDIRECT_URI'],
+                        scope='playlist-modify-private user-modify-playback-state')
+
+token_info = sp_oauth.get_cached_token()
+
+@app.route('/')
+def index():
+    auth_url = sp_oauth.get_authorize_url()
+    return redirect(auth_url)
+
+@app.route('/callback')
+def callback():
+    global token_info
+    code = request.args.get('code')
+    token_info = sp_oauth.get_access_token(code)
+    return "授权成功，您可以关闭此窗口。"
+
+def start_server():
+    app.run(port=8888)
+
+# 启动 Flask 服务器
+threading.Thread(target=start_server).start()
+
+# 等待用户完成 OAuth 流程
+while token_info is None:
+    pass
+
+spotify = spotipy.Spotify(auth=token_info['access_token'])
+
+# 以下是 Kook 机器人的代码
+@bot.command(name='play')
+async def music_cmd(msg: Message, *args):
+    if len(args) == 0:
+        await msg.reply('请输入歌曲名称。')
+        return
+    song_name = ' '.join(args)  # 合并所有参数作为歌曲名称
+    
+    results = spotify.search(q=song_name, limit=1, type='track')
+    tracks = results['tracks']['items']
+    
+    if tracks:
+        track_uri = tracks[0]['uri']
+        spotify.add_to_queue(track_uri)
+        await msg.reply(f'已将 {tracks[0]["name"]} 添加到播放队列。')
+    else:
+        await msg.reply('未找到相关歌曲。')
+
+@bot.command(name='next')
+async def next_cmd(msg: Message):
+    try:
+        spotify.next_track()
+        await msg.reply('已切到下一首歌。')
+    except Exception as e:
+        await msg.reply(f'切换下一首歌时出错: {e}')
+
+
+@bot.command(name='pause')
+async def pause_cmd(msg: Message):
+    try:
+        spotify.pause_playback()
+        await msg.reply('已暂停播放。')
+    except Exception as e:
+        await msg.reply(f'暂停播放时出错: {e}')
+
+
+
 
 
 
@@ -175,6 +269,11 @@ async def join_guild_send_event(b: Bot, e: Event):
         print(f"ch.send | msg_id {ret['msg_id']}")  # 刚刚发送消息的id
     except Exception as result:
         print(traceback.format_exc())  # 打印报错详细信息
+
+
+
+
+
 
 
 
