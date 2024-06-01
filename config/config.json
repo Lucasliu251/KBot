@@ -1,0 +1,8 @@
+{
+    "token": "1/MzAwNzY=/EmaNTHQDWKvQOnK1FOvqWA==",
+    "verify_token": "",
+    "encrypt_key": "",
+    "SPOTIPY_CLIENT_ID": "715605c71a9746289a8be9b308776f9d",
+    "SPOTIPY_CLIENT_SECRET" : "835dc94bcfb643168537a774df69095b",
+    "SPOTIPY_REDIRECT_URI" : "http://localhost:8888/callback"
+}
