@@ -3,24 +3,28 @@ import traceback
 from khl import *
 import random
 from random import randint
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-from flask import Flask, request, redirect,app
+from spotipy import oauth2, Spotify
+from spotipy.oauth2 import SpotifyOAuth,SpotifyOauthError
+from flask import Flask, request, redirect,app,session,jsonify
 import threading
 import aiohttp
 import asyncio
+import logging
+import time
+import os
 #import PyOfficeRobot
 
 
 
 
 # 用 json 读取 config.json，装载到 config 里
-with open('D:\Develop\project\WeChat 2 KOOK\config\config.json', 'r', encoding='utf-8') as f:
+with open(r'C:\Users\Administrator\Desktop\KooK_Bot\config\config.json', 'r', encoding='utf-8') as f:
     config = json.load(f)
 
 # init Bot
 KOOKtoken=config['token']
 bot = Bot(KOOKtoken)
+
 
 #投骰子模块
 @bot.command(name='投骰子')
@@ -152,14 +156,33 @@ async def music_cmd(msg: Message, *, song_name: str):
 
 
 
+# 设置日志记录
+#logging.basicConfig(level=logging.DEBUG)
+
+# Flask 服务器部分
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['SESSION_COOKIE_NAME'] = 'spotify-login-session'
 
-sp_oauth = SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
-                        client_secret=config['SPOTIPY_CLIENT_SECRET'],
-                        redirect_uri=config['SPOTIPY_REDIRECT_URI'],
-                        scope='playlist-modify-private user-modify-playback-state')
+sp_oauth = oauth2.SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
+                               client_secret=config['SPOTIPY_CLIENT_SECRET'],
+                               redirect_uri=config['SPOTIPY_REDIRECT_URI'],
+                               scope='user-read-private user-read-email playlist-modify-private user-modify-playback-state user-read-playback-state user-read-currently-playing')
 
-token_info = sp_oauth.get_cached_token()
+
+global_token_info = None
+
+def get_token():
+    global global_token_info
+    token_info = global_token_info
+    if not token_info:
+        return None
+    now = int(time.time())
+    is_expired = token_info['expires_at'] - now < 60
+    if is_expired:
+        token_info = sp_oauth.refresh_access_token(token_info['refresh_token'])
+        global_token_info = token_info
+    return token_info
 
 @app.route('/')
 def index():
@@ -168,22 +191,45 @@ def index():
 
 @app.route('/callback')
 def callback():
-    global token_info
+    global global_token_info
     code = request.args.get('code')
     token_info = sp_oauth.get_access_token(code)
+    global_token_info = token_info
     return "授权成功，您可以关闭此窗口。"
 
+@app.route('/get_token')
+def get_token_endpoint():
+    token_info = get_token()
+    if not token_info:
+        return "Token not available", 401
+    return jsonify(token_info)
+
 def start_server():
-    app.run(port=8888)
+    app.run(port=8888, debug=False)
 
 # 启动 Flask 服务器
 threading.Thread(target=start_server).start()
 
 # 等待用户完成 OAuth 流程
-while token_info is None:
-    pass
+while not global_token_info:
+    time.sleep(1)
 
-spotify = spotipy.Spotify(auth=token_info['access_token'])
+token_info = get_token()
+spotify = Spotify(auth=token_info['access_token'])
+
+def check_and_play_next():
+    try:
+        playback = spotify.current_playback()
+        if playback is None or not playback['is_playing']:
+            spotify.start_playback()
+            time.sleep(1)  # 等待播放开始
+            spotify.next_track()
+            logging.info("已开始播放并跳到下一首歌")
+        else:
+            logging.info("当前正在播放")
+    except Exception as e:
+        logging.error(f"检查播放状态时出错: {e}")
+
 
 # 以下是 Kook 机器人的代码
 @bot.command(name='play')
@@ -200,6 +246,7 @@ async def music_cmd(msg: Message, *args):
         track_uri = tracks[0]['uri']
         spotify.add_to_queue(track_uri)
         await msg.reply(f'已将 {tracks[0]["name"]} 添加到播放队列。')
+        check_and_play_next()   #检查是否播放
     else:
         await msg.reply('未找到相关歌曲。')
 
@@ -232,15 +279,32 @@ async def pause_cmd(msg: Message):
     #user = await b.fetch_public_channel(event.body['user_id'])
     #await b.reply(player+'进入了'+channel)
 
+
+
 #用户加入kook频道
 @bot.on_event(EventTypes.JOINED_CHANNEL)
 async def join_guild_send_event(b: Bot, e: Event):
     try:
-        print("user join channel", e.body)  # 用户加入了服务器
+        print("用户加入频道", e.body)  # 用户加入了服务器
         ch = await bot.client.fetch_public_channel("2506365885049703")  # 获取指定文字频道的对象
-        # 发送信息
         user_id = e.body['user_id']
         channel_id = e.body['channel_id']
+        guild_id = 84273090
+
+
+        # API请求信息
+        async def get_user_roles(user_id):
+            async with aiohttp.ClientSession() as session:
+                headers = {
+                    'Authorization': f'Bot {KOOKtoken}',
+                }
+                async with session.get(f'https://www.kookapp.cn/api/v3/user/view?user_id={user_id}', headers=headers) as response:
+                    if response.status == 200:
+                        user_info = await response.json()
+                        return user_info['data']['bot']  # 返回用户的角色ID列表
+                    else:
+                        return None
+        
         async def get_user_info(user_id):
             async with aiohttp.ClientSession() as session:
                 headers = {
@@ -263,10 +327,25 @@ async def join_guild_send_event(b: Bot, e: Event):
                         return channel_info['data']['name']
                     else:
                         return None
+                    
+
+        # 检测机器人信息
+        roles = await get_user_roles(user_id)
+        bot_roles_id = 21418851     #服务器角色“机器人”
+
+        # 检查用户是否为机器人，假设"机器人"角色的ID为12345
+        if roles:  # 如果用户为"机器人"
+            print(f"用户 {user_id} 是机器人，跳过通知")
+            return
+
+        # 获取用户名和频道名
         nickname = await get_user_info(user_id)
         channelname = await get_channel_info(channel_id)
-        ret = await ch.send(nickname+"加入"+channelname) 
+        
+        # 发送欢迎消息
+        ret = await ch.send(nickname + " 加入了 " + channelname)
         print(f"ch.send | msg_id {ret['msg_id']}")  # 刚刚发送消息的id
+
     except Exception as result:
         print(traceback.format_exc())  # 打印报错详细信息
 
@@ -513,6 +592,7 @@ async def action(event: Message, action: str):
 
 
 bot.run()
+print('微信监控上线')
 #机器人下线
 @bot.command(name='下线')
 async def offline():
