@@ -22,7 +22,10 @@ def read_data_file(file_path):
         'rank': [],
         'nickname': [],
         'kills': [],
-        'KD': []
+        'KD': [],
+        'HS': [],
+        'DMG': [],
+        'MVP': []
     }
     for line in lines:
         parts = line.split()
@@ -32,13 +35,18 @@ def read_data_file(file_path):
                 data['rank'].append(parts[0])
                 data['nickname'].append(parts[1])
                 data['kills'].append(parts[4])
-                data['KD'].append(str(KD))
+                data['KD'].append(f"{KD:.2f}")
+                data['HS'].append(parts[9])
+                data['DMG'].append(parts[11])
+                data['MVP'].append(parts[13])
     return data
 
 # 构建Kook富文本消息
 def build_kook_message(data):
 
     rank_nickname = ["{} {}".format(rank, nickname) for rank, nickname in zip(data['rank'], data['nickname'])]
+    kills_HS = ["{} ({})".format(kills, hs) for kills, hs in zip(data['kills'], data['HS'])]
+    KD_MVP =    ["{}  {}".format(KD, MVP) for KD, MVP in zip(data['KD'], data['MVP'])]
    # 构建卡片消息的 JSON 对象
     card = Card(
         Module.Header(Element.Text("「互联网垃圾桶」每日榜单", type=Types.Text.PLAIN))
@@ -48,8 +56,8 @@ def build_kook_message(data):
             Struct.Paragraph(
                 3,
                 Element.Text(("**Rank**\n" + "\n".join(rank_nickname)),type=Types.Text.KMD),
-                Element.Text(("**★StarTrack™️**\n" + "\n".join(data['kills'])),type=Types.Text.KMD),
-                Element.Text(("**K/D 比**\n" + "\n".join(data['KD'])),type=Types.Text.KMD)
+                Element.Text(("**★StarTrack™️**\n" + "\n".join(kills_HS)),type=Types.Text.KMD),
+                Element.Text(("**K/D  MVP**\n" + "\n".join(KD_MVP)),type=Types.Text.KMD)
             )
         )
     )
@@ -73,6 +81,7 @@ async def send_daily_stats():
     
     # 读取最新的统计数据
     today = datetime.now().strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     file_path = os.path.join("CS/data", f"player_stats_{today}.txt")
     logging.info(f"读取 {file_path} 中")
     data = read_data_file(file_path)
