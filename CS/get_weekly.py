@@ -1,132 +1,141 @@
-# import schedule
-import time
 import os
+import numpy as np
 import pandas as pd
-import configparser
 from datetime import datetime, timedelta
-
-data = [] 
-
-folder_path = "/CS/data"  # 文件夹路径
-start_date = datetime.now().strftime('%Y-%m-%d')  # 开始日期
-
-def load_config():
-    config = configparser.ConfigParser()
-    with open('C:/Users/Administrator/Desktop/KooK_Bot/CS/config.ini', 'r', encoding='utf-8') as f:
-        config.read_file(f)
-    return config
-
-def weekly_task(dataframe, nicknames_to_ids, start_date, folder_path):
-    start_date = datetime.strptime(start_date, "%Y-%m-%d")
-    previous_stats = {}
-    for i in range(7):  # 遍历过去7天
-        print(f"第{i+1}天")
-        target_date = start_date - timedelta(days=i)
-        file_name = f"player_stats_{target_date.strftime('%Y-%m-%d')}.txt"
-        file_path = os.path.join(folder_path, file_name)
-        print(f"正在读取文件：{file_path}")
-
-        if os.path.exists(file_path):
-            print(f"文件是否存在：{os.path.exists(file_path)}")
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f.readlines()[1:]:  # 跳过标题行
-                    parts = line.split()
-                    nickname = parts[1]
-                    kills = int(parts[4])
-                    deaths = int(parts[5])
-                    headshot = int(parts[7])
-                    damage = int(parts[11])
-                    mvp = int(parts[13])
-
-                    steam_id = nicknames_to_ids.get(nickname)
-                    if steam_id:
-                        # 如果 SteamID 不在 previous_stats 中，初始化
-                        if steam_id not in previous_stats:
-                            previous_stats[steam_id] = {'Kills': 0, 'Deaths': 0, 'Headshot': 0, 'Damage': 0, 'MVP': 0}
-                        
-                        # 正确累加数据
-                        previous_stats[steam_id]['Kills'] += kills
-                        previous_stats[steam_id]['Deaths'] += deaths
-                        previous_stats[steam_id]['Headshot'] += headshot
-                        previous_stats[steam_id]['Damage'] += damage
-                        previous_stats[steam_id]['MVP'] += mvp
-
-    # 更新 DataFrame
-    for steam_id, stats in previous_stats.items():
-        dataframe.loc[dataframe['SteamID'] == steam_id, 'Kills'] += stats['Kills']
-        dataframe.loc[dataframe['SteamID'] == steam_id, 'Deaths'] += stats['Deaths']
-        dataframe.loc[dataframe['SteamID'] == steam_id, 'Headshot'] += stats['Headshot']
-        dataframe.loc[dataframe['SteamID'] == steam_id, 'Damage'] += stats['Damage']
-        dataframe.loc[dataframe['SteamID'] == steam_id, 'MVP'] += stats['MVP']
-
-    return dataframe
-
-    
+import pymysql
 
 
-def main():
-    config = load_config()
-    steam_ids = []
-    nicknames_to_ids = {}
-    for key, value in config['SteamIDs'].items():
-        steam_id, nickname = value.split('#')[0].strip(), value.split('#')[1].strip()
-        steam_ids.append(steam_id)
-        nicknames_to_ids[nickname] = steam_id
+os.system('python CS/get_data.py')
+# 手动输入日期
+#input_date = input("请输入今天的日期 (YYYY-MM-DD): ")
+# 将输入的日期字符串转换为 datetime 对象
+#day = datetime.strptime(input_date, "%Y-%m-%d")
+# 设置目标日期
+today = datetime.now()
 
-    # 初始化数据
-    data = [
-        {'Player': nickname, 'SteamID': steam_id, 'Kills': 0, 'Deaths': 0, 'Damage': 0, 'Headshot': 0, 'K/D': 0.0, 'HS%': 0, 'MVP': 0}
-        for nickname, steam_id in nicknames_to_ids.items()
-    ]
-    df = pd.DataFrame(data)
-    weekly_data = weekly_task(df, nicknames_to_ids, start_date, folder_path)
-    print("一周内的数据：")
-    print(weekly_data)
+# 年、周数
+year, week, _ = today.isocalendar()
 
-    # 步骤1：归一化处理
-    for col in ['Kills', 'Deaths', 'Damage', 'K/D', 'HS%', 'MVP']:
-        max_val = weekly_data[col].max()
-        if max_val == 0:
-            max_val = 1  # 避免除以 0
-        weekly_data[col] = weekly_data[col] / max_val
+# 生成过去7天的日期
+date_list = [(datetime.strptime(today.strftime('%Y-%m-%d'), '%Y-%m-%d') - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
+print(f"Week {year}-W{week}: {date_list}")
 
-    # 打印调试信息
-    print("归一化后的数据：")
-    print(weekly_data)
+# 连接 MySQL 数据库
+conn = pymysql.connect(
+    host="47.115.75.168",          # 替换为 MySQL 主机地址
+    user="KYD",      # 替换为用户名
+    password="88888888",  # 替换为密码
+    charset="utf8mb4",          # 确保支持 UTF-8 字符集
+    database='trashbox'
+)
+cursor = conn.cursor()
 
-    # 步骤2：加权计算
-    weekly_data['Score'] = (
-        0.25 * weekly_data['Kills'] -  # 击杀
-        0.1 * weekly_data['Deaths'] +  # 死亡数（负权重）
-        0.2 * weekly_data['Damage'] +  # 伤害
-        0.2 * weekly_data['K/D'] +     # K/D
-        0.15 * weekly_data['HS%'] +    # 爆头率
-        0.1 * weekly_data['MVP']       # MVP 次数
+# 初始化一个空的 DataFrame 用于累加数据
+total_data = pd.DataFrame()
+
+# 遍历7天的文件
+for date in date_list:
+    file_path = f'CS/data/player_stats_{date}.txt'
+
+
+    # 读取文件
+    data = pd.read_csv(file_path, sep=r'\s{2,}', engine='python',usecols=['Nickname', '新增击杀数', '新增死亡数', '新增爆头数', '新增伤害量', '新增MVP次数'])
+    # 确保每一列的数据都是数字类型
+    data['新增击杀数'] = pd.to_numeric(data['新增击杀数'], errors='coerce').fillna(0)
+    data['新增死亡数'] = pd.to_numeric(data['新增死亡数'], errors='coerce').fillna(0)
+    data['新增爆头数'] = pd.to_numeric(data['新增爆头数'], errors='coerce').fillna(0)
+    data['新增伤害量'] = pd.to_numeric(data['新增伤害量'], errors='coerce').fillna(0)
+    data['新增MVP次数'] = pd.to_numeric(data['新增MVP次数'], errors='coerce').fillna(0)
+    # 遍历每一行（每个玩家），将数据累加到total_data
+    if total_data.empty:
+        total_data = data.copy()
+    for index, row in data.iterrows():
+        nickname = row['Nickname']
+        if nickname in total_data['Nickname'].values:
+            # 如果该玩家的数据已经存在，找到该玩家并累加数据
+            total_data.loc[total_data['Nickname'] == nickname, '新增击杀数'] += row['新增击杀数']
+            total_data.loc[total_data['Nickname'] == nickname, '新增死亡数'] += row['新增死亡数']
+            total_data.loc[total_data['Nickname'] == nickname, '新增爆头数'] += row['新增爆头数']
+            total_data.loc[total_data['Nickname'] == nickname, '新增伤害量'] += row['新增伤害量']
+            total_data.loc[total_data['Nickname'] == nickname, '新增MVP次数'] += row['新增MVP次数']
+
+
+
+# 设置每列的合理范围，剔除异常值
+columns_to_clean = {
+    '新增击杀数': (0, 2000),  # 假设合理范围是 0 到 2000
+    '新增死亡数': (0, 2000),
+    '新增爆头数': (0, 2000)
+}
+for column, (min_val, max_val) in columns_to_clean.items():
+    total_data = total_data[(data[column] >= min_val) & (total_data[column] <= max_val)]
+
+
+
+# 计算 K/D 和 HS 并保留两位小数
+total_data['K/D'] = (total_data['新增击杀数'] / total_data['新增死亡数']).round(2)
+total_data['HS'] = (total_data['新增爆头数'] / total_data['新增击杀数']).round(2)
+
+# 在标准化之前，保存一份原始数据
+original_data = pd.DataFrame()
+original_data = total_data.copy()
+
+
+# 标准化处理
+total_data['新增击杀数'] = total_data['新增击杀数'] / total_data['新增击杀数'].mean()
+total_data['新增死亡数'] = total_data['新增死亡数'] / total_data['新增死亡数'].mean()
+total_data['新增爆头数'] = total_data['新增爆头数'] / total_data['新增爆头数'].mean()
+total_data['新增伤害量'] = total_data['新增伤害量'] / total_data['新增伤害量'].mean()
+total_data['新增MVP次数'] = total_data['新增MVP次数'] / total_data['新增MVP次数'].mean()
+total_data['K/D'] = total_data['K/D'] / total_data['K/D'].mean()
+total_data['HS'] = total_data['HS'] / total_data['HS'].mean()
+
+
+# 周得分
+original_data['Activate'] = (total_data['新增击杀数'] + total_data['新增死亡数']).round(2)
+original_data['Score'] = (total_data['新增击杀数'] * 0.25 - total_data['新增死亡数'] * 0.1 + total_data['新增伤害量'] * 0.2 + total_data['HS'] * 0.2 + total_data['新增MVP次数'] * 0.15 + total_data['K/D'] * 0.2).round(2)
+
+# 按 Score 列降序排序
+original_data = original_data.sort_values(by='Score', ascending=False)
+
+
+
+
+# 打印指定的列
+#print(original_data[['Nickname', 'Score', 'Activate']])
+
+output_csv_path = f'CS/data/week/weekly_stats_{year}-{week}.csv'
+original_data.to_csv(output_csv_path, index=False, encoding='utf-8')
+print(f"{year}-{week}数据已保存到 {output_csv_path}")
+
+
+
+# 将 DataFrame 写入 MySQL
+original_data = original_data.fillna(0)  # 将 NaN 替换为 0
+for _, row in original_data.iterrows():
+    cursor.execute(
+        """
+        INSERT INTO weekly (
+            Nickname, 新增击杀数, 新增死亡数, 新增爆头数, 新增伤害量, 新增MVP次数, KD, HS, Score, Activate, year, week
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            row["Nickname"],
+            row["新增击杀数"],
+            row["新增死亡数"],
+            row["新增爆头数"],
+            row["新增伤害量"],
+            row["新增MVP次数"],
+            row["K/D"],
+            row["HS"],
+            row["Score"],
+            row["Activate"],
+            year,
+            week
+        )
     )
-
-    # 步骤3：检查是否有 NaN
-    if weekly_data['Score'].isna().any():
-        print("警告：计算的 Score 列存在 NaN 值。请检查数据输入是否正确。")
-        print(weekly_data[['Player', 'Score']])
-        return
-
-    # 步骤4：找出最高分的玩家
-    fmvp = weekly_data.loc[weekly_data['Score'].idxmax()]
-
-    # 输出结果
-    print("本周FMVP是：", fmvp['Player'])
-    print("详细数据：\n", fmvp)
-
-
-    
-
-
-    # schedule.every().saturday.at("20:00").do(weekly_task)
-    # print("定时程序正在运行。等待任务...")
-
-    # while True:
-    #     schedule.run_pending()
-    #     time.sleep(50)  # 避免CPU占用过高
-
-if __name__ == "__main__":
-    main()
+# 提交更改并关闭连接
+conn.commit()
+cursor.close()  # 关闭游标
+conn.close()
+print("数据已保存到 数据库")

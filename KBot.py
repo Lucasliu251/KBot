@@ -25,6 +25,9 @@ with open(r'C:\Users\Administrator\Desktop\KooK_Bot\config\config.json', 'r', en
 KOOKtoken=config['token']
 bot = Bot(KOOKtoken)
 
+bot.run()
+print('微信监控上线')
+
 
 #投骰子模块
 @bot.command(name='投骰子')
@@ -160,112 +163,112 @@ async def music_cmd(msg: Message, *, song_name: str):
 #logging.basicConfig(level=logging.DEBUG)
 
 # Flask 服务器部分
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-app.config['SESSION_COOKIE_NAME'] = 'spotify-login-session'
+# app = Flask(__name__)
+# app.secret_key = os.urandom(24)
+# app.config['SESSION_COOKIE_NAME'] = 'spotify-login-session'
 
-sp_oauth = oauth2.SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
-                               client_secret=config['SPOTIPY_CLIENT_SECRET'],
-                               redirect_uri=config['SPOTIPY_REDIRECT_URI'],
-                               scope='user-read-private user-read-email playlist-modify-private user-modify-playback-state user-read-playback-state user-read-currently-playing')
-
-
-global_token_info = None
-
-def get_token():
-    global global_token_info
-    token_info = global_token_info
-    if not token_info:
-        return None
-    now = int(time.time())
-    is_expired = token_info['expires_at'] - now < 60
-    if is_expired:
-        token_info = sp_oauth.refresh_access_token(token_info['refresh_token'])
-        global_token_info = token_info
-    return token_info
-
-@app.route('/')
-def index():
-    auth_url = sp_oauth.get_authorize_url()
-    return redirect(auth_url)
-
-@app.route('/callback')
-def callback():
-    global global_token_info
-    code = request.args.get('code')
-    token_info = sp_oauth.get_access_token(code)
-    global_token_info = token_info
-    return "授权成功，您可以关闭此窗口。"
-
-@app.route('/get_token')
-def get_token_endpoint():
-    token_info = get_token()
-    if not token_info:
-        return "Token not available", 401
-    return jsonify(token_info)
-
-def start_server():
-    app.run(port=8888, debug=False)
-
-# 启动 Flask 服务器
-threading.Thread(target=start_server).start()
-
-# 等待用户完成 OAuth 流程
-while not global_token_info:
-    time.sleep(1)
-
-token_info = get_token()
-spotify = Spotify(auth=token_info['access_token'])
-
-def check_and_play_next():
-    try:
-        playback = spotify.current_playback()
-        if playback is None or not playback['is_playing']:
-            spotify.start_playback()
-            time.sleep(1)  # 等待播放开始
-            spotify.next_track()
-            logging.info("已开始播放并跳到下一首歌")
-        else:
-            logging.info("当前正在播放")
-    except Exception as e:
-        logging.error(f"检查播放状态时出错: {e}")
+# sp_oauth = oauth2.SpotifyOAuth(client_id=config['SPOTIPY_CLIENT_ID'],
+#                                client_secret=config['SPOTIPY_CLIENT_SECRET'],
+#                                redirect_uri=config['SPOTIPY_REDIRECT_URI'],
+#                                scope='user-read-private user-read-email playlist-modify-private user-modify-playback-state user-read-playback-state user-read-currently-playing')
 
 
-# 以下是 Kook 机器人的代码
-@bot.command(name='play')
-async def music_cmd(msg: Message, *args):
-    if len(args) == 0:
-        await msg.reply('请输入歌曲名称。')
-        return
-    song_name = ' '.join(args)  # 合并所有参数作为歌曲名称
+# global_token_info = None
+
+# def get_token():
+#     global global_token_info
+#     token_info = global_token_info
+#     if not token_info:
+#         return None
+#     now = int(time.time())
+#     is_expired = token_info['expires_at'] - now < 60
+#     if is_expired:
+#         token_info = sp_oauth.refresh_access_token(token_info['refresh_token'])
+#         global_token_info = token_info
+#     return token_info
+
+# @app.route('/')
+# def index():
+#     auth_url = sp_oauth.get_authorize_url()
+#     return redirect(auth_url)
+
+# @app.route('/callback')
+# def callback():
+#     global global_token_info
+#     code = request.args.get('code')
+#     token_info = sp_oauth.get_access_token(code)
+#     global_token_info = token_info
+#     return "授权成功，您可以关闭此窗口。"
+
+# @app.route('/get_token')
+# def get_token_endpoint():
+#     token_info = get_token()
+#     if not token_info:
+#         return "Token not available", 401
+#     return jsonify(token_info)
+
+# def start_server():
+#     app.run(port=8888, debug=False)
+
+# # 启动 Flask 服务器
+# threading.Thread(target=start_server).start()
+
+# # 等待用户完成 OAuth 流程
+# while not global_token_info:
+#     time.sleep(1)
+
+# token_info = get_token()
+# spotify = Spotify(auth=token_info['access_token'])
+
+# def check_and_play_next():
+#     try:
+#         playback = spotify.current_playback()
+#         if playback is None or not playback['is_playing']:
+#             spotify.start_playback()
+#             time.sleep(1)  # 等待播放开始
+#             spotify.next_track()
+#             logging.info("已开始播放并跳到下一首歌")
+#         else:
+#             logging.info("当前正在播放")
+#     except Exception as e:
+#         logging.error(f"检查播放状态时出错: {e}")
+
+
+# # 以下是 Kook 机器人的代码
+# @bot.command(name='play')
+# async def music_cmd(msg: Message, *args):
+#     if len(args) == 0:
+#         await msg.reply('请输入歌曲名称。')
+#         return
+#     song_name = ' '.join(args)  # 合并所有参数作为歌曲名称
     
-    results = spotify.search(q=song_name, limit=1, type='track')
-    tracks = results['tracks']['items']
+#     results = spotify.search(q=song_name, limit=1, type='track')
+#     tracks = results['tracks']['items']
     
-    if tracks:
-        track_uri = tracks[0]['uri']
-        spotify.add_to_queue(track_uri)
-        await msg.reply(f'已将 {tracks[0]["name"]} 添加到播放队列。')
-        check_and_play_next()   #检查是否播放
-    else:
-        await msg.reply('未找到相关歌曲。')
+#     if tracks:
+#         track_uri = tracks[0]['uri']
+#         spotify.add_to_queue(track_uri)
+#         await msg.reply(f'已将 {tracks[0]["name"]} 添加到播放队列。')
+#         check_and_play_next()   #检查是否播放
+#     else:
+#         await msg.reply('未找到相关歌曲。')
 
-@bot.command(name='next')
-async def next_cmd(msg: Message):
-    try:
-        spotify.next_track()
-        await msg.reply('已切到下一首歌。')
-    except Exception as e:
-        await msg.reply(f'切换下一首歌时出错: {e}')
+# @bot.command(name='next')
+# async def next_cmd(msg: Message):
+#     try:
+#         spotify.next_track()
+#         await msg.reply('已切到下一首歌。')
+#     except Exception as e:
+#         await msg.reply(f'切换下一首歌时出错: {e}')
 
 
-@bot.command(name='pause')
-async def pause_cmd(msg: Message):
-    try:
-        spotify.pause_playback()
-        await msg.reply('已暂停播放。')
-    except Exception as e:
-        await msg.reply(f'暂停播放时出错: {e}')
+# @bot.command(name='pause')
+# async def pause_cmd(msg: Message):
+#     try:
+#         spotify.pause_playback()
+#         await msg.reply('已暂停播放。')
+#     except Exception as e:
+#         await msg.reply(f'暂停播放时出错: {e}')
 
 
 

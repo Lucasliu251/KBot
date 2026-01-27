@@ -69,6 +69,8 @@ def save_today_stats(output_file, player_data):
         for line in output:
             f.write(line + '\n')
 
+
+
 def main():
     config = load_config()
     API_KEY = config['Steam']['API_KEY']
