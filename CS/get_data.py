@@ -3,6 +3,7 @@ import os
 import requests
 from datetime import datetime, timedelta
 
+
 def load_config():
     config = configparser.ConfigParser()
     with open('C:/Users/Administrator/Desktop/KooK_Bot/CS/config.ini', 'r', encoding='utf-8') as f:
@@ -11,7 +12,7 @@ def load_config():
 
 def get_player_stats(api_key, steam_id):
     url = f'http://api.steampowered.com/ISteamUserStats/GetUserStatsForGame/v2/?key={api_key}&steamid={steam_id}&appid=730'
-    response = requests.get(url)
+    response = requests.get(url, timeout=10)
     if response.status_code == 200:
         return response.json()
     else:

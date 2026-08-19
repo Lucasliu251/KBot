@@ -120,8 +120,8 @@ async def send_daily_stats():
 
     # 调用get_data.py获取最新数据
     print('收集中')
-    os.system('python CS/get_data.py')
-    
+    os.system('python CS/get_data_new.py')
+    os.system('python C:/Users/Administrator/Desktop/TrashBox/Backend/calc_daily_styles.py')
     # 读取最新的统计数据
     today = datetime.now().strftime('%Y-%m-%d')
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -151,10 +151,15 @@ async def send_weekly_stats():
     ch = await bot.client.fetch_public_channel("2506365885049703")
     await ch.send(CardMessage(message))
 
+async def wechat_notify():
+    
+    os.system('python C:/Users/Administrator/Desktop/TrashBox/Backend/send_report.py')
+
 # 设置定时任务，每天23:00执行
 scheduler = AsyncIOScheduler()
 scheduler.add_job(send_daily_stats, 'cron', hour=23, minute=30,misfire_grace_time=60)
 scheduler.add_job(send_weekly_stats,'cron', day_of_week='sat',hour=20,minute=00, misfire_grace_time=60)
+scheduler.add_job(wechat_notify, 'cron', hour=23, minute=32 , misfire_grace_time=60)
 scheduler.start()
 
 # 运行Kook机器人
