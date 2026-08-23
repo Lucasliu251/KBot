@@ -2,7 +2,7 @@ import requests
 import logging
 import json
 import os
-from config import MUSIC_API_BASE, BACKUP_MUSIC_API
+from config import MUSIC_API_BASE, BACKUP_MUSIC_API, NETEASE_HOT_PLAYLIST_ID
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,65 @@ def search_music(keyword):
     """兼容机器人文字命令的旧接口，默认返回前 30 首。"""
     songs, _ = search_music_page(keyword, limit=30, offset=0)
     return songs
+
+
+def get_hot_searches(limit=12):
+    """获取网易云实时热搜词；失败时返回空列表，不影响热歌榜展示。"""
+    limit = max(1, min(20, int(limit)))
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            res = requests.get(
+                f"{api_base}/search/hot/detail",
+                headers=build_headers(),
+                timeout=10,
+            )
+            res.raise_for_status()
+            items = res.json().get('data', []) or []
+            hot_searches = []
+            for item in items:
+                keyword = str(item.get('searchWord', '')).strip()
+                if not keyword:
+                    continue
+                hot_searches.append({
+                    'keyword': keyword,
+                    'score': item.get('score', 0),
+                    'content': item.get('content', ''),
+                    'icon_type': item.get('iconType', 0),
+                })
+                if len(hot_searches) >= limit:
+                    break
+            if hot_searches:
+                return hot_searches
+        except Exception as exc:
+            logger.warning(f"网易云热搜接口失败 ({api_base}): {exc}")
+    return []
+
+
+def get_hot_playlist_tracks(limit=8, offset=0):
+    """分页获取网易云热歌榜，返回歌曲列表和是否可能还有下一页。"""
+    limit = max(1, min(50, int(limit)))
+    offset = max(0, int(offset))
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            res = requests.get(
+                f"{api_base}/playlist/track/all",
+                params={
+                    'id': NETEASE_HOT_PLAYLIST_ID,
+                    'limit': limit,
+                    'offset': offset,
+                },
+                headers=build_headers(),
+                timeout=12,
+            )
+            res.raise_for_status()
+            data = res.json()
+            if data.get('code') not in (None, 200):
+                raise MusicAPIError(data.get('message') or '热歌榜接口返回异常')
+            songs = data.get('songs', []) or []
+            return songs, len(songs) >= limit
+        except Exception as exc:
+            logger.warning(f"网易云热歌榜接口失败 ({api_base}): {exc}")
+    raise MusicAPIError('网易云热歌榜暂时不可用，请稍后重试')
 
 # 获取音乐URL
 def get_music_url(song_id):

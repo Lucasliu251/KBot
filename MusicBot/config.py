@@ -42,5 +42,8 @@ BACKUP_MUSIC_API = os.environ.get(
     "https://api.music.liuzhijin.cn",
 )
 
+# 网易云热歌榜。保留环境变量覆盖，方便兼容 API 更换榜单来源。
+NETEASE_HOT_PLAYLIST_ID = os.environ.get("NETEASE_HOT_PLAYLIST_ID", "3778678")
+
 # Web 控制台密钥
 SECRET_KEY = os.environ.get("SECRET_KEY", "kook_web_music_secret_key")

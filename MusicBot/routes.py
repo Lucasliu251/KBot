@@ -7,6 +7,8 @@ import kookvoice
 from utils import (
     search_music,
     search_music_page,
+    get_hot_searches,
+    get_hot_playlist_tracks,
     get_music_url,
     get_playlist,
     get_playlist_urls,
@@ -367,6 +369,34 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': str(e)}), 502
         except Exception as e:
             logger.error(f"搜索音乐异常: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route('/api/discover', methods=['GET'])
+    def discover():
+        """搜索框为空时返回网易云热搜词与分页热歌榜。"""
+        try:
+            limit = max(1, min(20, int(request.args.get('limit', 8))))
+            offset = max(0, int(request.args.get('offset', 0)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '分页参数无效'}), 400
+        try:
+            songs, has_more = get_hot_playlist_tracks(limit=limit, offset=offset)
+            return jsonify({
+                'success': True,
+                # 后续分页不重复传热搜，减少响应体和上游请求。
+                'hot_searches': get_hot_searches(limit=12) if offset == 0 else [],
+                'songs': songs,
+                'pagination': {
+                    'offset': offset,
+                    'limit': limit,
+                    'has_more': has_more,
+                },
+            })
+        except MusicAPIError as e:
+            logger.error(f"网易云发现页服务不可用: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 502
+        except Exception as e:
+            logger.error(f"加载网易云发现页异常: {e}")
             return jsonify({'success': False, 'error': str(e)}), 500
 
     @app.route('/api/song/detail', methods=['GET'])

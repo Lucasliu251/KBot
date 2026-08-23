@@ -53,6 +53,13 @@ type SearchTrack = {
   al?: { name?: string; picUrl?: string }
   dt?: number
 }
+type HotSearch = {
+  keyword: string
+  score?: number
+  content?: string
+  icon_type?: number
+}
+type SearchMode = 'discover' | 'search'
 type LyricLine = { time: number; text: string }
 
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
@@ -101,12 +108,16 @@ const lyricOffset = ref(0)
 const syncOpen = ref(false)
 const searchOpen = ref(false)
 const channelSwitcherOpen = ref(false)
+const searchMode = ref<SearchMode>('discover')
 const searching = ref(false)
+const discovering = ref(false)
 const loadingMoreSearch = ref(false)
 const searchHasMore = ref(false)
 const activeSearchKeyword = ref('')
 const query = ref('')
 const searchResults = ref<SearchTrack[]>([])
+const hotSearches = ref<HotSearch[]>([])
+const discoveryError = ref('')
 const playlistInput = ref('')
 const guilds = ref<Guild[]>([])
 const channels = ref<Channel[]>([])
@@ -365,6 +376,7 @@ watch([isPlaying, () => current.value?.id, duration], () => {
 watch(searchOpen, async (open) => {
   if (!open) return
   await nextTick()
+  if (!query.value.trim()) void loadDiscovery()
   window.setTimeout(() => searchInput.value?.focus(), 80)
 })
 
@@ -545,14 +557,66 @@ function getSearchPageSize() {
   return Math.max(4, Math.min(12, Math.ceil(availableHeight / 67)))
 }
 
+async function loadDiscovery() {
+  if (!searchOpen.value || query.value.trim() || (discovering.value && searchMode.value === 'discover')) return
+  const requestVersion = ++searchRequestVersion
+  searchMode.value = 'discover'
+  activeSearchKeyword.value = ''
+  searchResults.value = []
+  hotSearches.value = []
+  searchHasMore.value = false
+  discoveryError.value = ''
+  searching.value = false
+  loadingMoreSearch.value = false
+  discovering.value = true
+  if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
+  try {
+    const limit = getSearchPageSize()
+    const data = await getJson<{
+      hot_searches?: HotSearch[]
+      songs: SearchTrack[]
+      pagination?: { has_more?: boolean }
+    }>(`/api/discover?limit=${limit}&offset=0`)
+    if (requestVersion !== searchRequestVersion) return
+    hotSearches.value = data.hot_searches ?? []
+    searchResults.value = data.songs ?? []
+    searchHasMore.value = Boolean(data.pagination?.has_more)
+  } catch (error) {
+    if (requestVersion !== searchRequestVersion) return
+    discoveryError.value = error instanceof Error ? error.message : '网易云发现页暂时不可用'
+    searchResults.value = []
+    searchHasMore.value = false
+  } finally {
+    if (requestVersion === searchRequestVersion) discovering.value = false
+  }
+}
+
+async function handleSearchQueryInput() {
+  await nextTick()
+  if (!query.value.trim()) void loadDiscovery()
+}
+
+function runHotSearch(keyword: string) {
+  query.value = keyword
+  void runSearch()
+}
+
 async function runSearch() {
   const keyword = query.value.trim()
-  if (!keyword) return
+  if (!keyword) {
+    void loadDiscovery()
+    return
+  }
   const requestVersion = ++searchRequestVersion
+  searchMode.value = 'search'
   activeSearchKeyword.value = keyword
   searchResults.value = []
   searchHasMore.value = false
+  discoveryError.value = ''
+  discovering.value = false
+  loadingMoreSearch.value = false
   searching.value = true
+  if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
   try {
     const limit = getSearchPageSize()
     const data = await getJson<{
@@ -574,16 +638,20 @@ async function runSearch() {
 }
 
 async function loadMoreSearchResults() {
-  if (searching.value || loadingMoreSearch.value || !searchHasMore.value || !activeSearchKeyword.value) return
+  if (searching.value || discovering.value || loadingMoreSearch.value || !searchHasMore.value) return
+  if (searchMode.value === 'search' && !activeSearchKeyword.value) return
   const requestVersion = searchRequestVersion
   const offset = searchResults.value.length
   const limit = getSearchPageSize()
+  const endpoint = searchMode.value === 'discover'
+    ? `/api/discover?limit=${limit}&offset=${offset}`
+    : `/api/search?keyword=${encodeURIComponent(activeSearchKeyword.value)}&limit=${limit}&offset=${offset}`
   loadingMoreSearch.value = true
   try {
     const data = await getJson<{
       songs: SearchTrack[]
       pagination?: { has_more?: boolean }
-    }>(`/api/search?keyword=${encodeURIComponent(activeSearchKeyword.value)}&limit=${limit}&offset=${offset}`)
+    }>(endpoint)
     if (requestVersion !== searchRequestVersion) return
     const knownIds = new Set(searchResults.value.map((song) => String(song.id)))
     const nextSongs = (data.songs ?? []).filter((song) => !knownIds.has(String(song.id)))
@@ -593,7 +661,9 @@ async function loadMoreSearchResults() {
     if (requestVersion === searchRequestVersion) {
       notify(error instanceof Error ? error.message : '更多搜索结果加载失败')
     }
-  } finally { loadingMoreSearch.value = false }
+  } finally {
+    if (requestVersion === searchRequestVersion) loadingMoreSearch.value = false
+  }
 }
 
 function handleSearchScroll(event: Event) {
@@ -868,7 +938,7 @@ async function dropQueue(targetIndex: number) {
           <button class="icon-button" title="关闭" @click="searchOpen = false"><X :size="19" /></button>
         </div>
         <div class="search-box">
-          <Search :size="19" /><input ref="searchInput" v-model="query" placeholder="歌曲、艺术家或专辑" @keydown.enter="runSearch" />
+          <Search :size="19" /><input ref="searchInput" v-model="query" placeholder="歌曲、艺术家或专辑" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
           <button :disabled="searching || !query.trim()" @click="runSearch"><LoaderCircle v-if="searching" :size="17" class="continuous-spin" /><template v-else>搜索</template></button>
         </div>
         <div class="connection-picker">
@@ -877,18 +947,40 @@ async function dropQueue(targetIndex: number) {
           <button :class="connected ? 'disconnect-button' : 'connect-button'" @click="connectVoice">{{ connected ? '断开' : '连接' }}</button>
         </div>
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
-          <button v-for="song in searchResults" :key="song.id" class="search-result" @click="addSong(song)">
+          <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">
+            <div class="discover-heading">
+              <span class="discover-title"><Radio :size="15" />网易云热搜</span>
+              <small>点击关键词直接搜索</small>
+            </div>
+            <div v-if="hotSearches.length" class="hot-search-grid">
+              <button v-for="(item, index) in hotSearches" :key="item.keyword" class="hot-search-item" :class="{ 'is-top': index < 3 }" :title="item.content || `搜索 ${item.keyword}`" @click="runHotSearch(item.keyword)">
+                <span class="hot-search-rank">{{ String(index + 1).padStart(2, '0') }}</span>
+                <span class="hot-search-keyword">{{ item.keyword }}</span>
+              </button>
+            </div>
+            <div class="discover-heading chart-heading">
+              <span class="discover-title"><ListMusic :size="15" />网易云热歌榜</span>
+              <small>向下滚动继续浏览</small>
+            </div>
+          </section>
+          <button v-for="song in searchResults" :key="`${searchMode}-${song.id}`" class="search-result" @click="addSong(song)">
             <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
             <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家' }} · {{ song.al?.name || '未知专辑' }}</span></span>
             <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span><CirclePlus :size="20" />
           </button>
-          <div v-if="!searchResults.length" class="search-placeholder"><Search :size="28" /><strong>寻找下一首音乐</strong><span>支持网易云歌曲名称、艺术家和专辑搜索</span></div>
+          <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载网易云热榜</strong><span>看看大家此刻都在听什么</span></div>
+          <div v-else-if="!searchResults.length" class="search-placeholder">
+            <Radio v-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
+            <strong>{{ searchMode === 'discover' ? '热榜暂时没有响应' : '没有找到匹配的歌曲' }}</strong>
+            <span>{{ searchMode === 'discover' ? (discoveryError || '稍后再试，或直接搜索想听的歌') : '换一个歌曲名、艺术家或专辑试试' }}</span>
+            <button v-if="searchMode === 'discover'" class="discovery-retry" @click="loadDiscovery">重新加载</button>
+          </div>
           <div v-else-if="searchHasMore" class="search-load-more">
             <LoaderCircle v-if="loadingMoreSearch" :size="16" class="continuous-spin" />
             <ChevronDown v-else :size="15" />
             <span>{{ loadingMoreSearch ? '正在加载更多' : '向下滚动加载更多' }}</span>
           </div>
-          <div v-else class="search-results-end">已显示全部结果</div>
+          <div v-else class="search-results-end">{{ searchMode === 'discover' ? '已显示全部热歌' : '已显示全部结果' }}</div>
         </div>
         <div class="playlist-import">
           <div><strong>导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>
