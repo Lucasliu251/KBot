@@ -1,3 +1,19 @@
 /CS/data
 
 /CS/config.ini
+.serve.log
+.serve.pid
+.scheduled_tasks.lock
+.venv/
+
+# 任意目录下的 Python 缓存
+__pycache__/
+*.py[cod]
+
+# MusicBot 本地密钥与运行产物
+MusicBot/.env
+MusicBot/Cookie/cookie.txt
+MusicBot/Cookie/cookies.json
+MusicBot/venv/
+MusicBot/kook-music.pid
+MusicBot/*.log

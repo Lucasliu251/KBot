@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+生成 Linux 版 .env 模板。
+
+已存在 .env 时不会覆盖，避免把已配置的 Token 冲掉。
+
+changelog:
+- 2026-08-23: 改为 Linux FFmpeg 路径；已有 .env 时直接退出
+"""
+
+from __future__ import annotations
+
+import os
+
+ENV_CONTENT = """# KOOK机器人配置
+BOT_TOKEN=your_bot_token_here
+
+# FFMPEG配置 (Ubuntu 系统路径)
+FFMPEG_PATH=/usr/bin/ffmpeg
+FFPROBE_PATH=/usr/bin/ffprobe
+
+# 音乐API配置
+MUSIC_API_BASE=https://1304404172-f3na0r58ws.ap-beijing.tencentscf.com
+
+# Web控制台配置
+SECRET_KEY=kook_web_music_secret_key
+HOST=0.0.0.0
+PORT=8004
+DEBUG=False
+"""
+
+
+def create_env_file(target_path: str = ".env") -> str:
+    """
+    在当前目录写入 Linux 版 .env 模板。
+
+    @param {str} target_path - 要创建的环境文件路径，默认 `.env`
+    @returns {str} 实际写入或已存在的文件路径
+    @raises {FileExistsError} 目标文件已存在时抛出，防止覆盖现有 Token
+    """
+    if os.path.exists(target_path):
+        raise FileExistsError(f"{target_path} 已存在，拒绝覆盖")
+
+    with open(target_path, "w", encoding="utf-8") as env_file:
+        env_file.write(ENV_CONTENT)
+    return target_path
+
+
+if __name__ == "__main__":
+    try:
+        path = create_env_file()
+        print(f".env 文件创建成功: {path}")
+    except FileExistsError as exc:
+        print(f"跳过: {exc}")

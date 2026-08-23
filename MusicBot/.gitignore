@@ -1,0 +1,9 @@
+.env
+Cookie/cookie.txt
+Cookie/cookies.json
+Cookie/qr.png
+venv/
+kook-music.pid
+*.log
+__pycache__/
+*.pyc
