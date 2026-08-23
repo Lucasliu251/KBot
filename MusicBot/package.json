@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others-on-fail --names API,WEB --prefix-colors red,cyan \"npm:dev:api\" \"npm:dev:web\"",
-    "dev:api": "./serve.sh run",
+    "dev:api": "./venv/bin/python -u run.py",
     "dev:web": "vite --host 0.0.0.0",
     "build": "vue-tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0"

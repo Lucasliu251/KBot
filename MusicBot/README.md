@@ -38,3 +38,13 @@ npm run dev:web
 - `/Music/<频道ID>`：直接打开指定语音频道的控制台。
 
 生产部署前运行 `npm run build`，Flask 会从 `static/music-console` 加载构建产物。
+
+## 生产启动
+
+在仓库根目录启动。`./serve.sh` 默认拉起 main 和 music（8004，Nginx 反代 `https://trashbox.tech/Music/`）：
+
+```bash
+./serve.sh
+./serve.sh status
+./serve.sh restart
+```

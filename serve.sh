@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # 项目名称：KBot
-# 用法：./serve.sh 或 ./serve.sh start  — 默认只启动 main（KBot.py + CS/Scheduled_tasks.py）
-#       ./serve.sh {start/stop/restart/status/open} [main|order|broadcast|gsi|web|all]
+# 用法：./serve.sh 或 ./serve.sh start  — 默认启动 main + music
+#       ./serve.sh {start/stop/restart/status/open} [main|music|order|broadcast|gsi|web|all]
 # 特殊进程：./serve.sh {order/broadcast/gsi/web}
 #
 # changelog
 # - 2026-08-22: 无参数视为 start main；优先使用项目 .venv (Author: KBot)
 # - 2026-08-22: start/stop/restart/status 输出结构化入口信息，读 config/serve.ini (Author: KBot)
 # - 2026-08-23: 启动/停止时回收同组残留进程，避免双开重复发卡片 (Author: KBot)
+# - 2026-08-24: music 并入默认启动组，替代 MusicBot/serve.sh；兼容 MUSIC_BOT_TOKEN (Author: KBot)
 
 set -u
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SERVE_INI="$ROOT/config/serve.ini"
 PID_FILE="$ROOT/.serve.pid"
-SERVICE_GROUPS=(main order broadcast gsi web)
+DEFAULT_GROUPS=(main music)
+SERVICE_GROUPS=(main music order broadcast gsi web)
 
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   PYTHON="$PYTHON_BIN"
@@ -160,12 +162,83 @@ print_endpoints() {
 programs_for() {
   case "$1" in
     main) printf '%s\n' "KBot.py" "CS/Scheduled_tasks.py" ;;
+    music) printf '%s\n' "MusicBot/run.py" ;;
     order) printf '%s\n' "orderBot/order.py" ;;
     broadcast) printf '%s\n' "broadcast/broadcast.py" ;;
     gsi) printf '%s\n' "CS/GSI/GSI_server.py" "CS/GSI/GSI_message.py" ;;
     web) printf '%s\n' "CS/Web/API.py" ;;
     *) return 1 ;;
   esac
+}
+
+# 把 default/all/单组展开成要操作的进程组列表。
+resolve_groups() {
+  case "${1:-default}" in
+    default) printf '%s\n' "${DEFAULT_GROUPS[@]}" ;;
+    all) printf '%s\n' "${SERVICE_GROUPS[@]}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+# Music 用独立 venv，并在 MusicBot 目录启动，才能读到模板和静态资源。
+python_for() {
+  if [[ "$1" == music && -x "$ROOT/MusicBot/venv/bin/python" ]]; then
+    printf '%s\n' "$ROOT/MusicBot/venv/bin/python"
+  else
+    printf '%s\n' "$PYTHON"
+  fi
+}
+
+workdir_for() {
+  if [[ "$1" == music ]]; then
+    printf '%s\n' "$ROOT/MusicBot"
+  else
+    printf '%s\n' "$ROOT"
+  fi
+}
+
+# 启动 music 前检查 Token、FFmpeg、独立 venv，以及 Vue 控制台构建产物。
+# 标准输出必须保持干净：start_one 只用 stdout 回传 PID。
+ensure_music_ready() {
+  local music_dir="$ROOT/MusicBot"
+  local env_file="$music_dir/.env"
+  local venv_dir="$music_dir/venv"
+  local venv_py="$venv_dir/bin/python"
+  local token
+
+  if [[ ! -f "$env_file" ]]; then
+    printf '缺少 %s，请先复制 MusicBot/.env.example 并填写 MUSIC_BOT_TOKEN。\n' "$env_file" >&2
+    return 1
+  fi
+  token="$(grep -E '^MUSIC_BOT_TOKEN=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  if [[ -z "$token" ]]; then
+    token="$(grep -E '^BOT_TOKEN=' "$env_file" | tail -n 1 | cut -d= -f2- || true)"
+  fi
+  token="${token//$'\r'/}"
+  if [[ -z "$token" || "$token" == "your_bot_token_here" || "$token" == "your_music_bot_token_here" ]]; then
+    printf 'MusicBot/.env 的 MUSIC_BOT_TOKEN 未配置。\n' >&2
+    return 1
+  fi
+
+  if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+    printf '未检测到 ffmpeg / ffprobe，Music 无法解码音频。\n' >&2
+    return 1
+  fi
+
+  if [[ ! -x "$venv_py" ]]; then
+    printf '正在创建 MusicBot 虚拟环境...\n' >&2
+    python3 -m venv "$venv_dir" >&2 || return 1
+  fi
+  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio" >/dev/null 2>&1; then
+    printf '正在安装 MusicBot Python 依赖...\n' >&2
+    "$venv_dir/bin/pip" install -r "$music_dir/requirements.txt" >&2 || return 1
+  fi
+
+  if [[ ! -f "$music_dir/static/music-console/assets/music-console.js" ]]; then
+    printf '缺少 Music 前端构建产物，请在 MusicBot 目录执行 npm install && npm run build。\n' >&2
+    return 1
+  fi
+  return 0
 }
 
 group_pid() {
@@ -193,9 +266,11 @@ prune_pids() {
 }
 
 run_group() {
-  local group="$1" program
+  local group="$1" program py workdir
   local children=()
-  cd "$ROOT" || exit 1
+  workdir="$(workdir_for "$group")"
+  py="$(python_for "$group")"
+  cd "$workdir" || exit 1
   cleanup() {
     trap - TERM INT EXIT
     kill "${children[@]}" 2>/dev/null || true
@@ -205,7 +280,7 @@ run_group() {
   printf '\n[%s] 启动进程组：%s\n' "$(date '+%F %T')" "$group"
   while IFS= read -r program; do
     printf '[%s] 启动 %s\n' "$(date '+%F %T')" "$program"
-    "$PYTHON" -u "$program" &
+    "$py" -u "$ROOT/$program" &
     children+=("$!")
   done < <(programs_for "$group")
   wait
@@ -236,13 +311,27 @@ reap_stale_group() {
       [[ -n "$pid" && -z "${kept[$pid]:-}" ]] || continue
       kill -TERM "$pid" 2>/dev/null || true
     done < <(pgrep -f -- "-u $program" 2>/dev/null || true)
+    while read -r pid; do
+      [[ -n "$pid" && -z "${kept[$pid]:-}" ]] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done < <(pgrep -f -- "-u $ROOT/$program" 2>/dev/null || true)
   done < <(programs_for "$group")
+  if [[ "$group" == music ]]; then
+    while read -r pid; do
+      [[ -n "$pid" && -z "${kept[$pid]:-}" ]] || continue
+      kill -TERM "$pid" 2>/dev/null || true
+    done < <(pgrep -f -- "$ROOT/MusicBot/venv/bin/python" 2>/dev/null || true)
+    rm -f "$ROOT/MusicBot/kook-music.pid"
+  fi
 }
 
 # 启动一组。成功时把 PID 写到 stdout。
 start_one() {
   local group="$1" process_id
   programs_for "$group" >/dev/null || { printf '未知进程组：%s\n' "$group" >&2; return 2; }
+  if [[ "$group" == music ]]; then
+    ensure_music_ready || return 1
+  fi
   if process_id="$(group_pid "$group")"; then
     reap_stale_group "$group" "$process_id"
     printf '%s\n' "$process_id"
@@ -290,130 +379,107 @@ print_group_header() {
   fi
 }
 
-# start：已启动 + 入口；已在跑也视为已启动。
+# start：已启动 + 入口；已在跑也视为已启动。无参数时启动 DEFAULT_GROUPS。
 cmd_start() {
-  local group="${1:-main}" result=0 item process_id multi=0
+  local target="${1:-default}" result=0 item process_id multi=0
+  local items=()
   command -v "$PYTHON" >/dev/null || { printf '找不到 %s。\n' "$PYTHON" >&2; return 1; }
   command -v setsid >/dev/null || { printf '找不到 setsid。\n' >&2; return 1; }
   mkdir -p "$(dirname "$LOG")"
   touch "$LOG"
-  if [[ "$group" == all ]]; then
+  mapfile -t items < <(resolve_groups "$target")
+  if (( ${#items[@]} > 1 )); then
     multi=1
-    for item in "${SERVICE_GROUPS[@]}"; do
-      print_group_header "$item" "$multi"
-      if process_id="$(start_one "$item")"; then
-        printf '已启动 PID %s\n' "$process_id"
-        print_endpoints "$item"
-      else
-        printf '启动失败\n日志：%s\n' "$LOG" >&2
-        result=1
-      fi
+  fi
+  for item in "${items[@]}"; do
+    print_group_header "$item" "$multi"
+    if process_id="$(start_one "$item")"; then
+      printf '已启动 PID %s\n' "$process_id"
+      print_endpoints "$item"
+    else
+      printf '启动失败\n日志：%s\n' "$LOG" >&2
+      result=1
+    fi
+    if [[ "$multi" == 1 ]]; then
       printf '\n'
-    done
-    return "$result"
-  fi
-  if process_id="$(start_one "$group")"; then
-    printf '已启动 PID %s\n' "$process_id"
-    print_endpoints "$group"
-  else
-    printf '启动失败\n日志：%s\n' "$LOG" >&2
-    return 1
-  fi
+    fi
+  done
+  return "$result"
 }
 
-# stop：只输出已停止 / 未运行。
+# stop：只输出已停止 / 未运行。无参数时停止全部组。
 cmd_stop() {
-  local group="${1:-all}" result=0 item process_id rc multi=0
-  if [[ "$group" == all ]]; then
+  local target="${1:-all}" result=0 item process_id rc multi=0
+  local items=()
+  mapfile -t items < <(resolve_groups "$target")
+  if (( ${#items[@]} > 1 )); then
     multi=1
-    for item in "${SERVICE_GROUPS[@]}"; do
-      print_group_header "$item" "$multi"
-      process_id="$(stop_one "$item")"
-      rc=$?
-      if [[ "$rc" -eq 0 ]]; then
-        printf '已停止 PID %s\n' "$process_id"
-      elif [[ "$rc" -eq 3 ]]; then
-        printf '未运行\n'
-      else
-        printf '停止超时 PID %s\n' "$process_id" >&2
-        result=1
-      fi
-    done
-    return "$result"
   fi
-  process_id="$(stop_one "$group")"
-  rc=$?
-  if [[ "$rc" -eq 0 ]]; then
-    printf '已停止 PID %s\n' "$process_id"
-  elif [[ "$rc" -eq 3 ]]; then
-    printf '未运行\n'
-  else
-    printf '停止超时 PID %s\n' "$process_id" >&2
-    return 1
-  fi
+  for item in "${items[@]}"; do
+    print_group_header "$item" "$multi"
+    process_id="$(stop_one "$item")"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf '已停止 PID %s\n' "$process_id"
+    elif [[ "$rc" -eq 3 ]]; then
+      printf '未运行\n'
+    else
+      printf '停止超时 PID %s\n' "$process_id" >&2
+      result=1
+    fi
+  done
+  return "$result"
 }
 
-# restart：已停止 + 已启动 + 入口。
+# restart：已停止 + 已启动 + 入口。无参数时重启 DEFAULT_GROUPS。
 cmd_restart() {
-  local group="${1:-main}" result=0 item old_pid new_pid rc multi=0
+  local target="${1:-default}" result=0 item old_pid new_pid rc multi=0
+  local items=()
   command -v "$PYTHON" >/dev/null || { printf '找不到 %s。\n' "$PYTHON" >&2; return 1; }
   command -v setsid >/dev/null || { printf '找不到 setsid。\n' >&2; return 1; }
   mkdir -p "$(dirname "$LOG")"
   touch "$LOG"
-  if [[ "$group" == all ]]; then
+  mapfile -t items < <(resolve_groups "$target")
+  if (( ${#items[@]} > 1 )); then
     multi=1
-    for item in "${SERVICE_GROUPS[@]}"; do
-      print_group_header "$item" "$multi"
-      old_pid="$(stop_one "$item")"
-      rc=$?
-      if [[ "$rc" -eq 0 ]]; then
-        printf '已停止 PID %s\n' "$old_pid"
-      elif [[ "$rc" -eq 3 ]]; then
-        printf '未运行\n'
-      else
-        printf '停止超时 PID %s\n' "$old_pid" >&2
-        result=1
-        continue
-      fi
-      if new_pid="$(start_one "$item")"; then
-        printf '已启动 PID %s\n' "$new_pid"
-        print_endpoints "$item"
-      else
-        printf '启动失败\n日志：%s\n' "$LOG" >&2
-        result=1
-      fi
+  fi
+  for item in "${items[@]}"; do
+    print_group_header "$item" "$multi"
+    old_pid="$(stop_one "$item")"
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      printf '已停止 PID %s\n' "$old_pid"
+    elif [[ "$rc" -eq 3 ]]; then
+      printf '未运行\n'
+    else
+      printf '停止超时 PID %s\n' "$old_pid" >&2
+      result=1
+      continue
+    fi
+    if new_pid="$(start_one "$item")"; then
+      printf '已启动 PID %s\n' "$new_pid"
+      print_endpoints "$item"
+    else
+      printf '启动失败\n日志：%s\n' "$LOG" >&2
+      result=1
+    fi
+    if [[ "$multi" == 1 ]]; then
       printf '\n'
-    done
-    return "$result"
-  fi
-  old_pid="$(stop_one "$group")"
-  rc=$?
-  if [[ "$rc" -eq 0 ]]; then
-    printf '已停止 PID %s\n' "$old_pid"
-  elif [[ "$rc" -eq 3 ]]; then
-    printf '未运行\n'
-  else
-    printf '停止超时 PID %s\n' "$old_pid" >&2
-    return 1
-  fi
-  if new_pid="$(start_one "$group")"; then
-    printf '已启动 PID %s\n' "$new_pid"
-    print_endpoints "$group"
-  else
-    printf '启动失败\n日志：%s\n' "$LOG" >&2
-    return 1
-  fi
+    fi
+  done
+  return "$result"
 }
 
 # status：运行中/未运行 + 入口。
 cmd_status() {
   local wanted="${1:-all}" item process_id found=0 multi=0
+  local items=()
   prune_pids
-  if [[ "$wanted" == all ]]; then
+  mapfile -t items < <(resolve_groups "$wanted")
+  if (( ${#items[@]} > 1 )); then
     multi=1
   fi
-  for item in "${SERVICE_GROUPS[@]}"; do
-    [[ "$wanted" == all || "$wanted" == "$item" ]] || continue
+  for item in "${items[@]}"; do
     print_group_header "$item" "$multi"
     if process_id="$(group_pid "$item")"; then
       found=1
@@ -439,12 +505,12 @@ open_web() {
 }
 
 case "${1:-start}" in
-  start) cmd_start "${2:-main}" ;;
+  start) cmd_start "${2:-default}" ;;
   stop) cmd_stop "${2:-all}" ;;
-  restart) cmd_restart "${2:-main}" ;;
+  restart) cmd_restart "${2:-default}" ;;
   status) cmd_status "${2:-all}" ;;
   open) open_web ;;
   order|broadcast|gsi|web) cmd_start "$1" ;;
   __run) run_group "$2" ;;
-  *) printf '用法：%s {start/stop/restart/status/open} [main|order|broadcast|gsi|web|all]\n' "$0" >&2; exit 2 ;;
+  *) printf '用法：%s {start/stop/restart/status/open} [main|music|order|broadcast|gsi|web|all]\n' "$0" >&2; exit 2 ;;
 esac
