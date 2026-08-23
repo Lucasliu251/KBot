@@ -135,7 +135,7 @@ cmd_start() {
         local port
         port="$(read_env_port)"
         echo "[serve] 启动成功，PID=$(cat "${PID_FILE}")"
-        echo "[serve] 控制台: http://127.0.0.1:${port}  （外网用服务器 IP:${port}）"
+        echo "[serve] 控制台: http://127.0.0.1:${port}/Music  （外网用服务器 IP:${port}/Music）"
         echo "[serve] 日志: ${LOG_FILE}"
     else
         echo "[serve] 启动失败，请查看日志: ${LOG_FILE}"

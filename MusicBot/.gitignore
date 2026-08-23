@@ -7,3 +7,4 @@ kook-music.pid
 *.log
 __pycache__/
 *.pyc
+node_modules/

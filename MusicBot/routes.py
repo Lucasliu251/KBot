@@ -1,10 +1,19 @@
-from flask import render_template, request, jsonify, redirect, url_for, Blueprint
+from flask import render_template, request, jsonify, redirect, url_for, Blueprint, abort
 import logging
 import asyncio
 import json
 import time
 import kookvoice
-from utils import search_music, get_music_url, get_playlist, get_playlist_urls, format_playlist_data
+from utils import (
+    search_music,
+    get_music_url,
+    get_playlist,
+    get_playlist_urls,
+    format_playlist_data,
+    get_song_detail,
+    get_song_lyrics,
+    MusicAPIError,
+)
 import threading
 
 logger = logging.getLogger(__name__)
@@ -58,21 +67,45 @@ def run_async(coro):
 
 def register_routes(app, bot, socketio=None):
     """注册所有路由"""
+
+    def render_console(channel_id=''):
+        return render_template('dashboard.html', initial_channel_id=str(channel_id or ''))
     
     @app.route('/')
     def index():
-        """首页"""
-        return render_template('index.html')
+        """控制台入口；反代到 /Music 时这里就是 /Music。"""
+        return render_console()
+
+    @app.route('/Music')
+    @app.route('/Music/')
+    def music_console():
+        """直连 Flask 时使用的 /Music 控制台入口。"""
+        return render_console()
+
+    @app.route('/Music/<channel_id>')
+    @app.route('/dashboard/<channel_id>')
+    def music_console_channel(channel_id):
+        """按频道 ID 打开的可分享控制台深链。"""
+        if not str(channel_id).isdigit():
+            abort(404)
+        return render_console(channel_id)
     
     @app.route('/dashboard')
     def dashboard():
-        """控制台页面"""
-        return render_template('dashboard.html')
+        """兼容旧控制台地址。"""
+        return render_console()
     
     @app.route('/monitor')
     def monitor():
         """监控页面"""
         return render_template('monitor.html')
+
+    @app.route('/<channel_id>')
+    def prefixed_music_console_channel(channel_id):
+        """兼容 Nginx SCRIPT_NAME=/Music 后的 /Music/<频道ID>。"""
+        if not str(channel_id).isdigit():
+            abort(404)
+        return render_console(channel_id)
     
     @app.route('/api/guilds', methods=['GET'])
     def get_guilds():
@@ -82,6 +115,11 @@ def register_routes(app, bot, socketio=None):
             try:
                 import requests
                 from config import BOT_TOKEN
+                if not BOT_TOKEN:
+                    return jsonify({
+                        'success': False,
+                        'error': 'BOT_TOKEN 未配置，请先复制 .env.example 为 .env 并填写机器人 Token',
+                    }), 503
                 headers = {
                     'Authorization': f'Bot {BOT_TOKEN}',
                     'Content-Type': 'application/json'
@@ -102,11 +140,14 @@ def register_routes(app, bot, socketio=None):
                         guilds = []
                         logger.warning(f"服务器列表API返回错误: {data.get('message', '未知错误')}")
                 else:
-                    guilds = []
                     logger.error(f"服务器列表API HTTP错误: {response.status_code}")
+                    return jsonify({
+                        'success': False,
+                        'error': f'KOOK 服务器列表请求失败（HTTP {response.status_code}）',
+                    }), 502
             except Exception as e:
                 logger.error(f"获取服务器列表异常: {e}")
-                guilds = []
+                return jsonify({'success': False, 'error': f'无法连接 KOOK API：{e}'}), 502
             
             # 格式化数据
             formatted_guilds = []
@@ -135,6 +176,8 @@ def register_routes(app, bot, socketio=None):
             try:
                 import requests
                 from config import BOT_TOKEN
+                if not BOT_TOKEN:
+                    return jsonify({'success': False, 'error': 'BOT_TOKEN 未配置'}), 503
                 headers = {
                     'Authorization': f'Bot {BOT_TOKEN}',
                     'Content-Type': 'application/json'
@@ -149,10 +192,13 @@ def register_routes(app, bot, socketio=None):
                     else:
                         channels = []
                 else:
-                    channels = []
+                    return jsonify({
+                        'success': False,
+                        'error': f'KOOK 频道列表请求失败（HTTP {response.status_code}）',
+                    }), 502
             except Exception as e:
                 logger.error(f"获取频道列表异常: {e}")
-                channels = []
+                return jsonify({'success': False, 'error': f'无法连接 KOOK API：{e}'}), 502
             
             # 格式化数据，只返回语音频道
             formatted_channels = []
@@ -169,6 +215,52 @@ def register_routes(app, bot, socketio=None):
         except Exception as e:
             logger.error(f"获取频道列表异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/channel/context', methods=['GET'])
+    def get_channel_context():
+        """通过频道 ID 解析频道名称和所属服务器，供 /Music/<频道ID> 深链使用。"""
+        channel_id = str(request.args.get('channel_id', '')).strip()
+        if not channel_id:
+            return jsonify({'success': False, 'error': '缺少channel_id参数'}), 400
+        try:
+            import requests
+            from config import BOT_TOKEN
+            if not BOT_TOKEN:
+                return jsonify({'success': False, 'error': 'BOT_TOKEN 未配置'}), 503
+            response = requests.get(
+                'https://www.kookapp.cn/api/v3/channel/view',
+                params={'target_id': channel_id},
+                headers={
+                    'Authorization': f'Bot {BOT_TOKEN}',
+                    'Content-Type': 'application/json',
+                },
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return jsonify({
+                    'success': False,
+                    'error': f'KOOK 频道详情请求失败（HTTP {response.status_code}）',
+                }), 502
+            payload = response.json()
+            if payload.get('code') != 0:
+                return jsonify({
+                    'success': False,
+                    'error': payload.get('message', '频道不存在或机器人没有访问权限'),
+                }), 404
+            channel = payload.get('data', {})
+            if int(channel.get('type', 0)) != 2:
+                return jsonify({'success': False, 'error': '该 ID 不是语音频道'}), 400
+            return jsonify({
+                'success': True,
+                'context': {
+                    'guild_id': str(channel.get('guild_id', '')),
+                    'channel_id': str(channel.get('id', channel_id)),
+                    'channel_name': channel.get('name', '未知语音频道'),
+                },
+            })
+        except Exception as e:
+            logger.error(f"解析频道上下文异常: {e}")
+            return jsonify({'success': False, 'error': f'频道解析失败：{e}'}), 502
     
     @app.route('/api/join', methods=['POST'])
     def join_channel():
@@ -185,6 +277,29 @@ def register_routes(app, bot, socketio=None):
         
         try:
             from config import BOT_TOKEN
+            guild_id = str(guild_id)
+            channel_id = str(channel_id)
+            current_player = kookvoice.play_list.get(guild_id, {})
+            current_channel_id = str(current_player.get('voice_channel', ''))
+            current_status = kookvoice.guild_status.get(guild_id)
+
+            if current_channel_id == channel_id and current_status not in (
+                kookvoice.Status.STOP,
+                kookvoice.Status.EMPTY,
+            ):
+                return jsonify({'success': True, 'already_connected': True, 'channel_id': channel_id})
+
+            if current_channel_id and current_channel_id != channel_id:
+                kookvoice.Player(guild_id).stop()
+                deadline = time.time() + 4
+                while guild_id in kookvoice.play_list and time.time() < deadline:
+                    time.sleep(0.1)
+                if guild_id in kookvoice.play_list:
+                    return jsonify({
+                        'success': False,
+                        'error': '原语音连接仍在关闭，请稍后再试',
+                    }), 409
+
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
             player.join()
             
@@ -192,7 +307,7 @@ def register_routes(app, bot, socketio=None):
             global current_guild_id
             current_guild_id = guild_id
             
-            return jsonify({'success': True})
+            return jsonify({'success': True, 'channel_id': channel_id})
         except Exception as e:
             logger.error(f"加入语音频道异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -210,8 +325,14 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '缺少guild_id参数'})
         
         try:
+            guild_id = str(guild_id)
+            if guild_id not in kookvoice.play_list:
+                return jsonify({'success': True, 'already_disconnected': True})
             player = kookvoice.Player(guild_id)
             player.stop()
+            deadline = time.time() + 4
+            while guild_id in kookvoice.play_list and time.time() < deadline:
+                time.sleep(0.1)
             return jsonify({'success': True})
         except Exception as e:
             logger.error(f"离开语音频道异常: {e}")
@@ -227,8 +348,48 @@ def register_routes(app, bot, socketio=None):
         try:
             songs = search_music(keyword)
             return jsonify({'success': True, 'songs': songs})
+        except MusicAPIError as e:
+            logger.error(f"搜索音乐服务不可用: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 502
         except Exception as e:
             logger.error(f"搜索音乐异常: {e}")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.route('/api/song/detail', methods=['GET'])
+    def song_detail():
+        """返回控制台所需的精简歌曲信息。"""
+        song_id = request.args.get('id')
+        if not song_id:
+            return jsonify({'success': False, 'error': '缺少id参数'})
+        try:
+            detail = get_song_detail(song_id)
+            album = detail.get('al', {}) if detail else {}
+            artists = detail.get('ar', []) if detail else []
+            return jsonify({
+                'success': True,
+                'song': {
+                    'id': str(detail.get('id', song_id)),
+                    'name': detail.get('name', ''),
+                    'artist': ' / '.join(artist.get('name', '') for artist in artists if artist.get('name')),
+                    'album': album.get('name', ''),
+                    'cover': album.get('picUrl', ''),
+                    'duration': (detail.get('dt', 0) or 0) / 1000,
+                },
+            })
+        except Exception as e:
+            logger.error(f"获取歌曲详情异常: {e}")
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/song/lyrics', methods=['GET'])
+    def song_lyrics():
+        """返回网易云 LRC 原文，时间轴解析由前端完成。"""
+        song_id = request.args.get('id')
+        if not song_id:
+            return jsonify({'success': False, 'error': '缺少id参数'})
+        try:
+            return jsonify({'success': True, 'lyric': get_song_lyrics(song_id)})
+        except Exception as e:
+            logger.error(f"获取歌词异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/play', methods=['POST'])
@@ -243,6 +404,8 @@ def register_routes(app, bot, socketio=None):
         song_id = data.get('song_id')
         song_name = data.get('song_name', '')
         artist_name = data.get('artist_name', '')
+        album_name = data.get('album_name', '')
+        cover_url = data.get('cover_url', '')
         
         if not guild_id or not song_id:
             return jsonify({'success': False, 'error': '缺少必要参数'})
@@ -256,7 +419,16 @@ def register_routes(app, bot, socketio=None):
             # 播放音乐 - 提供必要的参数
             from config import BOT_TOKEN
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
-            player.add_music(url, {'title': song_name, 'artist': artist_name})
+            detail = get_song_detail(song_id) if not (album_name and cover_url) else {}
+            album_data = detail.get('al', {}) if detail else {}
+            player.add_music(url, {
+                'song_id': str(song_id),
+                'title': song_name,
+                'artist': artist_name,
+                'album': album_name or album_data.get('name', ''),
+                'cover': cover_url or album_data.get('picUrl', ''),
+                'duration': (detail.get('dt', 0) or 0) / 1000 if detail else 0,
+            })
             
             return jsonify({'success': True})
         except Exception as e:
@@ -287,7 +459,14 @@ def register_routes(app, bot, socketio=None):
             from config import BOT_TOKEN
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
             for song in songs:
-                player.add_music(song['marker'], {'title': song['name'], 'artist': song['artist']})
+                player.add_music(song['marker'], {
+                    'song_id': str(song['id']),
+                    'title': song['name'],
+                    'artist': song['artist'],
+                    'album': song.get('album', ''),
+                    'cover': song.get('cover', ''),
+                    'duration': song.get('duration', 0),
+                })
             
             return jsonify({'success': True, 'count': len(songs)})
         except Exception as e:
@@ -351,6 +530,104 @@ def register_routes(app, bot, socketio=None):
                 return jsonify({'success': True, 'playlist': []})
         except Exception as e:
             logger.error(f"获取播放列表异常: {e}")
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/player/state', methods=['GET'])
+    def get_player_state():
+        """获取顶栏连接状态和播放器偏好。"""
+        guild_id = request.args.get('guild_id')
+        if not guild_id:
+            return jsonify({'success': False, 'error': '缺少guild_id参数'})
+        guild_id = str(guild_id)
+        guild_playlist = kookvoice.play_list.get(guild_id, {})
+        status = kookvoice.guild_status.get(guild_id)
+        return jsonify({
+            'success': True,
+            'connected': bool(guild_playlist.get('voice_channel')) and status not in (
+                kookvoice.Status.STOP,
+                kookvoice.Status.EMPTY,
+            ),
+            'channel_id': guild_playlist.get('voice_channel', ''),
+            'volume': kookvoice.guild_volume.get(guild_id, 0.4),
+            'play_mode': kookvoice.guild_play_mode.get(guild_id, 'order'),
+            'paused': status == kookvoice.Status.PAUSE,
+        })
+
+    @app.route('/api/volume', methods=['POST'])
+    def set_volume():
+        """设置服务器播放音量；播放中会从当前位置平滑重启解码流。"""
+        data = request.json or {}
+        guild_id = str(data.get('guild_id', ''))
+        try:
+            volume = float(data.get('volume'))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'volume必须是0到1之间的数字'})
+        if not guild_id or not 0 <= volume <= 1:
+            return jsonify({'success': False, 'error': '音量范围必须是0到1'})
+        try:
+            kookvoice.guild_volume[guild_id] = volume
+            kookvoice.audio_cache.clear()
+            now_playing = kookvoice.play_list.get(guild_id, {}).get('now_playing')
+            if now_playing:
+                kookvoice.Player(guild_id).seek(int(now_playing.get('ss', 0)))
+            return jsonify({'success': True, 'volume': volume})
+        except Exception as e:
+            logger.error(f"设置音量异常: {e}")
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/play-mode', methods=['POST'])
+    def set_play_mode():
+        """切换顺序、单曲循环或随机播放。"""
+        data = request.json or {}
+        guild_id = str(data.get('guild_id', ''))
+        mode = data.get('mode')
+        if not guild_id or mode not in ('order', 'repeat-one', 'shuffle'):
+            return jsonify({'success': False, 'error': '播放模式无效'})
+        kookvoice.guild_play_mode[guild_id] = mode
+        return jsonify({'success': True, 'mode': mode})
+
+    @app.route('/api/previous', methods=['POST'])
+    def previous_music():
+        """从历史记录回到上一首歌曲。"""
+        data = request.json or {}
+        guild_id = str(data.get('guild_id', ''))
+        history = kookvoice.play_history.get(guild_id, [])
+        if not guild_id or not history:
+            return jsonify({'success': False, 'error': '暂无上一首歌曲'})
+        try:
+            previous = history.pop()
+            previous['ss'] = 0
+            previous.pop('start', None)
+            previous.pop('duration', None)
+            kookvoice.play_list[guild_id]['play_list'].insert(0, previous)
+            if kookvoice.play_list[guild_id].get('now_playing'):
+                kookvoice.Player(guild_id).skip()
+            else:
+                kookvoice.guild_status[guild_id] = kookvoice.Status.END
+            return jsonify({'success': True})
+        except Exception as e:
+            logger.error(f"返回上一首异常: {e}")
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/queue/reorder', methods=['POST'])
+    def reorder_queue():
+        """按队列索引移动歌曲，供前端拖拽排序。"""
+        data = request.json or {}
+        guild_id = str(data.get('guild_id', ''))
+        try:
+            from_index = int(data.get('from_index'))
+            to_index = int(data.get('to_index'))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '队列索引无效'})
+        try:
+            queue = kookvoice.play_list[guild_id]['play_list']
+            if not (0 <= from_index < len(queue) and 0 <= to_index < len(queue)):
+                return jsonify({'success': False, 'error': '队列索引超出范围'})
+            item = queue.pop(from_index)
+            queue.insert(to_index, item)
+            return jsonify({'success': True})
+        except Exception as e:
+            logger.error(f"调整队列顺序异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/pause', methods=['POST'])

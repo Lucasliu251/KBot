@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 COOKIE_TXT_PATH = os.path.join(os.path.dirname(__file__), "Cookie", "cookie.txt")
 
 
+class MusicAPIError(RuntimeError):
+    """网易云兼容 API 主备服务均不可用。"""
+
+
 def load_cookie_header():
     try:
         if os.path.exists(COOKIE_TXT_PATH):
@@ -32,27 +36,28 @@ def build_headers(extra: dict | None = None):
 
 # 搜索音乐
 def search_music(keyword):
-    try:
-        res = requests.get(f"{MUSIC_API_BASE}/cloudsearch?keywords={keyword}", headers=build_headers())
-        data = res.json()
-        songs = data.get('result', {}).get('songs', [])
-        return songs
-    except Exception as e:
-        logger.error(f"搜索音乐异常: {e}")
+    for api_base, endpoint in (
+        (MUSIC_API_BASE, 'cloudsearch'),
+        (BACKUP_MUSIC_API, 'search'),
+    ):
         try:
-            # 尝试使用备用API
-            res = requests.get(f"{BACKUP_MUSIC_API}/search?keywords={keyword}", headers=build_headers())
+            res = requests.get(
+                f"{api_base}/{endpoint}",
+                params={'keywords': keyword, 'limit': 30},
+                headers=build_headers(),
+                timeout=12,
+            )
+            res.raise_for_status()
             data = res.json()
-            songs = data.get('result', {}).get('songs', [])
-            return songs
-        except Exception as e2:
-            logger.error(f"备用API搜索音乐异常: {e2}")
-            return []
+            return data.get('result', {}).get('songs', [])
+        except Exception as exc:
+            logger.warning(f"音乐搜索接口失败 ({api_base}): {exc}")
+    raise MusicAPIError('音乐搜索服务不可用，请检查 MUSIC_API_BASE / BACKUP_MUSIC_API 配置')
 
 # 获取音乐URL
 def get_music_url(song_id):
     try:
-        res = requests.get(f"{MUSIC_API_BASE}/song/url?id={song_id}", headers=build_headers())
+        res = requests.get(f"{MUSIC_API_BASE}/song/url?id={song_id}", headers=build_headers(), timeout=12)
         data = res.json()
         url = data.get('data', [{}])[0].get('url', '')
         return url
@@ -60,13 +65,47 @@ def get_music_url(song_id):
         logger.error(f"获取音乐URL异常: {e}")
         try:
             # 尝试使用备用API
-            res = requests.get(f"{BACKUP_MUSIC_API}/song/url?id={song_id}", headers=build_headers())
+            res = requests.get(f"{BACKUP_MUSIC_API}/song/url?id={song_id}", headers=build_headers(), timeout=12)
             data = res.json()
             url = data.get('data', [{}])[0].get('url', '')
             return url
         except Exception as e2:
             logger.error(f"备用API获取音乐URL异常: {e2}")
             return ''
+
+
+def get_song_detail(song_id):
+    """获取单曲的专辑、封面和时长信息。"""
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            res = requests.get(
+                f"{api_base}/song/detail?ids={song_id}",
+                headers=build_headers(),
+                timeout=10,
+            )
+            songs = res.json().get('songs', [])
+            if songs:
+                return songs[0]
+        except Exception as exc:
+            logger.warning(f"获取歌曲详情失败 ({api_base}): {exc}")
+    return {}
+
+
+def get_song_lyrics(song_id):
+    """获取 LRC 歌词，优先原歌词，接口失败时返回空字符串。"""
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            res = requests.get(
+                f"{api_base}/lyric?id={song_id}",
+                headers=build_headers(),
+                timeout=10,
+            )
+            lyric = res.json().get('lrc', {}).get('lyric', '')
+            if lyric:
+                return lyric
+        except Exception as exc:
+            logger.warning(f"获取歌词失败 ({api_base}): {exc}")
+    return ''
 
 # 获取歌单
 def get_playlist(playlist_id):
@@ -151,6 +190,7 @@ def get_playlist_urls(playlist_id):
         song_name = track.get('name', '')
         artists = track.get('ar', [])
         artist_name = artists[0].get('name', '') if artists else ''
+        album_data = track.get('al', {}) or {}
         
         # 创建歌单歌曲标记，稍后实时获取URL
         song_marker = f"PLAYLIST_SONG:{song_id}:{song_name}:{artist_name}"
@@ -159,6 +199,9 @@ def get_playlist_urls(playlist_id):
             'id': song_id,
             'name': song_name,
             'artist': artist_name,
+            'album': album_data.get('name', ''),
+            'cover': album_data.get('picUrl', ''),
+            'duration': (track.get('dt', 0) or 0) / 1000,
             'marker': song_marker
         })
     
@@ -187,6 +230,8 @@ def format_playlist_data(play_list_data):
                     'id': song_id,
                     'name': song_name,
                     'artist': artist_name,
+                    'album': extra_data.get('album', ''),
+                    'cover': extra_data.get('cover', ''),
                     'duration': now_playing.get('duration', 0),
                     'playing': True,
                     'position': now_playing.get('ss', 0),
@@ -196,9 +241,12 @@ def format_playlist_data(play_list_data):
             # 普通文件
             file_name = file_path.split('/')[-1] if '/' in file_path else file_path
             result.append({
-                'id': 'local',
+                'id': str(extra_data.get('song_id', 'local')),
                 'name': extra_data.get('title', file_name),
                 'artist': extra_data.get('artist', '本地文件'),
+                'album': extra_data.get('album', ''),
+                'cover': extra_data.get('cover', ''),
+                'duration': now_playing.get('duration', extra_data.get('duration', 0)),
                 'playing': True,
                 'position': now_playing.get('ss', 0),
                 'start_time': now_playing.get('start', 0)
@@ -222,7 +270,9 @@ def format_playlist_data(play_list_data):
                     'id': song_id,
                     'name': song_name,
                     'artist': artist_name,
-                    'duration': 0,
+                    'album': extra_data.get('album', ''),
+                    'cover': extra_data.get('cover', ''),
+                    'duration': extra_data.get('duration', 0),
                     'queue_index': queue_index,
                     'playing': False
                 })
@@ -230,9 +280,12 @@ def format_playlist_data(play_list_data):
             # 普通文件
             file_name = file_path.split('/')[-1] if '/' in file_path else file_path
             result.append({
-                'id': 'local',
+                'id': str(extra_data.get('song_id', 'local')),
                 'name': extra_data.get('title', file_name),
                 'artist': extra_data.get('artist', '本地文件'),
+                'album': extra_data.get('album', ''),
+                'cover': extra_data.get('cover', ''),
+                'duration': extra_data.get('duration', 0),
                 'queue_index': queue_index,
                 'playing': False
             })

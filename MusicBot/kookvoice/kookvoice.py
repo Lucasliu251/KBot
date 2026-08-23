@@ -5,6 +5,7 @@ import time
 import logging
 import gc
 import psutil
+import random
 from enum import Enum, unique
 from typing import Dict, Union, List, Any, Optional, Coroutine as CoroutineType
 from asyncio import AbstractEventLoop
@@ -46,6 +47,9 @@ class Status(Enum):
 
 guild_status = {}
 play_list: Dict[str, Dict[str, Any]] = {}
+guild_volume: Dict[str, float] = {}
+guild_play_mode: Dict[str, str] = {}
+play_history: Dict[str, List[Dict[str, Any]]] = {}
 play_list_example = {'服务器id':
                               {'token': '机器人token',
                                'voice_channel': '语音频道id',
@@ -55,6 +59,11 @@ play_list_example = {'服务器id':
                                    {'file': '路径', 'ss': 0}]}}
 
 playlist_handle_status = {}
+
+
+def get_guild_volume(guild_id: str) -> float:
+    """返回服务器音量，并限制在 FFmpeg 可接受的安全范围。"""
+    return max(0.0, min(1.0, float(guild_volume.get(str(guild_id), 0.4))))
 
 # 音频缓存和预加载机制
 audio_cache = {}  # 缓存已解码的音频数据
@@ -266,6 +275,9 @@ class Player:
             play_list[self.guild_id] = {'token': self.token,
                                         'now_playing': None,
                                         'play_list': []}
+        guild_volume.setdefault(self.guild_id, 0.4)
+        guild_play_mode.setdefault(self.guild_id, 'order')
+        play_history.setdefault(self.guild_id, [])
         guild_status[self.guild_id] = Status.WAIT
         play_list[self.guild_id]['voice_channel'] = self.voice_channel_id
         if log_enabled:
@@ -288,6 +300,9 @@ class Player:
             play_list[self.guild_id] = {'token': self.token,
                                         'now_playing': None,
                                         'play_list': []}
+        guild_volume.setdefault(self.guild_id, 0.4)
+        guild_play_mode.setdefault(self.guild_id, 'order')
+        play_history.setdefault(self.guild_id, [])
         # 检查是否是歌单歌曲标记，如果是则跳过文件存在检查
         if not music.startswith("PLAYLIST_SONG:"):
             if 'http' not in music:
@@ -341,7 +356,7 @@ class Player:
                 
                 # 使用subprocess同步执行FFMPEG
                 import subprocess
-                command = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -i "{music}" {extra_command} -filter:a volume=0.4 -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
+                command = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -i "{music}" {extra_command} -filter:a volume={get_guild_volume(self.guild_id)} -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
                 
                 try:
                     # 限制预加载大小
@@ -792,7 +807,7 @@ class PlayHandler(threading.Thread):
                             # 如果没有缓存，使用FFMPEG解码
                             if not cached_audio:
                                 # FFMPEG命令 - 增加网络稳定性参数
-                                command2 = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -ss {ss_value} -i "{file}" {extra_command} -filter:a volume=0.4 -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
+                                command2 = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -ss {ss_value} -i "{file}" {extra_command} -filter:a volume={get_guild_volume(self.guild)} -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
                                 if log_enabled:
                                     logger.info(f'正在播放文件: {file}')
                                     logger.info(f'FFMPEG命令: {command2}')
@@ -1069,8 +1084,24 @@ class PlayHandler(threading.Thread):
                             if log_enabled:
                                 logger.info(f'歌曲播放完成: {file}')
                             
-                            # 清理当前播放状态
+                            # 记录历史，并根据播放模式安排下一首。
                             if self.guild in play_list and play_list[self.guild]['now_playing']:
+                                finished_song = play_list[self.guild]['now_playing'].copy()
+                                history = play_history.setdefault(self.guild, [])
+                                history.append(finished_song.copy())
+                                if len(history) > 50:
+                                    del history[:-50]
+
+                                mode = guild_play_mode.get(self.guild, 'order')
+                                if mode == 'repeat-one' and not skip_song:
+                                    replay_song = finished_song.copy()
+                                    replay_song['ss'] = 0
+                                    replay_song.pop('start', None)
+                                    replay_song.pop('duration', None)
+                                    play_list[self.guild]['play_list'].insert(0, replay_song)
+                                elif mode == 'shuffle' and len(play_list[self.guild]['play_list']) > 1:
+                                    random.shuffle(play_list[self.guild]['play_list'])
+
                                 play_list[self.guild]['now_playing'] = None
                             
                             # 执行智能清理
@@ -1093,7 +1124,7 @@ class PlayHandler(threading.Thread):
                                                     
                                                     # 使用subprocess同步执行FFMPEG
                                                     import subprocess
-                                                    command = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -ss {next_song.get("ss", 0)} -i "{next_file}" -filter:a volume=0.4 -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
+                                                    command = f'{ffmpeg_bin} -nostats -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 -ss {next_song.get("ss", 0)} -i "{next_file}" -filter:a volume={get_guild_volume(self.guild)} -acodec pcm_s16le -ac 2 -ar 48000 -f wav -y -'
                                                     
                                                     process = subprocess.Popen(
                                                         command,
