@@ -6,9 +6,10 @@ import traceback
 import aiohttp
 from urllib.parse import quote
 import json
+from pathlib import Path
 
 # 用 json 读取 config.json，装载到 config 里
-with open(r'C:\Users\Administrator\Desktop\KooK_Bot\config\config.json', 'r', encoding='utf-8') as f:
+with (Path(__file__).resolve().parents[1] / 'config' / 'config.json').open('r', encoding='utf-8') as f:
     config = json.load(f)
 
 # init Bot

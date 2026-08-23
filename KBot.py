@@ -12,21 +12,20 @@ import asyncio
 import logging
 import time
 import os
+from pathlib import Path
 #import PyOfficeRobot
 
 
 
 
 # 用 json 读取 config.json，装载到 config 里
-with open(r'C:\Users\Administrator\Desktop\KooK_Bot\config\config.json', 'r', encoding='utf-8') as f:
+with (Path(__file__).resolve().parent / 'config' / 'config.json').open('r', encoding='utf-8') as f:
     config = json.load(f)
 
 # init Bot
+# bot.run() 必须在全部 @bot.command 注册之后调用，见文件末尾。
 KOOKtoken=config['token']
 bot = Bot(KOOKtoken)
-
-bot.run()
-print('微信监控上线')
 
 
 #投骰子模块

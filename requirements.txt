@@ -1,0 +1,19 @@
+# KBot runtime
+aiohttp
+APScheduler
+Flask
+Flask-Cors
+khl.py
+pandas
+requests
+spotipy
+
+# CS data, database, and analysis tools
+matplotlib
+numpy
+psycopg2-binary
+PyMySQL
+scikit-learn
+SQLAlchemy
+
+# System dependency (install with the OS package manager): ffmpeg

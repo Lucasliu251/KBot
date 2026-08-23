@@ -2,10 +2,31 @@ import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-import pymysql
+import configparser
+import subprocess
+import sys
+from pathlib import Path
+from sqlalchemy import create_engine, text
+
+CS_DIR = Path(__file__).resolve().parent
+DATA_DIR = CS_DIR / 'data'
+WEEK_DIR = DATA_DIR / 'week'
 
 
-os.system('python CS/get_data.py')
+def load_db_uri():
+    """读取 CS/config.ini 中的 PostgreSQL 连接串。
+
+    @returns: SQLAlchemy DB_URI
+    @changelog
+    - 2026-08-22: 周报写入从远程 MySQL 改为本机 PostgreSQL (Author: KBot)
+    """
+    config = configparser.ConfigParser()
+    with (CS_DIR / 'config.ini').open('r', encoding='utf-8') as f:
+        config.read_file(f)
+    return config['SQL']['DB_URI']
+
+
+subprocess.run([sys.executable, CS_DIR / 'get_data.py'], check=True)
 # 手动输入日期
 #input_date = input("请输入今天的日期 (YYYY-MM-DD): ")
 # 将输入的日期字符串转换为 datetime 对象
@@ -20,22 +41,15 @@ year, week, _ = today.isocalendar()
 date_list = [(datetime.strptime(today.strftime('%Y-%m-%d'), '%Y-%m-%d') - timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
 print(f"Week {year}-W{week}: {date_list}")
 
-# 连接 MySQL 数据库
-conn = pymysql.connect(
-    host="47.115.75.168",          # 替换为 MySQL 主机地址
-    user="KYD",      # 替换为用户名
-    password="88888888",  # 替换为密码
-    charset="utf8mb4",          # 确保支持 UTF-8 字符集
-    database='trashbox'
-)
-cursor = conn.cursor()
+# 连接本机 PostgreSQL trashbox；中文列名与 Nickname 需保持引号
+engine = create_engine(load_db_uri())
 
 # 初始化一个空的 DataFrame 用于累加数据
 total_data = pd.DataFrame()
 
 # 遍历7天的文件
 for date in date_list:
-    file_path = f'CS/data/player_stats_{date}.txt'
+    file_path = DATA_DIR / f'player_stats_{date}.txt'
 
 
     # 读取文件
@@ -104,38 +118,43 @@ original_data = original_data.sort_values(by='Score', ascending=False)
 # 打印指定的列
 #print(original_data[['Nickname', 'Score', 'Activate']])
 
-output_csv_path = f'CS/data/week/weekly_stats_{year}-{week}.csv'
+WEEK_DIR.mkdir(parents=True, exist_ok=True)
+output_csv_path = WEEK_DIR / f'weekly_stats_{year}-{week}.csv'
 original_data.to_csv(output_csv_path, index=False, encoding='utf-8')
 print(f"{year}-{week}数据已保存到 {output_csv_path}")
 
 
 
-# 将 DataFrame 写入 MySQL
+# 将 DataFrame 写入 PostgreSQL weekly（列名与迁库时的 MySQL 原名一致）
 original_data = original_data.fillna(0)  # 将 NaN 替换为 0
-for _, row in original_data.iterrows():
-    cursor.execute(
-        """
-        INSERT INTO weekly (
-            Nickname, 新增击杀数, 新增死亡数, 新增爆头数, 新增伤害量, 新增MVP次数, KD, HS, Score, Activate, year, week
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            row["Nickname"],
-            row["新增击杀数"],
-            row["新增死亡数"],
-            row["新增爆头数"],
-            row["新增伤害量"],
-            row["新增MVP次数"],
-            row["K/D"],
-            row["HS"],
-            row["Score"],
-            row["Activate"],
-            year,
-            week
-        )
+insert_weekly = text(
+    """
+    INSERT INTO weekly (
+        "Nickname", "新增击杀数", "新增死亡数", "新增爆头数", "新增伤害量",
+        "新增MVP次数", "KD", "HS", "Score", "Activate", year, week
+    ) VALUES (
+        :nickname, :kills, :deaths, :headshots, :damage,
+        :mvp, :kd, :hs, :score, :activate, :year, :week
     )
-# 提交更改并关闭连接
-conn.commit()
-cursor.close()  # 关闭游标
-conn.close()
+    """
+)
+with engine.begin() as conn:
+    for _, row in original_data.iterrows():
+        conn.execute(
+            insert_weekly,
+            {
+                "nickname": row["Nickname"],
+                "kills": row["新增击杀数"],
+                "deaths": row["新增死亡数"],
+                "headshots": row["新增爆头数"],
+                "damage": row["新增伤害量"],
+                "mvp": row["新增MVP次数"],
+                "kd": row["K/D"],
+                "hs": row["HS"],
+                "score": row["Score"],
+                "activate": row["Activate"],
+                "year": year,
+                "week": week,
+            },
+        )
 print("数据已保存到 数据库")

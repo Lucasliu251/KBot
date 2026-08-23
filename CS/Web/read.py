@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 def generate_option_from_json(file_path):
     # 读取 JSON 文件
@@ -39,6 +40,6 @@ def generate_option_from_json(file_path):
     return dataset
 
 # 使用示例
-file_path = 'D:/Develop/project/KBot/CS/data/dirt.json'
+file_path = Path(__file__).resolve().parents[1] / 'data' / 'dirt.json'
 option = generate_option_from_json(file_path)
 print(json.dumps(option, ensure_ascii=False, indent=2))

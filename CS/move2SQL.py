@@ -2,10 +2,12 @@ import os
 import re
 import pandas as pd
 from sqlalchemy import create_engine
+from pathlib import Path
 
 # ================= 配置区域 =================
-DATA_DIR = r"C:\Users\Administrator\Desktop\KooK_Bot\CS\data"
-DB_URI = "mysql+pymysql://KYD:88888888@47.115.75.168:3306/trashbox"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+# 本机 PostgreSQL trashbox（程序账户）；历史 TXT 一次性导入用
+DB_URI = "postgresql+psycopg2://trashbox:88888888@127.0.0.1:5432/trashbox"
 
 NICKNAME_TO_STEAMID = {
     # ... (保持你之前的完整映射表不变)
@@ -190,7 +192,7 @@ def migrate():
             print(f" ✅ {len(df)} 条")
             
         except Exception as e:
-            if "Duplicate entry" in str(e):
+            if "Duplicate entry" in str(e) or "unique" in str(e).lower():
                 print(" ⚠️ [重复]")
             else:
                 print(f" ❌ {e}")

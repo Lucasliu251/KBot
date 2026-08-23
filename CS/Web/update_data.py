@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from datetime import datetime
 
 # 读取TXT文件内容
@@ -73,7 +74,7 @@ def process_files(input_directory, json_file_path):
             new_data = convert_to_json(lines, formatted_date)
             update_json_file(new_data, json_file_path)
 # 配置路径
-input_directory = 'C:/Users/Administrator/Desktop/KooK_Bot/CS/data'  # 替换为存放TXT文件的目录
-json_file_path = 'C:/Users/Administrator/Desktop/KooK_Bot/CS/data/dirt.json'  # 替换为你要保存的JSON文件路径
+input_directory = Path(__file__).resolve().parents[1] / 'data'
+json_file_path = input_directory / 'dirt.json'
 
 process_files(input_directory, json_file_path)

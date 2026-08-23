@@ -3,10 +3,14 @@ import os
 import requests
 import json
 from datetime import datetime,timedelta
+from pathlib import Path
+
+CS_DIR = Path(__file__).resolve().parent
+DATA_DIR = CS_DIR / 'data'
 
 # 读取config文件
 config = configparser.ConfigParser()
-with open('config.ini', 'r', encoding='utf-8') as f:
+with (CS_DIR / 'config.ini').open('r', encoding='utf-8') as f:
     config.read_file(f)
 
 API_KEY = config['Steam']['API_KEY']
@@ -18,7 +22,7 @@ for key, value in config['SteamIDs'].items():
     nicknames[steam_id] = nickname
 
 # 创建数据保存文件夹（如果不存在）
-data_folder = 'data'
+data_folder = DATA_DIR
 if not os.path.exists(data_folder):
     os.makedirs(data_folder)
 
@@ -66,8 +70,8 @@ today = datetime.now().strftime('%Y-%m-%d')
 yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # 文件名基于日期
-output_file = f"player_stats_{today}.txt"
-previous_file = f"player_stats_{yesterday}.txt"
+output_file = DATA_DIR / f"player_stats_{today}.txt"
+previous_file = DATA_DIR / f"player_stats_{yesterday}.txt"
 
 # 读取昨日的击杀、局数、获胜数据
 previous_day_stats = read_previous_day_stats(previous_file)
@@ -104,11 +108,10 @@ for line in output:
     print(line)
 
 # 保存到txt文件
-output_file = os.path.join("data", f"player_stats_{today}.txt")
+output_file = DATA_DIR / f"player_stats_{today}.txt"
 with open(output_file, 'w', encoding='utf-8') as f:
     for line in output:
         f.write(line + '\n')
 
 print(f"\n数据已导出到 {output_file}")
-
 

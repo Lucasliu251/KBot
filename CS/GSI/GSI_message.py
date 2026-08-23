@@ -4,12 +4,13 @@ from khl import Bot, Event, EventTypes
 from khl.card import Card, CardMessage, Module, Types, Element, Struct
 import aiohttp
 import json
+import os
 
 
 
 
 # API地址
-API_URL = "http://47.115.75.168:3000/gsi"
+API_URL = os.getenv("GSI_API_URL", "http://127.0.0.1:3000/gsi")
 botoken = '1/MzA5MDc=/lOziyhZw7gRaEn02qJfdeg=='
 
 # 启动KOOK机器人并发送消息

@@ -2,11 +2,15 @@ import configparser
 import os
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
+
+CS_DIR = Path(__file__).resolve().parent
+DATA_DIR = CS_DIR / 'data'
 
 
 def load_config():
     config = configparser.ConfigParser()
-    with open('C:/Users/Administrator/Desktop/KooK_Bot/CS/config.ini', 'r', encoding='utf-8') as f:
+    with (CS_DIR / 'config.ini').open('r', encoding='utf-8') as f:
         config.read_file(f)
     return config
 
@@ -63,8 +67,7 @@ def save_today_stats(output_file, player_data):
     for i, (steam_id, nickname, total_kills, total_deaths, new_kills, new_deaths, KD, total_headshot, new_headshot, HS, total_damage, new_damage, total_mvp, new_mvp) in enumerate(player_data, start=1):
         output.append(f"Top{i:<5}{nickname.ljust(30)}{str(total_kills).ljust(20)}{str(total_deaths).ljust(20)}{str(new_kills).ljust(20)}{str(new_deaths).ljust(20)}{str(KD).ljust(6)}{str(total_headshot).ljust(20)}{str(new_headshot).ljust(20)}{str(HS).ljust(6)}{str(total_damage).ljust(20)}{str(new_damage).ljust(20)}{str(total_mvp).ljust(20)}{str(new_mvp).ljust(20)}")
     
-    if not os.path.exists("CS/data"):
-        os.makedirs("CS/data")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     
     with open(output_file, 'w', encoding='utf-8') as f:
         for line in output:
@@ -85,8 +88,8 @@ def main():
     today = datetime.now().strftime('%Y-%m-%d')
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
-    output_file = os.path.join("CS/data", f"player_stats_{today}.txt")
-    previous_file = os.path.join("CS/data", f"player_stats_{yesterday}.txt")
+    output_file = DATA_DIR / f"player_stats_{today}.txt"
+    previous_file = DATA_DIR / f"player_stats_{yesterday}.txt"
     
     previous_day_stats = read_previous_day_stats(previous_file, nicknames_to_ids)
     

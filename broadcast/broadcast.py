@@ -2,6 +2,7 @@ import subprocess
 import asyncio
 import aiohttp
 from khl import *
+from pathlib import Path
 
 bot_token = '1/MzI4MDU=/k7tU+d3eOpsPrF5H1TK9Ug=='
 bot = Bot(token=bot_token)
@@ -131,7 +132,7 @@ async def join_guild_send_event(b: Bot, e: Event):
     
     channel_id = e.body['channel_id']
     if user_id in whitelist:
-        audio_file = f"C:/Users/Administrator/Desktop/KooK_Bot/broadcast/音效库/{whitelist[user_id]}"
+        audio_file = Path(__file__).resolve().parent / "音效库" / whitelist[user_id]
 
         #Bot加入语音频道并播放
         await play_audio_in_channel(channel_id,audio_file)
@@ -150,7 +151,7 @@ async def play_sound(msg: Message):
         await msg.ctx.channel.send('请先加入语音频道')
         return
      
-    audio_file = "C:/Users/Administrator/Desktop/KooK_Bot/broadcast/音效库/肛门.mp3"
+    audio_file = Path(__file__).resolve().parent / "音效库" / "肛门.mp3"
     await play_audio_in_channel(channel_id,audio_file)
 
 

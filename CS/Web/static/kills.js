@@ -20,7 +20,7 @@ var option = {
 
 async function updateDatasetFromJson() {
     // 获取 dirt.json 中的数据
-    const response = await fetch('http://47.115.75.168:5000/api/data');
+    const response = await fetch('/api/data');
 	if (!response.ok) throw new Error('网络响应不正常.');
     const jsonData = await response.json();
 

@@ -4,6 +4,10 @@ import requests
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 import pandas as pd
+from pathlib import Path
+
+CS_DIR = Path(__file__).resolve().parent
+DATA_DIR = CS_DIR / 'data'
 
 
 
@@ -11,10 +15,7 @@ import pandas as pd
 def load_config():
     config = configparser.ConfigParser()
     # 建议使用相对路径或确保路径正确
-    config_path = r'C:/Users/Administrator/Desktop/KooK_Bot/CS/config.ini'
-    # 容错：如果绝对路径不存在，尝试相对路径
-    if not os.path.exists(config_path):
-        config_path = 'config.ini'
+    config_path = CS_DIR / 'config.ini'
         
     with open(config_path, 'r', encoding='utf-8') as f:
         config.read_file(f)
@@ -138,8 +139,7 @@ def save_today_stats(output_file, player_data_list):
         )
         output.append(line)
     
-    if not os.path.exists("CS/data"):
-        os.makedirs("CS/data")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     
     with open(output_file, 'w', encoding='utf-8') as f:
         for line in output:
@@ -147,7 +147,16 @@ def save_today_stats(output_file, player_data_list):
 
 def save_to_sql(player_data_list, record_date, DB_URI):
     """
-    [新增] 将当日最新 Totals 存入 MySQL 数据库
+    将当日最新 Totals 写入 PostgreSQL daily 表。
+    同一天重复跑时先删后插，避免 uk_user_date 唯一约束冲突。
+
+    @param player_data_list: 含 steam_id / nickname / 累计统计的玩家字典列表
+    @param record_date: 记录日期，YYYY-MM-DD
+    @param DB_URI: SQLAlchemy 连接串
+    @returns: None
+
+    @changelog
+    - 2026-08-22: 改为 PostgreSQL；按 record_date 先删后插 (Author: KBot)
     """
     try:
         engine = create_engine(DB_URI)
@@ -173,21 +182,13 @@ def save_to_sql(player_data_list, record_date, DB_URI):
         if not db_records: return
 
         df = pd.DataFrame(db_records)
-        
-        # 使用 Pandas 写入，追加模式
-        # 注意：由于我们在数据库设置了 (steam_id, record_date) 唯一索引
-        # 如果当日已经运行过，直接 append 会报错。
-        # 这里使用更稳健的方法：先删除当日旧数据(如果有)，再插入；或者忽略错误。
-        # 为了简单，这里演示 append。如果报错 Duplicate entry，说明今天已经存过了。
-        
-        try:
-            df.to_sql('daily', engine, if_exists='append', index=False)
-            print("✅ 数据库同步完成")
-        except Exception as e:
-            if "Duplicate entry" in str(e):
-                print("⚠️ 数据库今日数据已存在，跳过插入 (非错误)")
-            else:
-                print(f"❌ 数据库写入失败: {e}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM daily WHERE record_date = :record_date"),
+                {"record_date": record_date},
+            )
+            df.to_sql('daily', conn, if_exists='append', index=False)
+        print("✅ 数据库同步完成")
                 
     except Exception as e:
         print(f"连接数据库失败: {e}")
@@ -211,8 +212,8 @@ def main():
     today = datetime.now().strftime('%Y-%m-%d')
     yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
-    output_file = os.path.join("CS/data", f"player_stats_{today}.txt")
-    previous_file = os.path.join("CS/data", f"player_stats_{yesterday}.txt")
+    output_file = DATA_DIR / f"player_stats_{today}.txt"
+    previous_file = DATA_DIR / f"player_stats_{yesterday}.txt"
     
     # 1. 读取昨日数据 (为了计算增量给 TXT 用)
     previous_day_stats = read_previous_day_stats(previous_file, nicknames_to_ids)
