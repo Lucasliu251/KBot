@@ -91,6 +91,8 @@ const MODE_META = {
 
 const tracks = ref<Track[]>(DEMO_TRACKS.map((track) => ({ ...track })))
 const lyrics = ref<LyricLine[]>(DEMO_LYRICS)
+const lyricState = ref<'loading' | 'ready' | 'empty'>('ready')
+const lyricsTrackId = ref('demo-1')
 const position = ref(DEMO_TRACKS[0].position ?? 0)
 const volume = ref(68)
 const isPlaying = ref(true)
@@ -100,6 +102,9 @@ const syncOpen = ref(false)
 const searchOpen = ref(false)
 const channelSwitcherOpen = ref(false)
 const searching = ref(false)
+const loadingMoreSearch = ref(false)
+const searchHasMore = ref(false)
+const activeSearchKeyword = ref('')
 const query = ref('')
 const searchResults = ref<SearchTrack[]>([])
 const playlistInput = ref('')
@@ -117,12 +122,22 @@ const setupError = ref('')
 const demoMode = ref(true)
 const refreshing = ref(false)
 const toast = ref('')
+const seeking = ref(false)
 const dragIndex = ref<number | null>(null)
 const dragTargetIndex = ref<number | null>(null)
 const searchInput = ref<HTMLInputElement | null>(null)
+const searchResultsBox = ref<HTMLElement | null>(null)
 let pollTimer: number | undefined
 let progressTimer: number | undefined
 let toastTimer: number | undefined
+let playlistRequestVersion = 0
+let lyricRequestVersion = 0
+let searchRequestVersion = 0
+let lyricTargetId = 'demo-1'
+let playbackAnchorPosition = position.value
+let playbackAnchorTime = performance.now()
+const lyricCache = new Map<string, LyricLine[]>()
+let hasLoadedLivePlaylist = false
 
 const current = computed(() => tracks.value.find((track) => track.playing))
 const queuedTracks = computed(() => tracks.value.filter((track) => !track.playing))
@@ -162,16 +177,32 @@ function coverFallback(event: Event) {
   if (!image.src.endsWith('/album-placeholder.png')) image.src = FALLBACK_COVER
 }
 
+function syncPlaybackPosition(nextPosition: number, force = false) {
+  const normalized = Math.max(0, Number(nextPosition) || 0)
+  const drift = normalized - position.value
+  position.value = force || Math.abs(drift) > 1.25
+    ? normalized
+    : Math.max(0, position.value + drift * 0.4)
+  playbackAnchorPosition = position.value
+  playbackAnchorTime = performance.now()
+}
+
 async function loadPlaylist(selectedGuild = guildId.value) {
   if (!selectedGuild) return
+  const requestVersion = ++playlistRequestVersion
   try {
     const data = await getJson<{ playlist: Track[] }>(`/api/playlist/current?guild_id=${encodeURIComponent(selectedGuild)}`)
+    if (requestVersion !== playlistRequestVersion) return
     if (data.success === false) throw new Error(data.error)
     const playlist = (data.playlist ?? []).map((track) => ({ ...track, id: String(track.id), duration: Number(track.duration || 0) }))
+    const previousTrackId = current.value?.id
+    const incomingCurrent = playlist.find((track) => track.playing)
     tracks.value = playlist
-    position.value = Number(playlist.find((track) => track.playing)?.position || 0)
+    if (incomingCurrent) syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingCurrent.id)
     demoMode.value = false
+    hasLoadedLivePlaylist = true
   } catch {
+    if (requestVersion !== playlistRequestVersion || hasLoadedLivePlaylist) return
     if (tracks.value.length === 0) tracks.value = DEMO_TRACKS.map((track) => ({ ...track }))
     demoMode.value = true
   }
@@ -307,7 +338,7 @@ onMounted(async () => {
     channelSwitcherOpen.value = true
   }
   window.addEventListener('popstate', handlePopState)
-  pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 5000)
+  pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 2000)
 })
 
 onBeforeUnmount(() => {
@@ -319,10 +350,16 @@ onBeforeUnmount(() => {
   document.body.classList.remove('is-queue-dragging')
 })
 
-watch([isPlaying, current, duration], () => {
+watch([isPlaying, () => current.value?.id, duration], () => {
   if (progressTimer) window.clearInterval(progressTimer)
+  playbackAnchorPosition = position.value
+  playbackAnchorTime = performance.now()
   if (!isPlaying.value || !current.value || duration.value <= 0) return
-  progressTimer = window.setInterval(() => { position.value = Math.min(duration.value, position.value + 1) }, 1000)
+  progressTimer = window.setInterval(() => {
+    if (seeking.value) return
+    const elapsed = (performance.now() - playbackAnchorTime) / 1000
+    position.value = Math.min(duration.value, playbackAnchorPosition + elapsed)
+  }, 100)
 }, { immediate: true })
 
 watch(searchOpen, async (open) => {
@@ -331,27 +368,63 @@ watch(searchOpen, async (open) => {
   window.setTimeout(() => searchInput.value?.focus(), 80)
 })
 
-watch(() => [current.value?.id, demoMode.value] as const, async ([id, isDemo], _, onCleanup) => {
-  if (!id || isDemo || id === 'local') {
-    if (isDemo) lyrics.value = DEMO_LYRICS
+watch(() => current.value?.id, async (id) => {
+  if (!id || id === lyricTargetId) return
+  lyricTargetId = id
+  const requestVersion = ++lyricRequestVersion
+
+  if (demoMode.value || id.startsWith('demo-')) {
+    lyricsTrackId.value = id
+    lyrics.value = DEMO_LYRICS
+    lyricState.value = 'ready'
     return
   }
-  const controller = new AbortController()
-  onCleanup(() => controller.abort())
-  try {
-    const [detail, lyric] = await Promise.all([
-      getJson<{ song?: { album?: string; cover?: string; duration?: number } }>(`/api/song/detail?id=${encodeURIComponent(id)}`, controller.signal),
-      getJson<{ lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}`, controller.signal),
-    ])
+
+  lyricsTrackId.value = id
+  const cachedLyrics = lyricCache.get(id)
+  if (cachedLyrics) {
+    lyrics.value = cachedLyrics
+    lyricState.value = 'ready'
+  } else {
+    lyrics.value = []
+    lyricState.value = 'loading'
+  }
+
+  const detailPromise = getJson<{ song?: { album?: string; cover?: string; duration?: number } }>(`/api/song/detail?id=${encodeURIComponent(id)}`)
+  const lyricPromise = (async () => {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await getJson<{ lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}`)
+        const parsed = parseLyrics(response.lyric ?? '')
+        if (parsed.length || attempt === 1) return parsed
+      } catch {
+        if (attempt === 1) return []
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 450))
+    }
+    return []
+  })()
+
+  const [detailResult, lyricResult] = await Promise.allSettled([detailPromise, lyricPromise])
+  if (requestVersion !== lyricRequestVersion || lyricTargetId !== id) return
+
+  if (detailResult.status === 'fulfilled') {
+    const detail = detailResult.value
     if (detail.song) {
       tracks.value = tracks.value.map((track) => track.id === id
         ? { ...track, album: detail.song?.album || track.album, cover: detail.song?.cover || track.cover, duration: detail.song?.duration || track.duration }
         : track)
     }
-    const parsed = parseLyrics(lyric.lyric ?? '')
-    lyrics.value = parsed.length ? parsed : [{ time: 0, text: '这首歌暂时没有可用歌词' }]
-  } catch {
-    lyrics.value = [{ time: 0, text: '这首歌暂时没有可用歌词' }]
+  }
+
+  const parsedLyrics = lyricResult.status === 'fulfilled' ? lyricResult.value : []
+  if (parsedLyrics.length) {
+    lyricCache.set(id, parsedLyrics)
+    lyrics.value = parsedLyrics
+    lyricState.value = 'ready'
+  } else if (!cachedLyrics) {
+    lyrics.value = []
+    lyricState.value = 'empty'
   }
 })
 
@@ -362,10 +435,12 @@ const activeLyricIndex = computed(() => {
   }
   return 0
 })
-const visibleLyrics = computed(() => Array.from({ length: 15 }, (_, slot) => {
-  const index = activeLyricIndex.value - 7 + slot
-  return { line: lyrics.value[index], index, slot }
-}))
+const lyricItems = computed(() => lyrics.value.map((line, index) => ({
+  line,
+  index,
+  offset: index - activeLyricIndex.value,
+  distance: Math.abs(index - activeLyricIndex.value),
+})))
 
 async function togglePlayback() {
   const next = !isPlaying.value
@@ -432,6 +507,8 @@ async function cyclePlayMode() {
 }
 
 async function commitSeek() {
+  seeking.value = false
+  syncPlaybackPosition(position.value, true)
   if (demoMode.value || !guildId.value) return
   try { await postJson('/api/seek', { guild_id: guildId.value, position: Math.round(position.value) }) }
   catch (error) { notify(error instanceof Error ? error.message : '进度调整失败') }
@@ -463,18 +540,66 @@ async function connectVoice() {
   } catch (error) { notify(error instanceof Error ? error.message : '语音频道操作失败') }
 }
 
+function getSearchPageSize() {
+  const availableHeight = searchResultsBox.value?.clientHeight || 420
+  return Math.max(4, Math.min(12, Math.ceil(availableHeight / 67)))
+}
+
 async function runSearch() {
   const keyword = query.value.trim()
   if (!keyword) return
+  const requestVersion = ++searchRequestVersion
+  activeSearchKeyword.value = keyword
+  searchResults.value = []
+  searchHasMore.value = false
   searching.value = true
   try {
-    const data = await getJson<{ songs: SearchTrack[] }>(`/api/search?keyword=${encodeURIComponent(keyword)}`)
+    const limit = getSearchPageSize()
+    const data = await getJson<{
+      songs: SearchTrack[]
+      pagination?: { has_more?: boolean }
+    }>(`/api/search?keyword=${encodeURIComponent(keyword)}&limit=${limit}&offset=0`)
+    if (requestVersion !== searchRequestVersion) return
     searchResults.value = data.songs ?? []
+    searchHasMore.value = Boolean(data.pagination?.has_more)
     if (!searchResults.value.length) notify('没有找到匹配的歌曲')
   } catch (error) {
+    if (requestVersion !== searchRequestVersion) return
     searchResults.value = []
+    searchHasMore.value = false
     notify(error instanceof Error ? error.message : '搜索服务暂时不可用')
-  } finally { searching.value = false }
+  } finally {
+    if (requestVersion === searchRequestVersion) searching.value = false
+  }
+}
+
+async function loadMoreSearchResults() {
+  if (searching.value || loadingMoreSearch.value || !searchHasMore.value || !activeSearchKeyword.value) return
+  const requestVersion = searchRequestVersion
+  const offset = searchResults.value.length
+  const limit = getSearchPageSize()
+  loadingMoreSearch.value = true
+  try {
+    const data = await getJson<{
+      songs: SearchTrack[]
+      pagination?: { has_more?: boolean }
+    }>(`/api/search?keyword=${encodeURIComponent(activeSearchKeyword.value)}&limit=${limit}&offset=${offset}`)
+    if (requestVersion !== searchRequestVersion) return
+    const knownIds = new Set(searchResults.value.map((song) => String(song.id)))
+    const nextSongs = (data.songs ?? []).filter((song) => !knownIds.has(String(song.id)))
+    searchResults.value = [...searchResults.value, ...nextSongs]
+    searchHasMore.value = Boolean(data.pagination?.has_more)
+  } catch (error) {
+    if (requestVersion === searchRequestVersion) {
+      notify(error instanceof Error ? error.message : '更多搜索结果加载失败')
+    }
+  } finally { loadingMoreSearch.value = false }
+}
+
+function handleSearchScroll(event: Event) {
+  const target = event.currentTarget as HTMLElement
+  const remaining = target.scrollHeight - target.scrollTop - target.clientHeight
+  if (remaining < 90) void loadMoreSearchResults()
 }
 
 async function addSong(song: SearchTrack) {
@@ -641,7 +766,20 @@ async function dropQueue(targetIndex: number) {
           <span v-if="demoMode" class="preview-label">界面预览</span>
         </div>
         <div class="slider-block progress-block">
-          <input v-model.number="position" class="range-input progress-range" type="range" min="0" :max="Math.max(duration, 1)" step="1" :style="rangeProgressStyle" aria-label="歌曲进度" @pointerup="commitSeek" />
+          <input
+            v-model.number="position"
+            class="range-input progress-range"
+            type="range"
+            min="0"
+            :max="Math.max(duration, 1)"
+            step="1"
+            :style="rangeProgressStyle"
+            aria-label="歌曲进度"
+            @pointerdown="seeking = true"
+            @pointerup="seeking = false"
+            @pointercancel="seeking = false"
+            @change="commitSeek"
+          />
           <div class="time-row"><span>{{ formatTime(position) }}</span><span>{{ formatTime(duration) }}</span></div>
         </div>
         <div class="slider-block volume-block">
@@ -678,9 +816,23 @@ async function dropQueue(targetIndex: number) {
           </div>
         </div>
         <div class="lyrics-stage" aria-live="polite">
-          <div class="lyrics-list">
-            <div v-for="item in visibleLyrics" :key="`${item.index}-${item.slot}`" class="lyric-line" :class="{ 'is-current': item.index === activeLyricIndex, 'is-empty': !item.line }" :style="{ '--distance': String(Math.abs(item.slot - 7)) }">
-              {{ item.line?.text || '·' }}
+          <div v-if="lyricState === 'loading'" class="lyric-status">
+            <LoaderCircle :size="22" class="continuous-spin" />
+            <span>正在同步歌词</span>
+          </div>
+          <div v-else-if="lyricState === 'empty'" class="lyric-status">
+            <Music2 :size="24" />
+            <span>这首歌暂时没有可用歌词</span>
+          </div>
+          <div v-else class="lyrics-list">
+            <div
+              v-for="item in lyricItems"
+              :key="`${lyricsTrackId}-${item.index}-${item.line.time}`"
+              class="lyric-line"
+              :class="{ 'is-current': item.index === activeLyricIndex, 'is-hidden': item.distance > 8 }"
+              :style="{ '--offset': String(item.offset), '--distance': String(item.distance) }"
+            >
+              {{ item.line.text }}
             </div>
           </div>
         </div>
@@ -724,13 +876,19 @@ async function dropQueue(targetIndex: number) {
           <label><span>语音频道</span><span class="select-wrap"><select :value="channelId" @change="handleChannelSelection"><option v-if="!channels.length" value="">暂无可用频道</option><option v-for="channel in channels" :key="channel.id" :value="channel.id">{{ channel.name }}</option></select><ChevronDown :size="15" /></span></label>
           <button :class="connected ? 'disconnect-button' : 'connect-button'" @click="connectVoice">{{ connected ? '断开' : '连接' }}</button>
         </div>
-        <div class="search-results">
+        <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
           <button v-for="song in searchResults" :key="song.id" class="search-result" @click="addSong(song)">
             <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
             <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家' }} · {{ song.al?.name || '未知专辑' }}</span></span>
             <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span><CirclePlus :size="20" />
           </button>
           <div v-if="!searchResults.length" class="search-placeholder"><Search :size="28" /><strong>寻找下一首音乐</strong><span>支持网易云歌曲名称、艺术家和专辑搜索</span></div>
+          <div v-else-if="searchHasMore" class="search-load-more">
+            <LoaderCircle v-if="loadingMoreSearch" :size="16" class="continuous-spin" />
+            <ChevronDown v-else :size="15" />
+            <span>{{ loadingMoreSearch ? '正在加载更多' : '向下滚动加载更多' }}</span>
+          </div>
+          <div v-else class="search-results-end">已显示全部结果</div>
         </div>
         <div class="playlist-import">
           <div><strong>导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>

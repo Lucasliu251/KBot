@@ -100,15 +100,15 @@ ensure_ffmpeg() {
 # 确认 Token 和 .env 已经就位
 ensure_env() {
     if [[ ! -f "${ENV_FILE}" ]]; then
-        echo "[serve] 缺少 ${ENV_FILE}，请先配置 BOT_TOKEN。"
+        echo "[serve] 缺少 ${ENV_FILE}，请先配置 MUSIC_BOT_TOKEN。"
         exit 1
     fi
 
     local token
-    token="$(grep -E '^BOT_TOKEN=' "${ENV_FILE}" | tail -n 1 | cut -d= -f2- || true)"
+    token="$(grep -E '^(MUSIC_BOT_TOKEN|BOT_TOKEN)=' "${ENV_FILE}" | tail -n 1 | cut -d= -f2- || true)"
     token="${token//$'\r'/}"
-    if [[ -z "${token}" || "${token}" == "your_bot_token_here" ]]; then
-        echo "[serve] .env 里的 BOT_TOKEN 未配置。"
+    if [[ -z "${token}" || "${token}" == "your_bot_token_here" || "${token}" == "your_music_bot_token_here" ]]; then
+        echo "[serve] .env 里的 MUSIC_BOT_TOKEN 未配置。"
         exit 1
     fi
 }

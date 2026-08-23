@@ -6,6 +6,7 @@ import time
 import kookvoice
 from utils import (
     search_music,
+    search_music_page,
     get_music_url,
     get_playlist,
     get_playlist_urls,
@@ -118,7 +119,7 @@ def register_routes(app, bot, socketio=None):
                 if not BOT_TOKEN:
                     return jsonify({
                         'success': False,
-                        'error': 'BOT_TOKEN 未配置，请先复制 .env.example 为 .env 并填写机器人 Token',
+                        'error': 'MUSIC_BOT_TOKEN 未配置，请先复制 .env.example 为 .env 并填写音乐机器人 Token',
                     }), 503
                 headers = {
                     'Authorization': f'Bot {BOT_TOKEN}',
@@ -177,7 +178,7 @@ def register_routes(app, bot, socketio=None):
                 import requests
                 from config import BOT_TOKEN
                 if not BOT_TOKEN:
-                    return jsonify({'success': False, 'error': 'BOT_TOKEN 未配置'}), 503
+                    return jsonify({'success': False, 'error': 'MUSIC_BOT_TOKEN 未配置'}), 503
                 headers = {
                     'Authorization': f'Bot {BOT_TOKEN}',
                     'Content-Type': 'application/json'
@@ -226,7 +227,7 @@ def register_routes(app, bot, socketio=None):
             import requests
             from config import BOT_TOKEN
             if not BOT_TOKEN:
-                return jsonify({'success': False, 'error': 'BOT_TOKEN 未配置'}), 503
+                return jsonify({'success': False, 'error': 'MUSIC_BOT_TOKEN 未配置'}), 503
             response = requests.get(
                 'https://www.kookapp.cn/api/v3/channel/view',
                 params={'target_id': channel_id},
@@ -344,10 +345,23 @@ def register_routes(app, bot, socketio=None):
         keyword = request.args.get('keyword')
         if not keyword:
             return jsonify({'success': False, 'error': '缺少keyword参数'})
-        
         try:
-            songs = search_music(keyword)
-            return jsonify({'success': True, 'songs': songs})
+            limit = max(1, min(20, int(request.args.get('limit', 8))))
+            offset = max(0, int(request.args.get('offset', 0)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '分页参数无效'}), 400
+        try:
+            songs, total = search_music_page(keyword, limit=limit, offset=offset)
+            return jsonify({
+                'success': True,
+                'songs': songs,
+                'pagination': {
+                    'offset': offset,
+                    'limit': limit,
+                    'total': total,
+                    'has_more': offset + len(songs) < total,
+                },
+            })
         except MusicAPIError as e:
             logger.error(f"搜索音乐服务不可用: {e}")
             return jsonify({'success': False, 'error': str(e)}), 502
@@ -600,6 +614,7 @@ def register_routes(app, bot, socketio=None):
             previous.pop('start', None)
             previous.pop('duration', None)
             kookvoice.play_list[guild_id]['play_list'].insert(0, previous)
+            kookvoice.Player(guild_id).refresh_preload()
             if kookvoice.play_list[guild_id].get('now_playing'):
                 kookvoice.Player(guild_id).skip()
             else:
@@ -625,6 +640,7 @@ def register_routes(app, bot, socketio=None):
                 return jsonify({'success': False, 'error': '队列索引超出范围'})
             item = queue.pop(from_index)
             queue.insert(to_index, item)
+            kookvoice.Player(guild_id).refresh_preload()
             return jsonify({'success': True})
         except Exception as e:
             logger.error(f"调整队列顺序异常: {e}")
@@ -705,6 +721,7 @@ def register_routes(app, bot, socketio=None):
         try:
             if guild_id in kookvoice.play_list:
                 kookvoice.play_list[guild_id]['play_list'] = []
+                kookvoice.Player(guild_id).refresh_preload()
                 return jsonify({'success': True})
             else:
                 return jsonify({'success': True})
@@ -730,6 +747,7 @@ def register_routes(app, bot, socketio=None):
                 playlist = kookvoice.play_list[guild_id]['play_list']
                 if 0 <= int(index) < len(playlist):
                     playlist.pop(int(index))
+                    kookvoice.Player(guild_id).refresh_preload()
                     return jsonify({'success': True})
                 else:
                     return jsonify({'success': False, 'error': '索引超出范围'})

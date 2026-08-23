@@ -16,8 +16,15 @@ DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1", "t")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8004"))
 
-# KOOK 机器人 Token，必须通过环境变量或 .env 注入
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# MusicBot 独立使用的 KOOK 机器人 Token。
+# 保留 BOT_TOKEN 回退仅用于兼容旧部署；其它 KBot 功能不会读取本配置文件。
+MUSIC_BOT_TOKEN = os.environ.get("MUSIC_BOT_TOKEN") or os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = MUSIC_BOT_TOKEN
+
+# 下一首歌曲至少预解码 5 分钟。PCM 为 48kHz / 16-bit / stereo，约 55 MiB。
+MUSIC_PRELOAD_SECONDS = max(300, int(os.environ.get("MUSIC_PRELOAD_SECONDS", "300")))
+MUSIC_CACHE_TTL = max(600, int(os.environ.get("MUSIC_CACHE_TTL", "900")))
+MUSIC_CACHE_MAX_SONGS = max(1, int(os.environ.get("MUSIC_CACHE_MAX_SONGS", "3")))
 
 # Linux 系统 FFmpeg / FFprobe，可用环境变量覆盖
 FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "/usr/bin/ffmpeg")

@@ -11,9 +11,10 @@ cp .env.example .env
 编辑 `.env`，至少填写：
 
 ```dotenv
-BOT_TOKEN=你的_KOOK_机器人_Token
+MUSIC_BOT_TOKEN=你的_MusicBot_KOOK机器人_Token
 FFMPEG_PATH=/usr/bin/ffmpeg
 FFPROBE_PATH=/usr/bin/ffprobe
+MUSIC_PRELOAD_SECONDS=300
 ```
 
 机器人需要先被邀请进 KOOK 服务器，并拥有查看、加入目标语音频道的权限。服务器和语音频道会自动出现在网页选择器中，不需要把 ID 写进源码。

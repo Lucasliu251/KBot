@@ -35,7 +35,10 @@ def build_headers(extra: dict | None = None):
     return headers
 
 # 搜索音乐
-def search_music(keyword):
+def search_music_page(keyword, limit=8, offset=0):
+    """按页搜索歌曲，避免一次把全部结果发送给客户端。"""
+    limit = max(1, min(50, int(limit)))
+    offset = max(0, int(offset))
     for api_base, endpoint in (
         (MUSIC_API_BASE, 'cloudsearch'),
         (BACKUP_MUSIC_API, 'search'),
@@ -43,16 +46,28 @@ def search_music(keyword):
         try:
             res = requests.get(
                 f"{api_base}/{endpoint}",
-                params={'keywords': keyword, 'limit': 30},
+                params={'keywords': keyword, 'limit': limit, 'offset': offset},
                 headers=build_headers(),
                 timeout=12,
             )
             res.raise_for_status()
             data = res.json()
-            return data.get('result', {}).get('songs', [])
+            result = data.get('result', {}) or {}
+            songs = result.get('songs', []) or []
+            total_value = result.get('songCount')
+            total = int(total_value or 0) if total_value is not None else (
+                offset + len(songs) + (1 if len(songs) >= limit else 0)
+            )
+            return songs, total
         except Exception as exc:
             logger.warning(f"音乐搜索接口失败 ({api_base}): {exc}")
     raise MusicAPIError('音乐搜索服务不可用，请检查 MUSIC_API_BASE / BACKUP_MUSIC_API 配置')
+
+
+def search_music(keyword):
+    """兼容机器人文字命令的旧接口，默认返回前 30 首。"""
+    songs, _ = search_music_page(keyword, limit=30, offset=0)
+    return songs
 
 # 获取音乐URL
 def get_music_url(song_id):

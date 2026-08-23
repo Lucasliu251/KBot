@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 # 配置基础日志
@@ -18,7 +19,8 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 try:
     # 加载环境变量
     logger.info("正在加载环境变量...")
-    load_dotenv()
+    # 始终读取 MusicBot 自己的 .env，并覆盖父进程残留的旧机器人配置。
+    load_dotenv(dotenv_path=Path(__file__).with_name('.env'), override=True)
     
     logger.info("正在初始化应用...")
     from app import create_app
