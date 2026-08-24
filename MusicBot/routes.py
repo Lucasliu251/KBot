@@ -843,10 +843,30 @@ def register_routes(app, bot, socketio=None):
         
         try:
             if guild_id in kookvoice.play_list:
-                playlist_data = format_playlist_data(kookvoice.play_list[guild_id])
-                return jsonify({'success': True, 'playlist': playlist_data})
+                guild_playlist = kookvoice.play_list[guild_id]
+                playlist_data = format_playlist_data(guild_playlist)
+                status = kookvoice.guild_status.get(guild_id)
+                now_playing = guild_playlist.get('now_playing') or {}
+                paused = status == kookvoice.Status.PAUSE
+                active = (
+                    status == kookvoice.Status.PLAYING
+                    and bool(now_playing.get('start'))
+                )
+                return jsonify({
+                    'success': True,
+                    'playlist': playlist_data,
+                    'playing': active,
+                    'paused': paused,
+                    'preparing': bool(now_playing) and not active and not paused,
+                })
             else:
-                return jsonify({'success': True, 'playlist': []})
+                return jsonify({
+                    'success': True,
+                    'playlist': [],
+                    'playing': False,
+                    'paused': False,
+                    'preparing': False,
+                })
         except Exception as e:
             logger.error(f"获取播放列表异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -860,6 +880,12 @@ def register_routes(app, bot, socketio=None):
         guild_id = str(guild_id)
         guild_playlist = kookvoice.play_list.get(guild_id, {})
         status = kookvoice.guild_status.get(guild_id)
+        now_playing = guild_playlist.get('now_playing') or {}
+        paused = status == kookvoice.Status.PAUSE
+        active = (
+            status == kookvoice.Status.PLAYING
+            and bool(now_playing.get('start'))
+        )
         return jsonify({
             'success': True,
             'connected': bool(guild_playlist.get('voice_channel')) and status not in (
@@ -869,9 +895,10 @@ def register_routes(app, bot, socketio=None):
             'channel_id': guild_playlist.get('voice_channel', ''),
             'volume': kookvoice.guild_volume.get(guild_id, 0.4),
             'play_mode': kookvoice.guild_play_mode.get(guild_id, 'order'),
-            'paused': status == kookvoice.Status.PAUSE,
-            'playing': status == kookvoice.Status.PLAYING,
-            'position': float((guild_playlist.get('now_playing') or {}).get('ss', 0)),
+            'paused': paused,
+            'playing': active,
+            'preparing': bool(now_playing) and not active and not paused,
+            'position': float(now_playing.get('ss', 0)),
         })
 
     @app.route('/api/volume', methods=['POST'])

@@ -184,6 +184,7 @@ const connected = ref(false)
 const setupError = ref('')
 const bootstrapping = ref(true)
 const playbackControlPending = ref(false)
+const preparingPlayback = ref(false)
 const voiceControlPending = ref(false)
 const clearingQueue = ref(false)
 const refreshing = ref(false)
@@ -593,6 +594,9 @@ async function selectMusicSource(provider: MusicProvider) {
   if (musicSource.value === provider) return
   musicSource.value = provider
   searchRequestVersion += 1
+  searching.value = false
+  discovering.value = false
+  loadingMoreSearch.value = false
   searchResults.value = []
   hotSearches.value = []
   searchHasMore.value = false
@@ -616,7 +620,7 @@ async function loadPlaylist(selectedGuild = guildId.value) {
   if (!selectedGuild) return
   const requestVersion = ++playlistRequestVersion
   try {
-    const data = await getJson<{ playlist: Track[] }>(`/api/playlist/current?guild_id=${encodeURIComponent(selectedGuild)}`)
+    const data = await getJson<{ playlist: Track[]; playing?: boolean; paused?: boolean; preparing?: boolean }>(`/api/playlist/current?guild_id=${encodeURIComponent(selectedGuild)}`)
     if (requestVersion !== playlistRequestVersion) return
     if (data.success === false) throw new Error(data.error)
     const playlist = (data.playlist ?? []).map((track) => ({ ...track, id: String(track.id), duration: Number(track.duration || 0) }))
@@ -626,9 +630,17 @@ async function loadPlaylist(selectedGuild = guildId.value) {
     if (incomingCurrent) {
       const incomingTrackId = `${incomingCurrent.provider || 'netease'}:${incomingCurrent.id}`
       syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingTrackId)
+      if (typeof data.preparing === 'boolean') preparingPlayback.value = data.preparing
+      if (typeof data.playing === 'boolean' || typeof data.paused === 'boolean') {
+        isPlaying.value = Boolean(data.playing) && !data.paused
+      } else if (previousTrackId !== incomingTrackId) {
+        // 兼容后端滚动升级：新曲目出现时先冻结，等待状态接口确认起播。
+        isPlaying.value = false
+      }
     } else {
       position.value = 0
       isPlaying.value = false
+      preparingPlayback.value = false
     }
   } catch {
     if (requestVersion !== playlistRequestVersion) return
@@ -637,10 +649,11 @@ async function loadPlaylist(selectedGuild = guildId.value) {
 
 async function loadPlayerState(selectedGuild: string) {
   try {
-    const data = await getJson<{ connected: boolean; channel_id?: string; volume?: number; play_mode?: PlayMode; paused?: boolean; playing?: boolean; position?: number }>(`/api/player/state?guild_id=${encodeURIComponent(selectedGuild)}`)
+    const data = await getJson<{ connected: boolean; channel_id?: string; volume?: number; play_mode?: PlayMode; paused?: boolean; playing?: boolean; preparing?: boolean; position?: number }>(`/api/player/state?guild_id=${encodeURIComponent(selectedGuild)}`)
     connectedChannelId.value = data.channel_id || ''
     connected.value = Boolean(data.connected) && connectedChannelId.value === channelId.value
     isPlaying.value = Boolean(data.playing) && !data.paused
+    preparingPlayback.value = Boolean(data.preparing)
     if (typeof data.position === 'number' && current.value) syncPlaybackPosition(data.position)
     if (typeof data.volume === 'number') volume.value = Math.round(data.volume * 100)
     if (data.play_mode) playMode.value = data.play_mode
@@ -768,7 +781,7 @@ onMounted(async () => {
     if (!current.value) lyricState.value = 'empty'
   }
   window.addEventListener('popstate', handlePopState)
-  pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 2000)
+  pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 1000)
 })
 
 onBeforeUnmount(() => {
@@ -801,6 +814,10 @@ watch(searchOpen, async (open) => {
   if (!open) {
     if (searchInputTimer) window.clearTimeout(searchInputTimer)
     searchInputTimer = undefined
+    searchRequestVersion += 1
+    searching.value = false
+    discovering.value = false
+    loadingMoreSearch.value = false
     return
   }
   await nextTick()
@@ -905,6 +922,10 @@ const lyricItems = computed(() => lyrics.value.map((line, index) => ({
 })))
 
 async function togglePlayback() {
+  if (preparingPlayback.value) {
+    notify('歌曲正在预热，请稍候')
+    return
+  }
   if (!guildId.value || !current.value || playbackControlPending.value) {
     if (!current.value) notify('当前没有正在播放的歌曲')
     return
@@ -914,6 +935,7 @@ async function togglePlayback() {
   try {
     const data = await postJson<{ paused?: boolean; position?: number }>(next ? '/api/resume' : '/api/pause', { guild_id: guildId.value })
     isPlaying.value = data.paused === undefined ? next : !data.paused
+    preparingPlayback.value = false
     if (typeof data.position === 'number') syncPlaybackPosition(data.position, true)
   } catch (error) {
     notify(error instanceof Error ? error.message : '播放状态切换失败')
@@ -961,6 +983,7 @@ async function clearQueue() {
     lyricRequestVersion += 1
     syncPlaybackPosition(0, true)
     isPlaying.value = false
+    preparingPlayback.value = false
     connected.value = data.disconnected === false
     connectedChannelId.value = connected.value ? channelId.value : ''
     notify(connected.value ? '冷却期间收到新歌曲，机器人继续播放' : '已清空全部音乐并退出语音频道')
@@ -1070,7 +1093,7 @@ async function ensureSearchResultsScrollable() {
 }
 
 async function loadDiscovery() {
-  if (!searchOpen.value || query.value.trim() || (discovering.value && searchMode.value === 'discover')) return
+  if (!searchOpen.value || query.value.trim()) return
   const requestVersion = ++searchRequestVersion
   searchMode.value = 'discover'
   activeSearchKeyword.value = ''
@@ -1399,7 +1422,7 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
       <section class="panel player-panel">
         <div class="cover-wrap">
           <img class="album-cover" :src="current?.cover || FALLBACK_COVER" :alt="current ? `${current.name} 专辑封面` : '默认专辑封面'" @error="coverFallback" />
-          <div class="playing-stamp"><span class="playing-dot" />{{ bootstrapping ? 'LOADING' : current ? (isPlaying ? 'PLAYING' : 'PAUSED') : 'IDLE' }}</div>
+          <div class="playing-stamp"><span class="playing-dot" />{{ bootstrapping ? 'LOADING' : current ? (preparingPlayback ? 'BUFFERING' : isPlaying ? 'PLAYING' : 'PAUSED') : 'IDLE' }}</div>
         </div>
         <div class="track-meta">
           <h1>{{ current?.name || (bootstrapping ? '正在加载' : '等待播放') }}</h1>
@@ -1435,8 +1458,8 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
         <div class="transport-controls">
           <button title="上一首" @click="previousTrack"><SkipBack :size="20" /><span>上一首</span></button>
           <button :disabled="clearingQueue" title="清空全部音乐并退出语音频道" @click="clearQueue"><LoaderCircle v-if="clearingQueue" :size="19" class="continuous-spin" /><Trash2 v-else :size="19" /><span>{{ clearingQueue ? '退出中' : '清空' }}</span></button>
-          <button class="primary-control" :disabled="!current || playbackControlPending" :title="isPlaying ? '暂停' : '继续播放'" @click="togglePlayback">
-            <LoaderCircle v-if="playbackControlPending" :size="19" class="continuous-spin" /><Pause v-else-if="isPlaying" :size="20" /><Play v-else :size="20" fill="currentColor" /><span>{{ playbackControlPending ? '切换中' : isPlaying ? '暂停' : '播放' }}</span>
+          <button class="primary-control" :disabled="!current || playbackControlPending || preparingPlayback" :title="preparingPlayback ? '歌曲预热中' : isPlaying ? '暂停' : '继续播放'" @click="togglePlayback">
+            <LoaderCircle v-if="playbackControlPending || preparingPlayback" :size="19" class="continuous-spin" /><Pause v-else-if="isPlaying" :size="20" /><Play v-else :size="20" fill="currentColor" /><span>{{ preparingPlayback ? '预热中' : playbackControlPending ? '切换中' : isPlaying ? '暂停' : '播放' }}</span>
           </button>
           <button title="下一首" @click="nextTrack"><SkipForward :size="20" /><span>下一首</span></button>
           <button :class="{ 'is-active': playMode !== 'order' }" title="切换播放模式" @click="cyclePlayMode">

@@ -981,8 +981,11 @@ class PlayHandler(threading.Thread):
                         else:
                             if play_list[self.guild]['play_list']:
                                 music_info = play_list[self.guild]['play_list'].pop(0)
-                                if guild_status.get(self.guild) in (Status.SKIP, Status.EMPTY):
-                                    guild_status[self.guild] = Status.END
+                                # 每首新歌都必须重新经历 PREPARING(END) -> PLAYING。
+                                # 上一首自然结束后状态仍可能是 PLAYING，若沿用会让新歌
+                                # 在预热期间提前启动时间轴，也不会生成新的 start 时间。
+                                guild_status[self.guild] = Status.END
+                                music_info.pop('start', None)
                                 play_list[self.guild]['now_playing'] = music_info
                                 # 当前歌曲出队后，立即且只预加载新的队首歌曲。
                                 schedule_next_preload(self.guild)
@@ -1196,6 +1199,9 @@ class PlayHandler(threading.Thread):
                                 guild_status[self.guild] = Status.END
 
                             if guild_status[self.guild] == Status.END:
+                                # 只有预热完成后才发布 PLAYING 和起播时间；预热阶段的
+                                # now_playing 只是“准备中的当前曲目”，不能启动时间轴。
+                                guild_status[self.guild] = Status.PLAYING
                                 music_info['start'] = time.time()
                                 if original_loop:
                                     asyncio.run_coroutine_threadsafe(
@@ -1207,7 +1213,6 @@ class PlayHandler(threading.Thread):
                                     )
                                 if log_enabled:
                                     logger.info(f'开始播放: {file}，服务器: {self.guild}')
-                                guild_status[self.guild] = Status.PLAYING
 
                             chunk_size = PCM_FRAME_BYTES
                             total_audio = b''
