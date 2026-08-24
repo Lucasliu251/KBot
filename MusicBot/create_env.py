@@ -16,7 +16,7 @@ import os
 ENV_CONTENT = """# KOOK机器人配置
 MUSIC_BOT_TOKEN=your_music_bot_token_here
 
-# FFMPEG配置 (Ubuntu 系统路径)
+# FFMPEG配置（可留空让程序从 macOS/Linux PATH 自动发现）
 FFMPEG_PATH=/usr/bin/ffmpeg
 FFPROBE_PATH=/usr/bin/ffprobe
 

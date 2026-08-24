@@ -10,6 +10,7 @@ changelog:
 """
 
 import os
+import shutil
 
 # 基本配置：优先读 .env，便于同一份代码在不同机器上部署
 DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1", "t")
@@ -26,9 +27,17 @@ MUSIC_PRELOAD_SECONDS = max(300, int(os.environ.get("MUSIC_PRELOAD_SECONDS", "30
 MUSIC_CACHE_TTL = max(600, int(os.environ.get("MUSIC_CACHE_TTL", "900")))
 MUSIC_CACHE_MAX_SONGS = max(1, int(os.environ.get("MUSIC_CACHE_MAX_SONGS", "3")))
 
-# Linux 系统 FFmpeg / FFprobe，可用环境变量覆盖
-FFMPEG_PATH = os.environ.get("FFMPEG_PATH", "/usr/bin/ffmpeg")
-FFPROBE_PATH = os.environ.get("FFPROBE_PATH", "/usr/bin/ffprobe")
+def resolve_media_binary(env_name: str, command: str, linux_default: str) -> str:
+    """优先使用有效的显式路径，否则自动发现 macOS/Linux PATH 中的程序。"""
+    configured = os.environ.get(env_name, '').strip()
+    if configured and os.path.isfile(configured) and os.access(configured, os.X_OK):
+        return configured
+    detected = shutil.which(command)
+    return detected or configured or linux_default
+
+
+FFMPEG_PATH = resolve_media_binary("FFMPEG_PATH", "ffmpeg", "/usr/bin/ffmpeg")
+FFPROBE_PATH = resolve_media_binary("FFPROBE_PATH", "ffprobe", "/usr/bin/ffprobe")
 
 # 网易云兼容音乐 API
 MUSIC_API_BASE = os.environ.get(

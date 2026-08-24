@@ -7,6 +7,8 @@ import gc
 import psutil
 import random
 import subprocess
+import sys
+from array import array
 from enum import Enum, unique
 from typing import Dict, Union, List, Any, Optional, Coroutine as CoroutineType
 from asyncio import AbstractEventLoop
@@ -76,6 +78,10 @@ PCM_SAMPLE_RATE = 48000
 PCM_CHANNELS = 2
 PCM_SAMPLE_BYTES = 2
 PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_SAMPLE_BYTES
+PCM_FRAME_DURATION = 0.02
+PCM_FRAME_BYTES = int(PCM_BYTES_PER_SECOND * PCM_FRAME_DURATION)
+PCM_SILENCE_FRAME = bytes(PCM_FRAME_BYTES)
+VOLUME_RAMP_SECONDS = 0.12
 preload_seconds = max(300, MUSIC_PRELOAD_SECONDS)
 preload_max_bytes = preload_seconds * PCM_BYTES_PER_SECOND
 continuation_lead_seconds = 15
@@ -197,9 +203,9 @@ def get_cleanup_stats():
         'cache_max_size': cache_max_size
     }
 
-def get_cache_key(file_path, ss_value=0, volume=0.4):
-    """生成缓存键"""
-    return f"{file_path}:{float(ss_value):.3f}:v{float(volume):.3f}"
+def get_cache_key(file_path, ss_value=0):
+    """生成与音量无关的原始 PCM 缓存键。"""
+    return f"{file_path}:{float(ss_value):.3f}"
 
 
 def get_audio_identity(music_info):
@@ -219,7 +225,50 @@ def get_audio_identity(music_info):
 def get_queue_item_cache_key(guild_id, music_info):
     identity = get_audio_identity(music_info)
     ss_value = music_info.get('ss', 0) if isinstance(music_info, dict) else 0
-    return get_cache_key(f'guild:{guild_id}:{identity}', ss_value, get_guild_volume(guild_id))
+    return get_cache_key(f'guild:{guild_id}:{identity}', ss_value)
+
+
+def apply_pcm_gain(pcm_data: bytes, gain: float) -> bytes:
+    """对 16-bit little-endian PCM 应用增益，不改变缓存中的原始数据。"""
+    if not pcm_data:
+        return pcm_data
+    gain = max(0.0, min(1.0, float(gain)))
+    if gain <= 0.0001:
+        return bytes(len(pcm_data))
+    if gain >= 0.9999:
+        return pcm_data
+    samples = array('h')
+    samples.frombytes(pcm_data)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * gain)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    return samples.tobytes()
+
+
+class PCMVolumeRamp:
+    """在若干个 20ms 帧内平滑过渡音量，避免突变产生爆音。"""
+
+    def __init__(self, gain: float):
+        self.current = max(0.0, min(1.0, float(gain)))
+        self.target = self.current
+        self.step = 0.0
+        self.remaining = 0
+
+    def process(self, pcm_data: bytes, target_gain: float) -> bytes:
+        target_gain = max(0.0, min(1.0, float(target_gain)))
+        if abs(target_gain - self.target) > 0.0001:
+            self.target = target_gain
+            self.remaining = max(1, round(VOLUME_RAMP_SECONDS / PCM_FRAME_DURATION))
+            self.step = (self.target - self.current) / self.remaining
+        if self.remaining > 0:
+            self.current += self.step
+            self.remaining -= 1
+            if self.remaining == 0:
+                self.current = self.target
+        return apply_pcm_gain(pcm_data, self.current)
 
 
 def resolve_audio_source(music_info):
@@ -248,12 +297,12 @@ def resolve_audio_source(music_info):
         return ''
 
 
-def decode_audio_prefix(file_path, ss_value=0, extra_command='', volume=0.4):
+def decode_audio_prefix(file_path, ss_value=0, extra_command=''):
     """同步预解码最多 preload_seconds 秒 PCM，并标记是否已经读完整首。"""
     command = (
         f'{ffmpeg_bin} -loglevel error -nostats -reconnect 1 -reconnect_streamed 1 '
         f'-reconnect_delay_max 2 -timeout 30000000 -ss {ss_value} -i "{file_path}" '
-        f'{extra_command} -filter:a volume={volume} -acodec pcm_s16le -ac {PCM_CHANNELS} '
+        f'{extra_command} -acodec pcm_s16le -ac {PCM_CHANNELS} '
         f'-ar {PCM_SAMPLE_RATE} -f s16le -y -'
     )
     process = subprocess.Popen(
@@ -334,7 +383,6 @@ def schedule_next_preload(guild_id):
                 file_path,
                 next_song.get('ss', 0),
                 extra_command,
-                get_guild_volume(guild_id),
             )
             with cache_lock:
                 job = preload_queue.get(guild_id, {})
@@ -366,7 +414,7 @@ def schedule_next_preload(guild_id):
 
 async def preload_audio(file_path, ss_value=0, extra_command=''):
     """预加载音频数据到缓存"""
-    cache_key = get_cache_key(file_path, ss_value, 0.4)
+    cache_key = get_cache_key(file_path, ss_value)
     with cache_lock:
         if cache_key in audio_cache:
             return audio_cache[cache_key]
@@ -378,7 +426,6 @@ async def preload_audio(file_path, ss_value=0, extra_command=''):
             file_path,
             ss_value,
             extra_command,
-            0.4,
         )
         with cache_lock:
             audio_cache[cache_key] = cached
@@ -487,6 +534,30 @@ class Player:
         if log_enabled:
             logger.info(f'停止播放，服务器: {self.guild_id}')
 
+    def clear(self):
+        """清空该服务器的全部音乐状态，并触发完整的停止、退频道流程。"""
+        global guild_status
+
+        guild_playlist = play_list.get(self.guild_id)
+        if guild_playlist:
+            guild_playlist['play_list'] = []
+            guild_playlist['now_playing'] = None
+
+        play_history.pop(self.guild_id, None)
+        song_play_count.pop(self.guild_id, None)
+
+        # 取消下一首预加载目标并移除本服务器缓存；播放循环已经持有的数据
+        # 仍有自己的引用，可安全等待 STOP 在下一帧边界结束。
+        with cache_lock:
+            preload_queue.pop(self.guild_id, None)
+            for key, value in list(audio_cache.items()):
+                if value.get('owner_guild') == self.guild_id:
+                    del audio_cache[key]
+
+        guild_status[self.guild_id] = Status.STOP
+        if log_enabled:
+            logger.info(f'清空全部音乐并退出语音频道，服务器: {self.guild_id}')
+
     def skip(self, skip_amount: int = 1):
         '''
         跳过指定数量的歌曲
@@ -510,6 +581,8 @@ class Player:
         global guild_status
         if self.guild_id not in play_list:
             raise ValueError('该服务器没有正在播放的歌曲')
+        if not play_list[self.guild_id].get('now_playing'):
+            raise ValueError('当前没有正在播放的歌曲')
         guild_status[self.guild_id] = Status.PAUSE
         if log_enabled:
             logger.info(f'暂停播放，服务器: {self.guild_id}')
@@ -518,6 +591,8 @@ class Player:
         global guild_status
         if self.guild_id not in play_list:
             raise ValueError('该服务器没有正在播放的歌曲')
+        if not play_list[self.guild_id].get('now_playing'):
+            raise ValueError('当前没有可继续播放的歌曲')
         guild_status[self.guild_id] = Status.PLAYING
         if log_enabled:
             logger.info(f'继续播放，服务器: {self.guild_id}')
@@ -620,14 +695,18 @@ class PlayHandler(threading.Thread):
     async def stop(self, start_event):
         await start_event.wait()
         global playlist_handle_status
-        if self.guild in play_list:
-            del play_list[self.guild]
-        if self.guild in playlist_handle_status and playlist_handle_status[self.guild]:
-            playlist_handle_status[self.guild] = False
         try:
-            await self.requestor.leave(self.channel_id)
-        except:
-            pass
+            if self.channel_id:
+                await self.requestor.leave(self.channel_id)
+        except Exception as exc:
+            if log_enabled:
+                logger.warning(f'退出语音频道失败，频道: {self.channel_id}，错误: {exc}')
+        finally:
+            # /api/clear 会等待 play_list 被移除；因此必须在离开请求完成后
+            # 再发布“退出完成”状态，避免前端过早显示已断开。
+            play_list.pop(self.guild, None)
+            if self.guild in playlist_handle_status:
+                playlist_handle_status[self.guild] = False
         if log_enabled:
             logger.info(f'停止并清理，服务器: {self.guild}')
 
@@ -636,6 +715,8 @@ class PlayHandler(threading.Thread):
         playlist_handle_status[self.guild] = True
         try:
             await asyncio.sleep(1)
+            if guild_status.get(self.guild) == Status.STOP:
+                return
             if self.guild in play_list and 'voice_channel' in play_list[self.guild]:
                 new_channel = play_list[self.guild]['voice_channel']
                 self.channel_id = new_channel
@@ -667,7 +748,8 @@ class PlayHandler(threading.Thread):
                 while self.guild in guild_status and guild_status[self.guild] == Status.WAIT:
                     await asyncio.sleep(2)
 
-                command = f"{ffmpeg_bin} -re -loglevel level+info -nostats -f s16le -ac {PCM_CHANNELS} -ar {PCM_SAMPLE_RATE} -i - -map 0:a:0 -acodec libopus -ab {bitrate}k -ac 2 -ar 48000 -filter:a volume=1.0 -f tee [select=a:f=rtp:ssrc={audio_ssrc}:payload_type={audio_pt}]{rtp_url}"
+                # Python 以 20ms 为唯一实时调度时钟；发送端不能再使用 -re 二次节流。
+                command = f"{ffmpeg_bin} -loglevel warning -nostats -f s16le -ac {PCM_CHANNELS} -ar {PCM_SAMPLE_RATE} -i - -map 0:a:0 -acodec libopus -ab {bitrate}k -ac 2 -ar 48000 -f tee [select=a:f=rtp:ssrc={audio_ssrc}:payload_type={audio_pt}]{rtp_url}"
                 if log_enabled:
                     logger.info(f'运行 ffmpeg 命令: {command}')
                 p = await asyncio.create_subprocess_shell(
@@ -676,6 +758,43 @@ class PlayHandler(threading.Thread):
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE
                 )
+
+                async def terminate_process(process):
+                    """终止并回收 FFmpeg 子进程，避免停止/跳过后留下孤儿进程。"""
+                    if not process:
+                        return
+                    try:
+                        if process.returncode is None:
+                            process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=0.5)
+                    except (ProcessLookupError, asyncio.TimeoutError):
+                        pass
+
+                volume_ramp = PCMVolumeRamp(get_guild_volume(self.guild))
+                next_transport_deadline = time.monotonic()
+
+                async def send_transport_frame(frame: bytes):
+                    """按 20ms 节拍发送一帧；落后时重置节拍，绝不追赶补发。"""
+                    nonlocal next_transport_deadline
+                    if not p or not p.stdin:
+                        raise RuntimeError('RTP 编码器不可用')
+                    if len(frame) < PCM_FRAME_BYTES:
+                        frame = frame + bytes(PCM_FRAME_BYTES - len(frame))
+                    elif len(frame) > PCM_FRAME_BYTES:
+                        frame = frame[:PCM_FRAME_BYTES]
+                    delay = next_transport_deadline - time.monotonic()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    elif delay < -PCM_FRAME_DURATION:
+                        next_transport_deadline = time.monotonic()
+                    output_frame = volume_ramp.process(frame, get_guild_volume(self.guild))
+                    p.stdin.write(output_frame)
+                    await p.stdin.drain()
+                    # 每次都从实际写完时刻继续，避免阻塞或暂停后出现 catch-up burst。
+                    next_transport_deadline = max(
+                        next_transport_deadline + PCM_FRAME_DURATION,
+                        time.monotonic() + PCM_FRAME_DURATION,
+                    )
 
                 while True:
                     await asyncio.sleep(0.5)
@@ -834,7 +953,7 @@ class PlayHandler(threading.Thread):
                                     f'{ffmpeg_bin} -loglevel warning -nostats -reconnect 1 '
                                     f'-reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 '
                                     f'-ss {start_position} -i "{file}" {extra_command} '
-                                    f'-filter:a volume={get_guild_volume(self.guild)} -acodec pcm_s16le '
+                                    f'-acodec pcm_s16le '
                                     f'-ac {PCM_CHANNELS} -ar {PCM_SAMPLE_RATE} -f s16le -y -'
                                 )
                                 try:
@@ -844,7 +963,6 @@ class PlayHandler(threading.Thread):
                                         stdout=asyncio.subprocess.PIPE,
                                         stderr=asyncio.subprocess.PIPE,
                                     )
-                                    await asyncio.sleep(0.1)
                                     if decoder.returncode not in (None, 0):
                                         if log_enabled:
                                             logger.error(f'FFMPEG 解码进程启动失败: {decoder.returncode}')
@@ -873,22 +991,6 @@ class PlayHandler(threading.Thread):
                             if log_enabled:
                                 logger.info(f'开始播放音频，预期时长: {expected_duration:.2f} 秒')
 
-                            # 记录播放开始时间
-                            first_music_start_time = time.time()
-                            
-                            # 进程健康检查
-                            def check_process_health():
-                                """检查进程健康状态"""
-                                if p2 and p2.returncode not in (None, 0):
-                                    if log_enabled:
-                                        logger.warning(f'FFMPEG进程异常退出，返回码: {p2.returncode}')
-                                    return False
-                                if p and p.returncode is not None:
-                                    if log_enabled:
-                                        logger.warning(f'编码进程异常退出，返回码: {p.returncode}')
-                                    return False
-                                return True
-
                             # 设置播放状态
                             if self.guild not in guild_status:
                                 guild_status[self.guild] = Status.END
@@ -906,23 +1008,86 @@ class PlayHandler(threading.Thread):
                                     logger.info(f'开始播放: {file}，服务器: {self.guild}')
                                 guild_status[self.guild] = Status.PLAYING
 
-                            chunk_size = 96000
+                            chunk_size = PCM_FRAME_BYTES
                             total_audio = b''
-                            last_write_time = 0.0
                             consecutive_empty_reads = 0
-                            max_empty_reads = 10  # 最大连续空读取次数
+                            # 解码读取也使用 20ms 轮询，这样网络缓冲期间仍能持续送静音，
+                            # 不会让 RTP 编码器断粮。累计 10 秒无歌曲数据后才尝试续流。
+                            max_empty_reads = max(1, int(10 / PCM_FRAME_DURATION))
+                            decoder_restart_attempts = 0
+                            max_decoder_restart_attempts = 2
+                            source_audio_bytes_sent = 0
+
+                            def current_media_position():
+                                return float(ss_value) + source_audio_bytes_sent / PCM_BYTES_PER_SECOND
+
+                            def update_media_position():
+                                """歌曲时钟只由已经送出的歌曲采样推进，静音帧不参与。"""
+                                if self.guild in play_list and play_list[self.guild]['now_playing']:
+                                    play_list[self.guild]['now_playing']['ss'] = min(
+                                        expected_duration,
+                                        current_media_position(),
+                                    )
+
+                            async def restart_decoder(reason):
+                                """上游在暂停或网络抖动后失效时，从已发送采样处精确续流。"""
+                                nonlocal p2, total_audio, consecutive_empty_reads
+                                nonlocal continuation_started, decoder_restart_attempts
+
+                                restart_position = current_media_position()
+                                if (decoder_restart_attempts >= max_decoder_restart_attempts
+                                        or restart_position >= expected_duration - 1.0):
+                                    return False
+
+                                decoder_restart_attempts += 1
+                                if log_enabled:
+                                    logger.warning(
+                                        f'解码流{reason}，从 {restart_position:.3f}s 重建 '
+                                        f'({decoder_restart_attempts}/{max_decoder_restart_attempts})'
+                                    )
+
+                                old_decoder = p2
+                                p2 = None
+                                await terminate_process(old_decoder)
+
+                                # 未满一帧的数据尚未计入歌曲时钟；丢弃后由新解码器重取，
+                                # 避免旧半帧与 seek 后的新数据发生重复拼接。
+                                total_audio = b''
+                                consecutive_empty_reads = 0
+                                p2 = await start_decoder(restart_position)
+                                continuation_started = True
+                                return p2 is not None
+
+                            update_media_position()
 
                             try:
                                 skip_song = False
                                 audio_data_index = 0  # 缓存数据索引
                                 
                                 while True:
-                                    # 检查进程健康状态
-                                    if not check_process_health():
+                                    state = guild_status.get(self.guild, Status.STOP)
+                                    if p and p.returncode is not None:
                                         if log_enabled:
-                                            logger.error(f'进程健康检查失败，停止播放: {file}')
+                                            logger.error(f'RTP 编码器异常退出: {p.returncode}')
                                         break
-                                    
+
+                                    # 控制命令必须在读取、消费下一帧歌曲数据之前处理。
+                                    if state == Status.STOP:
+                                        if self.guild in play_list:
+                                            play_list[self.guild]['play_list'] = []
+                                        await terminate_process(p2)
+                                        await terminate_process(p)
+                                        return
+                                    if state == Status.SKIP:
+                                        guild_status[self.guild] = Status.END
+                                        skip_song = True
+                                        await terminate_process(p2)
+                                        break
+                                    if state == Status.PAUSE:
+                                        # 仅推进 RTP 传输时钟，不推进歌曲时钟或解码游标。
+                                        await send_transport_frame(PCM_SILENCE_FRAME)
+                                        continue
+
                                     new_audio = None
                                     
                                     # 缓存还剩 15 秒时启动续流解码，避免连接空闲 5 分钟后失效。
@@ -950,72 +1115,42 @@ class PlayHandler(threading.Thread):
                                         try:
                                             # 使用超时读取，避免无限阻塞
                                             new_audio = await asyncio.wait_for(
-                                                p2.stdout.read(chunk_size), 
-                                                timeout=2.0
+                                                p2.stdout.read(chunk_size),
+                                                timeout=PCM_FRAME_DURATION,
                                             )
                                         except asyncio.TimeoutError:
-                                            # 读取超时，检查进程状态
                                             if p2.returncode is not None:
-                                                # 进程已退出
-                                                if log_enabled:
-                                                    logger.warning(f'解码进程已退出: {file}, 返回码: {p2.returncode}')
-                                                    # 读取进程错误输出
-                                                    if p2.stderr:
-                                                        try:
-                                                            stderr_data = await p2.stderr.read()
-                                                            if stderr_data:
-                                                                stderr_text = stderr_data.decode('utf-8', errors='ignore')
-                                                                logger.warning(f'解码进程错误输出: {stderr_text[:500]}')
-                                                        except Exception as e:
-                                                            logger.warning(f'读取解码进程错误输出失败: {e}')
+                                                if await restart_decoder(f'异常退出（{p2.returncode}）'):
+                                                    await send_transport_frame(PCM_SILENCE_FRAME)
+                                                    continue
                                                 break
-                                            # 进程仍在运行，继续尝试读取
                                             consecutive_empty_reads += 1
                                             if consecutive_empty_reads >= max_empty_reads:
+                                                if await restart_decoder('连续 10 秒无数据'):
+                                                    await send_transport_frame(PCM_SILENCE_FRAME)
+                                                    continue
                                                 if log_enabled:
-                                                    logger.warning(f'连续{max_empty_reads}次读取超时，可能网络问题: {file}')
-                                                    logger.warning(f'当前进程状态: 返回码={p2.returncode}, 是否运行中={p2.returncode is None}')
+                                                    logger.warning(f'解码流连续 10 秒无数据且无法恢复: {file}')
                                                 break
+                                            # 缓冲期间维持 RTP 连续，歌曲位置保持不变。
+                                            await send_transport_frame(PCM_SILENCE_FRAME)
                                             continue
 
                                         if not new_audio:
                                             consecutive_empty_reads += 1
-                                            if consecutive_empty_reads >= max_empty_reads:
-                                                # 打印解码器stderr，帮助定位
-                                                if p2.stderr:
-                                                    try:
-                                                        err_text = (await p2.stderr.read()).decode('utf-8', errors='ignore').strip()
-                                                        if err_text and log_enabled:
-                                                            logger.warning(f'解码进程stderr: {err_text[:500]}')
-                                                    except Exception:
-                                                        pass
-
-                                                # 写入剩余缓存
-                                                if total_audio and p and p.stdin:
-                                                    try:
-                                                        p.stdin.write(total_audio)
-                                                        await p.stdin.drain()
-                                                        if log_enabled:
-                                                            logger.info(f'写入剩余音频数据: {len(total_audio)} 字节')
-                                                    except Exception as e:
-                                                        if log_enabled:
-                                                            logger.error(f'写入剩余音频数据异常: {e}')
-
-                                                # 若播放时长不足，继续等待凑够最小时长
-                                                actual_duration = max(0.0, time.time() - first_music_start_time)
-                                                min_play_time = 30.0
-                                                target_duration = max(expected_duration, min_play_time)
-                                                if actual_duration < target_duration:
-                                                    wait_sec = target_duration - actual_duration
-                                                    if log_enabled:
-                                                        logger.info(f'等待剩余时间: {wait_sec:.2f} 秒 (目标时长: {target_duration:.2f} 秒)')
-                                                    await asyncio.sleep(wait_sec)
-
-                                                if log_enabled:
-                                                    logger.info(f'音频播放完成: {file}')
+                                            if p2.returncode is not None:
+                                                if await restart_decoder(f'提前结束（{p2.returncode}）'):
+                                                    await send_transport_frame(PCM_SILENCE_FRAME)
+                                                    continue
                                                 break
+                                            if consecutive_empty_reads >= max_empty_reads:
+                                                if await restart_decoder('连续返回空数据'):
+                                                    await send_transport_frame(PCM_SILENCE_FRAME)
+                                                    continue
+                                                break
+                                            await send_transport_frame(PCM_SILENCE_FRAME)
+                                            continue
                                         else:
-                                            # 重置连续空读取计数
                                             consecutive_empty_reads = 0
                                     else:
                                         # 没有缓存也没有进程，结束播放
@@ -1024,55 +1159,29 @@ class PlayHandler(threading.Thread):
                                     if new_audio:
                                         total_audio += new_audio
 
-                                        # 成块写入编码器stdin
+                                        # 只按完整 20ms PCM 帧发送，控制与进度均在帧边界生效。
                                         while len(total_audio) >= chunk_size:
+                                            state = guild_status.get(self.guild, Status.STOP)
+                                            if state == Status.PAUSE:
+                                                break
+                                            if state == Status.SKIP:
+                                                guild_status[self.guild] = Status.END
+                                                skip_song = True
+                                                await terminate_process(p2)
+                                                break
+                                            if state == Status.STOP:
+                                                if self.guild in play_list:
+                                                    play_list[self.guild]['play_list'] = []
+                                                await terminate_process(p2)
+                                                await terminate_process(p)
+                                                return
                                             audio_slice = total_audio[:chunk_size]
                                             total_audio = total_audio[chunk_size:]
                                             if p and p.stdin:
                                                 try:
-                                                    now = time.time()
-                                                    if last_write_time > 0:
-                                                        elapsed = now - last_write_time
-                                                        if elapsed < 0.02:
-                                                            await asyncio.sleep(0.02 - elapsed)
-                                                    # 暂停控制：当状态为 PAUSE 时，阻塞写入，直到恢复
-                                                    if self.guild in guild_status and guild_status[self.guild] == Status.PAUSE:
-                                                        while self.guild in guild_status and guild_status[self.guild] == Status.PAUSE:
-                                                            await asyncio.sleep(0.1)
-                                                    p.stdin.write(audio_slice)
-                                                    await p.stdin.drain()
-                                                    last_write_time = time.time()
-
-                                                    # 更新前端显示进度
-                                                    if self.guild in play_list and play_list[self.guild]['now_playing']:
-                                                        play_list[self.guild]['now_playing']['ss'] = (
-                                                            float(ss_value) + last_write_time - first_music_start_time
-                                                        )
-
-                                                    # 中断控制
-                                                    if self.guild in guild_status:
-                                                        state = guild_status[self.guild]
-                                                        if state == Status.SKIP:
-                                                            if log_enabled:
-                                                                logger.info(f'跳过当前歌曲: {file}')
-                                                            # 重置状态并标记跳过当前歌曲，不退出整个推流
-                                                            try:
-                                                                guild_status[self.guild] = Status.END
-                                                            except Exception:
-                                                                pass
-                                                            skip_song = True
-                                                            try:
-                                                                if p2:
-                                                                    p2.kill()
-                                                            except Exception:
-                                                                pass
-                                                            break
-                                                        if state == Status.STOP:
-                                                            if log_enabled:
-                                                                logger.info(f'停止播放: {file}')
-                                                            if self.guild in play_list:
-                                                                play_list[self.guild]['play_list'] = []
-                                                            return
+                                                    await send_transport_frame(audio_slice)
+                                                    source_audio_bytes_sent += len(audio_slice)
+                                                    update_media_position()
                                                 except Exception as e:
                                                     if log_enabled:
                                                         logger.error(f'音频写入异常: {e}', exc_info=True)
@@ -1083,21 +1192,29 @@ class PlayHandler(threading.Thread):
                                         # 若标记跳过，结束本曲读循环
                                         if skip_song:
                                             break
-                                    else:
-                                        if log_enabled:
-                                            logger.error(f'音频进程异常: {file}')
-                                        break
 
-                                # 完整歌曲末尾通常不足一个 96KB 块，也必须写入，避免截掉最后半秒。
+                                # 完整歌曲末尾不足一个 20ms 帧时补静音发送，但只计算真实歌曲字节。
                                 if total_audio and not skip_song and p and p.stdin:
-                                    p.stdin.write(total_audio)
-                                    await p.stdin.drain()
-                                    last_write_time = time.time()
-                                    if self.guild in play_list and play_list[self.guild]['now_playing']:
-                                        play_list[self.guild]['now_playing']['ss'] = min(
-                                            expected_duration,
-                                            float(ss_value) + last_write_time - first_music_start_time,
-                                        )
+                                    while True:
+                                        final_state = guild_status.get(self.guild, Status.STOP)
+                                        if final_state == Status.PAUSE:
+                                            await send_transport_frame(PCM_SILENCE_FRAME)
+                                            continue
+                                        if final_state == Status.SKIP:
+                                            guild_status[self.guild] = Status.END
+                                            skip_song = True
+                                        elif final_state == Status.STOP:
+                                            if self.guild in play_list:
+                                                play_list[self.guild]['play_list'] = []
+                                            await terminate_process(p2)
+                                            await terminate_process(p)
+                                            return
+                                        else:
+                                            final_source_bytes = len(total_audio)
+                                            await send_transport_frame(total_audio)
+                                            source_audio_bytes_sent += final_source_bytes
+                                            update_media_position()
+                                        break
                             except Exception as e:
                                 if log_enabled:
                                     logger.error(f'音频播放异常: {e}', exc_info=True)
@@ -1127,6 +1244,7 @@ class PlayHandler(threading.Thread):
                                             except Exception as stderr_e:
                                                 logger.error(f'错误详情 - 读取编码器stderr失败: {stderr_e}')
                             finally:
+                                await terminate_process(p2)
                                 if cache_entry:
                                     with cache_lock:
                                         live_entry = audio_cache.get(cache_key)
@@ -1164,10 +1282,8 @@ class PlayHandler(threading.Thread):
                             # 检查是否还有更多歌曲
                             if self.guild in play_list and len(play_list[self.guild]['play_list']) == 0:
                                 try:
-                                    if p:
-                                        p.kill()
-                                    if p2:
-                                        p2.kill()
+                                    await terminate_process(p)
+                                    await terminate_process(p2)
                                 except Exception as e:
                                     if log_enabled:
                                         logger.error(f'关闭FFMPEG进程异常: {e}')

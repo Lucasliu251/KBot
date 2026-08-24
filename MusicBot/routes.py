@@ -595,26 +595,30 @@ def register_routes(app, bot, socketio=None):
             'volume': kookvoice.guild_volume.get(guild_id, 0.4),
             'play_mode': kookvoice.guild_play_mode.get(guild_id, 'order'),
             'paused': status == kookvoice.Status.PAUSE,
+            'playing': status == kookvoice.Status.PLAYING,
+            'position': float((guild_playlist.get('now_playing') or {}).get('ss', 0)),
         })
 
     @app.route('/api/volume', methods=['POST'])
     def set_volume():
-        """设置服务器播放音量；播放中会从当前位置平滑重启解码流。"""
+        """设置服务器播放音量；发送循环会在约 120ms 内平滑应用。"""
         data = request.json or {}
-        guild_id = str(data.get('guild_id', ''))
+        guild_id = data.get('guild_id')
         try:
             volume = float(data.get('volume'))
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': 'volume必须是0到1之间的数字'})
         if not guild_id or not 0 <= volume <= 1:
             return jsonify({'success': False, 'error': '音量范围必须是0到1'})
+        guild_id = str(guild_id)
         try:
             kookvoice.guild_volume[guild_id] = volume
-            kookvoice.audio_cache.clear()
             now_playing = kookvoice.play_list.get(guild_id, {}).get('now_playing')
-            if now_playing:
-                kookvoice.Player(guild_id).seek(int(now_playing.get('ss', 0)))
-            return jsonify({'success': True, 'volume': volume})
+            return jsonify({
+                'success': True,
+                'volume': volume,
+                'position': float((now_playing or {}).get('ss', 0)),
+            })
         except Exception as e:
             logger.error(f"设置音量异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -687,11 +691,13 @@ def register_routes(app, bot, socketio=None):
         
         if not guild_id:
             return jsonify({'success': False, 'error': '缺少guild_id参数'})
+        guild_id = str(guild_id)
         
         try:
             player = kookvoice.Player(guild_id)
             player.pause()
-            return jsonify({'success': True})
+            position = float((kookvoice.play_list.get(str(guild_id), {}).get('now_playing') or {}).get('ss', 0))
+            return jsonify({'success': True, 'paused': True, 'position': position})
         except Exception as e:
             logger.error(f"暂停播放异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -711,7 +717,8 @@ def register_routes(app, bot, socketio=None):
         try:
             player = kookvoice.Player(guild_id)
             player.resume()
-            return jsonify({'success': True})
+            position = float((kookvoice.play_list.get(str(guild_id), {}).get('now_playing') or {}).get('ss', 0))
+            return jsonify({'success': True, 'paused': False, 'position': position})
         except Exception as e:
             logger.error(f"继续播放异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -738,7 +745,7 @@ def register_routes(app, bot, socketio=None):
     
     @app.route('/api/clear', methods=['POST'])
     def clear_playlist():
-        """清空播放列表"""
+        """清空当前歌曲与等待队列，并退出语音频道。"""
         data = request.json
         if not data:
             return jsonify({'success': False, 'error': '请求数据为空'})
@@ -747,16 +754,25 @@ def register_routes(app, bot, socketio=None):
         
         if not guild_id:
             return jsonify({'success': False, 'error': '缺少guild_id参数'})
+        guild_id = str(guild_id)
         
         try:
             if guild_id in kookvoice.play_list:
-                kookvoice.play_list[guild_id]['play_list'] = []
-                kookvoice.Player(guild_id).refresh_preload()
-                return jsonify({'success': True})
+                kookvoice.Player(guild_id).clear()
+                deadline = time.time() + 4
+                while guild_id in kookvoice.play_list and time.time() < deadline:
+                    time.sleep(0.05)
+                if guild_id in kookvoice.play_list:
+                    return jsonify({
+                        'success': False,
+                        'error': '播放线程仍在退出，请稍后再试',
+                    }), 409
             else:
-                return jsonify({'success': True})
+                # 即使连接已结束，也确保旧历史与缓存目标不会残留。
+                kookvoice.Player(guild_id).clear()
+            return jsonify({'success': True, 'disconnected': True, 'playlist': []})
         except Exception as e:
-            logger.error(f"清空播放列表异常: {e}")
+            logger.error(f"清空全部音乐异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/remove', methods=['POST'])

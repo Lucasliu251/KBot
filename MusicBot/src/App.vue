@@ -63,46 +63,19 @@ type SearchMode = 'discover' | 'search'
 type LyricLine = { time: number; text: string }
 
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
-const DEMO_TRACKS: Track[] = [
-  { id: 'demo-1', name: '凌晨来信', artist: '灰色电台', album: '城市失眠指南', cover: FALLBACK_COVER, duration: 238, position: 87, playing: true },
-  { id: 'demo-2', name: '飞鸟经过的夜晚', artist: '匿名旅人', album: '风的回声', cover: FALLBACK_COVER, duration: 214, queue_index: 0 },
-  { id: 'demo-3', name: '把黄昏留在窗边', artist: '南方邮局', album: '日落以后', cover: FALLBACK_COVER, duration: 253, queue_index: 1 },
-  { id: 'demo-4', name: '温柔的噪音', artist: '低空飞行', album: '白昼梦', cover: FALLBACK_COVER, duration: 196, queue_index: 2 },
-  { id: 'demo-5', name: '世界安静三秒', artist: '云层收音机', album: '无人的海岸线', cover: FALLBACK_COVER, duration: 226, queue_index: 3 },
-]
-const DEMO_LYRICS: LyricLine[] = [
-  { time: 0, text: '路灯把影子写得很长' },
-  { time: 12, text: '晚风穿过没有人的广场' },
-  { time: 25, text: '收音机里传来一阵微光' },
-  { time: 38, text: '像某封忘记寄出的信一样' },
-  { time: 51, text: '我们曾沿着河岸慢慢走' },
-  { time: 64, text: '把沉默留给身后的高楼' },
-  { time: 77, text: '这一刻城市放轻了呼吸' },
-  { time: 90, text: '我听见你在凌晨的回音' },
-  { time: 103, text: '穿过雨落下来的缝隙' },
-  { time: 116, text: '停在离我不远的屋顶' },
-  { time: 129, text: '如果明天仍旧没有答案' },
-  { time: 142, text: '就让今晚再走得慢一点' },
-  { time: 155, text: '让旧唱片继续转一圈' },
-  { time: 168, text: '让没说完的话留在耳边' },
-  { time: 181, text: '天亮之前不必告别' },
-  { time: 194, text: '我们只是路过这场长夜' },
-  { time: 207, text: '等第一班列车驶过窗前' },
-  { time: 220, text: '再把名字交还给明天' },
-]
 const MODE_META = {
   order: { label: '顺序播放', icon: Repeat2 },
   'repeat-one': { label: '单曲循环', icon: Repeat1 },
   shuffle: { label: '随机播放', icon: Shuffle },
 } as const
 
-const tracks = ref<Track[]>(DEMO_TRACKS.map((track) => ({ ...track })))
-const lyrics = ref<LyricLine[]>(DEMO_LYRICS)
-const lyricState = ref<'loading' | 'ready' | 'empty'>('ready')
-const lyricsTrackId = ref('demo-1')
-const position = ref(DEMO_TRACKS[0].position ?? 0)
-const volume = ref(68)
-const isPlaying = ref(true)
+const tracks = ref<Track[]>([])
+const lyrics = ref<LyricLine[]>([])
+const lyricState = ref<'loading' | 'ready' | 'empty'>('loading')
+const lyricsTrackId = ref('')
+const position = ref(0)
+const volume = ref(40)
+const isPlaying = ref(false)
 const playMode = ref<PlayMode>('order')
 const lyricOffset = ref(0)
 const syncOpen = ref(false)
@@ -130,7 +103,10 @@ const resolvedChannelName = ref('')
 const connectedChannelId = ref('')
 const connected = ref(false)
 const setupError = ref('')
-const demoMode = ref(true)
+const bootstrapping = ref(true)
+const playbackControlPending = ref(false)
+const voiceControlPending = ref(false)
+const clearingQueue = ref(false)
 const refreshing = ref(false)
 const toast = ref('')
 const seeking = ref(false)
@@ -141,14 +117,15 @@ const searchResultsBox = ref<HTMLElement | null>(null)
 let pollTimer: number | undefined
 let progressTimer: number | undefined
 let toastTimer: number | undefined
+let volumeTimer: number | undefined
 let playlistRequestVersion = 0
 let lyricRequestVersion = 0
 let searchRequestVersion = 0
-let lyricTargetId = 'demo-1'
+let volumeRequestVersion = 0
+let lyricTargetId = ''
 let playbackAnchorPosition = position.value
 let playbackAnchorTime = performance.now()
 const lyricCache = new Map<string, LyricLine[]>()
-let hasLoadedLivePlaylist = false
 
 const current = computed(() => tracks.value.find((track) => track.playing))
 const queuedTracks = computed(() => tracks.value.filter((track) => !track.playing))
@@ -209,22 +186,24 @@ async function loadPlaylist(selectedGuild = guildId.value) {
     const previousTrackId = current.value?.id
     const incomingCurrent = playlist.find((track) => track.playing)
     tracks.value = playlist
-    if (incomingCurrent) syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingCurrent.id)
-    demoMode.value = false
-    hasLoadedLivePlaylist = true
+    if (incomingCurrent) {
+      syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingCurrent.id)
+    } else {
+      position.value = 0
+      isPlaying.value = false
+    }
   } catch {
-    if (requestVersion !== playlistRequestVersion || hasLoadedLivePlaylist) return
-    if (tracks.value.length === 0) tracks.value = DEMO_TRACKS.map((track) => ({ ...track }))
-    demoMode.value = true
+    if (requestVersion !== playlistRequestVersion) return
   }
 }
 
 async function loadPlayerState(selectedGuild: string) {
   try {
-    const data = await getJson<{ connected: boolean; channel_id?: string; volume?: number; play_mode?: PlayMode; paused?: boolean }>(`/api/player/state?guild_id=${encodeURIComponent(selectedGuild)}`)
+    const data = await getJson<{ connected: boolean; channel_id?: string; volume?: number; play_mode?: PlayMode; paused?: boolean; playing?: boolean; position?: number }>(`/api/player/state?guild_id=${encodeURIComponent(selectedGuild)}`)
     connectedChannelId.value = data.channel_id || ''
     connected.value = Boolean(data.connected) && connectedChannelId.value === channelId.value
-    isPlaying.value = !data.paused
+    isPlaying.value = Boolean(data.playing) && !data.paused
+    if (typeof data.position === 'number' && current.value) syncPlaybackPosition(data.position)
     if (typeof data.volume === 'number') volume.value = Math.round(data.volume * 100)
     if (data.play_mode) playMode.value = data.play_mode
   } catch {
@@ -344,9 +323,11 @@ onMounted(async () => {
       channelSwitcherOpen.value = !channelId.value
     }
   } catch (error) {
-    demoMode.value = true
     setupError.value = error instanceof Error ? error.message : '后端服务暂时不可用'
     channelSwitcherOpen.value = true
+  } finally {
+    bootstrapping.value = false
+    if (!current.value) lyricState.value = 'empty'
   }
   window.addEventListener('popstate', handlePopState)
   pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 2000)
@@ -356,6 +337,7 @@ onBeforeUnmount(() => {
   if (pollTimer) window.clearInterval(pollTimer)
   if (progressTimer) window.clearInterval(progressTimer)
   if (toastTimer) window.clearTimeout(toastTimer)
+  if (volumeTimer) window.clearTimeout(volumeTimer)
   window.removeEventListener('popstate', handlePopState)
   window.removeEventListener('pointerup', finishPointerDrag)
   document.body.classList.remove('is-queue-dragging')
@@ -381,16 +363,17 @@ watch(searchOpen, async (open) => {
 })
 
 watch(() => current.value?.id, async (id) => {
-  if (!id || id === lyricTargetId) return
-  lyricTargetId = id
-  const requestVersion = ++lyricRequestVersion
-
-  if (demoMode.value || id.startsWith('demo-')) {
-    lyricsTrackId.value = id
-    lyrics.value = DEMO_LYRICS
-    lyricState.value = 'ready'
+  if (!id) {
+    lyricTargetId = ''
+    lyricsTrackId.value = ''
+    lyricRequestVersion += 1
+    lyrics.value = []
+    lyricState.value = bootstrapping.value ? 'loading' : 'empty'
     return
   }
+  if (id === lyricTargetId) return
+  lyricTargetId = id
+  const requestVersion = ++lyricRequestVersion
 
   lyricsTrackId.value = id
   const cachedLyrics = lyricCache.get(id)
@@ -455,23 +438,26 @@ const lyricItems = computed(() => lyrics.value.map((line, index) => ({
 })))
 
 async function togglePlayback() {
+  if (!guildId.value || !current.value || playbackControlPending.value) {
+    if (!current.value) notify('当前没有正在播放的歌曲')
+    return
+  }
   const next = !isPlaying.value
-  isPlaying.value = next
-  if (demoMode.value || !guildId.value) return
+  playbackControlPending.value = true
   try {
-    await postJson(next ? '/api/resume' : '/api/pause', { guild_id: guildId.value })
+    const data = await postJson<{ paused?: boolean; position?: number }>(next ? '/api/resume' : '/api/pause', { guild_id: guildId.value })
+    isPlaying.value = data.paused === undefined ? next : !data.paused
+    if (typeof data.position === 'number') syncPlaybackPosition(data.position, true)
   } catch (error) {
-    isPlaying.value = !next
     notify(error instanceof Error ? error.message : '播放状态切换失败')
+  } finally {
+    playbackControlPending.value = false
   }
 }
 
 async function previousTrack() {
-  if (demoMode.value) {
-    const active = tracks.value.findIndex((track) => track.playing)
-    const previous = active <= 0 ? tracks.value.length - 1 : active - 1
-    tracks.value = tracks.value.map((track, index) => ({ ...track, playing: index === previous }))
-    position.value = 0
+  if (!guildId.value) {
+    notify('请先选择语音频道')
     return
   }
   try {
@@ -481,11 +467,8 @@ async function previousTrack() {
 }
 
 async function nextTrack() {
-  if (demoMode.value) {
-    const active = tracks.value.findIndex((track) => track.playing)
-    const next = active < 0 || active === tracks.value.length - 1 ? 0 : active + 1
-    tracks.value = tracks.value.map((track, index) => ({ ...track, playing: index === next }))
-    position.value = 0
+  if (!guildId.value || !current.value) {
+    notify('当前没有正在播放的歌曲')
     return
   }
   try {
@@ -495,61 +478,107 @@ async function nextTrack() {
 }
 
 async function clearQueue() {
-  if (!window.confirm('确认清空等待播放的歌曲？当前歌曲不会被中断。')) return
-  tracks.value = tracks.value.filter((track) => track.playing)
-  if (demoMode.value) return
+  if (clearingQueue.value) return
+  if (!guildId.value) {
+    notify('请先选择语音频道')
+    return
+  }
+  clearingQueue.value = true
   try {
     await postJson('/api/clear', { guild_id: guildId.value })
-    notify('播放队列已清空')
+    tracks.value = []
+    lyrics.value = []
+    lyricState.value = 'empty'
+    lyricsTrackId.value = ''
+    lyricTargetId = ''
+    lyricRequestVersion += 1
+    syncPlaybackPosition(0, true)
+    isPlaying.value = false
+    connected.value = false
+    connectedChannelId.value = ''
+    notify('已清空全部音乐并退出语音频道')
   } catch (error) {
     notify(error instanceof Error ? error.message : '清空失败')
-    await loadPlaylist()
+    await Promise.all([loadPlaylist(), loadPlayerState(guildId.value)])
+  } finally {
+    clearingQueue.value = false
   }
 }
 
 async function cyclePlayMode() {
+  if (!guildId.value) {
+    notify('请先选择语音频道')
+    return
+  }
   const modes: PlayMode[] = ['order', 'repeat-one', 'shuffle']
   const next = modes[(modes.indexOf(playMode.value) + 1) % modes.length]
   playMode.value = next
   notify(`已切换为${MODE_META[next].label}`)
-  if (!demoMode.value && guildId.value) {
-    try { await postJson('/api/play-mode', { guild_id: guildId.value, mode: next }) }
-    catch (error) { notify(error instanceof Error ? error.message : '播放模式切换失败') }
-  }
+  try { await postJson('/api/play-mode', { guild_id: guildId.value, mode: next }) }
+  catch (error) { notify(error instanceof Error ? error.message : '播放模式切换失败') }
 }
 
 async function commitSeek() {
   seeking.value = false
   syncPlaybackPosition(position.value, true)
-  if (demoMode.value || !guildId.value) return
+  if (!guildId.value || !current.value) return
   try { await postJson('/api/seek', { guild_id: guildId.value, position: Math.round(position.value) }) }
   catch (error) { notify(error instanceof Error ? error.message : '进度调整失败') }
 }
 
 async function commitVolume() {
-  if (demoMode.value || !guildId.value) return
-  try { await postJson('/api/volume', { guild_id: guildId.value, volume: volume.value / 100 }) }
-  catch (error) { notify(error instanceof Error ? error.message : '音量调整失败') }
+  if (volumeTimer) {
+    window.clearTimeout(volumeTimer)
+    volumeTimer = undefined
+  }
+  if (!guildId.value) return
+  const requestVersion = ++volumeRequestVersion
+  const requestedVolume = volume.value / 100
+  try {
+    const data = await postJson<{ volume?: number }>('/api/volume', { guild_id: guildId.value, volume: requestedVolume })
+    if (requestVersion === volumeRequestVersion
+        && Math.abs(volume.value / 100 - requestedVolume) < 0.005
+        && typeof data.volume === 'number') {
+      volume.value = Math.round(data.volume * 100)
+    }
+  } catch (error) {
+    if (requestVersion === volumeRequestVersion) notify(error instanceof Error ? error.message : '音量调整失败')
+  }
+}
+
+function scheduleVolumeCommit() {
+  // 拖动开始立即生效，持续拖动时最多每 80ms 合并一次最新值。
+  if (volumeTimer) return
+  void commitVolume()
+  volumeTimer = window.setTimeout(() => {
+    volumeTimer = undefined
+    void commitVolume()
+  }, 80)
 }
 
 async function connectVoice() {
+  if (voiceControlPending.value) return
   if (!guildId.value || !channelId.value) {
     channelSwitcherOpen.value = true
     notify('请先选择语音频道')
     return
   }
-  if (!connected.value && connectedChannelId.value && connectedChannelId.value !== channelId.value) {
-    const confirmed = window.confirm('机器人正在另一个语音频道播放。切换连接会停止当前播放并清空队列，是否继续？')
-    if (!confirmed) return
-  }
+  const leaving = connected.value
+  const switching = !leaving && Boolean(connectedChannelId.value) && connectedChannelId.value !== channelId.value
+  voiceControlPending.value = true
   try {
-    await postJson(connected.value ? '/api/leave' : '/api/join', connected.value
+    await postJson(leaving ? '/api/leave' : '/api/join', leaving
       ? { guild_id: guildId.value }
       : { guild_id: guildId.value, channel_id: channelId.value })
-    connected.value = !connected.value
+    connected.value = !leaving
     connectedChannelId.value = connected.value ? channelId.value : ''
-    notify(connected.value ? `已连接到 ${channelName.value}` : '已断开语音频道')
-  } catch (error) { notify(error instanceof Error ? error.message : '语音频道操作失败') }
+    notify(leaving ? '已断开语音频道' : switching ? `已切换到 ${channelName.value}` : `已连接到 ${channelName.value}`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '语音频道操作失败')
+    await loadPlayerState(guildId.value)
+  } finally {
+    voiceControlPending.value = false
+  }
 }
 
 function getSearchPageSize() {
@@ -757,7 +786,7 @@ async function dropQueue(targetIndex: number) {
   tracks.value = [...playing, ...nextQueue.map((track, index) => ({ ...track, queue_index: index }))]
   dragIndex.value = null
   dragTargetIndex.value = null
-  if (!demoMode.value && guildId.value) {
+  if (guildId.value) {
     try { await postJson('/api/queue/reorder', { guild_id: guildId.value, from_index: from, to_index: to }) }
     catch (error) {
       notify(error instanceof Error ? error.message : '排序保存失败')
@@ -812,8 +841,8 @@ async function dropQueue(targetIndex: number) {
         </div>
       </div>
       <div class="top-actions">
-        <button class="connection-state" :class="connected ? 'is-connected' : 'is-disconnected'" :title="connected ? '点击断开语音连接' : '点击连接所选语音频道'" @click="connectVoice">
-          <Wifi v-if="connected" :size="17" /><WifiOff v-else :size="17" /><span>{{ connected ? '已连接' : channelId ? '待连接' : '未选择' }}</span>
+        <button class="connection-state" :class="connected ? 'is-connected' : 'is-disconnected'" :disabled="voiceControlPending" :aria-busy="voiceControlPending" :title="connected ? '点击断开语音连接' : '点击连接所选语音频道'" @click="connectVoice">
+          <LoaderCircle v-if="voiceControlPending" :size="17" class="continuous-spin" /><Wifi v-else-if="connected" :size="17" /><WifiOff v-else :size="17" /><span>{{ voiceControlPending ? '处理中' : connected ? '已连接' : channelId ? '待连接' : '未选择' }}</span>
         </button>
         <button class="icon-button" aria-label="搜索音乐" title="搜索音乐" @click="searchOpen = true"><Search :size="19" /></button>
         <button class="icon-button" aria-label="刷新页面状态" title="刷新页面状态" @click="refreshAll"><RefreshCw :size="19" :class="{ 'spin-once': refreshing }" /></button>
@@ -824,16 +853,15 @@ async function dropQueue(targetIndex: number) {
       <section class="panel player-panel">
         <div class="cover-wrap">
           <img class="album-cover" :src="current?.cover || FALLBACK_COVER" :alt="current ? `${current.name} 专辑封面` : '默认专辑封面'" @error="coverFallback" />
-          <div class="playing-stamp"><span class="playing-dot" />{{ isPlaying ? 'PLAYING' : 'PAUSED' }}</div>
+          <div class="playing-stamp"><span class="playing-dot" />{{ bootstrapping ? 'LOADING' : current ? (isPlaying ? 'PLAYING' : 'PAUSED') : 'IDLE' }}</div>
         </div>
         <div class="track-meta">
-          <h1>{{ current?.name || '等待播放' }}</h1>
-          <h2>{{ current?.artist || '从右上角搜索并添加音乐' }}</h2>
+          <h1>{{ current?.name || (bootstrapping ? '正在加载' : '等待播放') }}</h1>
+          <h2>{{ current?.artist || (bootstrapping ? '正在读取播放器状态' : '从右上角搜索并添加音乐') }}</h2>
           <p>{{ current?.album || '互联网垃圾桶音乐控制台' }}</p>
         </div>
         <div class="source-row">
           <span class="netease-dot"><Music2 :size="13" /></span><span class="source-name">NETEASE</span>
-          <span v-if="demoMode" class="preview-label">界面预览</span>
         </div>
         <div class="slider-block progress-block">
           <input
@@ -845,6 +873,7 @@ async function dropQueue(targetIndex: number) {
             step="1"
             :style="rangeProgressStyle"
             aria-label="歌曲进度"
+            :disabled="!current"
             @pointerdown="seeking = true"
             @pointerup="seeking = false"
             @pointercancel="seeking = false"
@@ -854,14 +883,14 @@ async function dropQueue(targetIndex: number) {
         </div>
         <div class="slider-block volume-block">
           <Volume2 :size="17" />
-          <input v-model.number="volume" class="range-input volume-range" type="range" min="0" max="100" :style="volumeProgressStyle" aria-label="音量" @pointerup="commitVolume" />
+          <input v-model.number="volume" class="range-input volume-range" type="range" min="0" max="100" :style="volumeProgressStyle" aria-label="音量" @input="scheduleVolumeCommit" @change="commitVolume" />
           <span class="volume-value">{{ volume }}%</span>
         </div>
         <div class="transport-controls">
           <button title="上一首" @click="previousTrack"><SkipBack :size="20" /><span>上一首</span></button>
-          <button title="清空播放队列" @click="clearQueue"><Trash2 :size="19" /><span>清空</span></button>
-          <button class="primary-control" :title="isPlaying ? '暂停' : '继续播放'" @click="togglePlayback">
-            <Pause v-if="isPlaying" :size="20" /><Play v-else :size="20" fill="currentColor" /><span>{{ isPlaying ? '暂停' : '播放' }}</span>
+          <button :disabled="clearingQueue" title="清空全部音乐并退出语音频道" @click="clearQueue"><LoaderCircle v-if="clearingQueue" :size="19" class="continuous-spin" /><Trash2 v-else :size="19" /><span>{{ clearingQueue ? '退出中' : '清空' }}</span></button>
+          <button class="primary-control" :disabled="!current || playbackControlPending" :title="isPlaying ? '暂停' : '继续播放'" @click="togglePlayback">
+            <LoaderCircle v-if="playbackControlPending" :size="19" class="continuous-spin" /><Pause v-else-if="isPlaying" :size="20" /><Play v-else :size="20" fill="currentColor" /><span>{{ playbackControlPending ? '切换中' : isPlaying ? '暂停' : '播放' }}</span>
           </button>
           <button title="下一首" @click="nextTrack"><SkipForward :size="20" /><span>下一首</span></button>
           <button :class="{ 'is-active': playMode !== 'order' }" title="切换播放模式" @click="cyclePlayMode">
@@ -892,7 +921,7 @@ async function dropQueue(targetIndex: number) {
           </div>
           <div v-else-if="lyricState === 'empty'" class="lyric-status">
             <Music2 :size="24" />
-            <span>这首歌暂时没有可用歌词</span>
+            <span>{{ current ? '这首歌暂时没有可用歌词' : '播放歌曲后将在这里显示歌词' }}</span>
           </div>
           <div v-else class="lyrics-list">
             <div
@@ -944,7 +973,7 @@ async function dropQueue(targetIndex: number) {
         <div class="connection-picker">
           <label><span>服务器</span><span class="select-wrap"><select :value="guildId" @change="handleGuildSelection"><option v-if="!guilds.length" value="">暂无可用服务器</option><option v-for="guild in guilds" :key="guild.id" :value="guild.id">{{ guild.name }}</option></select><ChevronDown :size="15" /></span></label>
           <label><span>语音频道</span><span class="select-wrap"><select :value="channelId" @change="handleChannelSelection"><option v-if="!channels.length" value="">暂无可用频道</option><option v-for="channel in channels" :key="channel.id" :value="channel.id">{{ channel.name }}</option></select><ChevronDown :size="15" /></span></label>
-          <button :class="connected ? 'disconnect-button' : 'connect-button'" @click="connectVoice">{{ connected ? '断开' : '连接' }}</button>
+          <button :class="connected ? 'disconnect-button' : 'connect-button'" :disabled="voiceControlPending" :aria-busy="voiceControlPending" @click="connectVoice">{{ voiceControlPending ? '处理中' : connected ? '断开' : '连接' }}</button>
         </div>
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
           <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">

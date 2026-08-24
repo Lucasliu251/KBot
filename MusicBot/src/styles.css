@@ -155,6 +155,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   font-weight: 600;
 }
 .connection-state:hover, .icon-button:hover, .subtle-button:hover { background: var(--surface-hover); color: var(--text); }
+.connection-state:disabled { opacity: 0.58; cursor: wait; transform: none; }
 .connection-state.is-connected { color: var(--green); }
 .connection-state.is-disconnected { color: #df6a62; }
 .icon-button {
@@ -216,9 +217,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .track-meta p { margin-top: 5px; color: var(--faint); font-size: 12px; }
 .source-row { height: 26px; gap: 7px; }
 .netease-dot { width: 20px; height: 20px; display: grid; place-items: center; color: white; background: var(--red); border-radius: 7px; }
-.source-name, .preview-label { font-size: 9px; font-weight: 700; letter-spacing: 0.08em; }
-.source-name { color: #9e9c96; }
-.preview-label { padding-left: 8px; color: #6f6d68; border-left: 1px solid var(--line); }
+.source-name { color: #9e9c96; font-size: 9px; font-weight: 700; letter-spacing: 0.08em; }
 
 .slider-block { margin-top: 11px; }
 .range-input {
@@ -235,6 +234,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .range-input::-webkit-slider-thumb { width: 13px; height: 13px; margin-top: -4.5px; appearance: none; border: 3px solid #f7f3ed; border-radius: 50%; background: var(--red); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); opacity: 0; transition: opacity 150ms ease; }
 .range-input::-moz-range-thumb { width: 9px; height: 9px; border: 2px solid #f7f3ed; border-radius: 50%; background: var(--red); opacity: 0; }
 .range-input:hover::-webkit-slider-thumb, .range-input:focus::-webkit-slider-thumb, .range-input:hover::-moz-range-thumb { opacity: 1; }
+.range-input:disabled { opacity: 0.42; cursor: not-allowed; }
 .time-row { display: flex; justify-content: space-between; margin-top: 2px; color: #77756f; font-size: 10px; font-variant-numeric: tabular-nums; }
 .volume-block { margin-top: 7px; gap: 10px; color: #817f78; }
 .volume-block .range-input { flex: 1; }
@@ -260,6 +260,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 }
 .transport-controls button:hover { color: white; background: #2a2a27; }
 .transport-controls button:active { transform: translateY(1px); }
+.transport-controls button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 .transport-controls button span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 9px; }
 .transport-controls .primary-control { color: white; background: var(--red); }
 .transport-controls .primary-control:hover { background: #ff6a5d; }
@@ -396,6 +397,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .connection-picker > button { align-self: end; height: 31px; margin: 0; padding: 0 12px; }
 .connection-picker > button.disconnect-button { color: #e7857d; background: rgba(255, 91, 77, 0.11); }
 .connection-picker > button.connect-button { color: #91dfaa; background: rgba(109, 213, 140, 0.11); }
+.connection-picker > button:disabled { opacity: 0.58; cursor: wait; }
 .search-results { flex: 1; min-height: 150px; margin-top: 14px; overflow-y: auto; }
 .discover-section { padding: 3px 5px 8px; }
 .discover-heading { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 10px; }
