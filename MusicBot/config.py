@@ -22,10 +22,18 @@ PORT = int(os.environ.get("PORT", "8004"))
 MUSIC_BOT_TOKEN = os.environ.get("MUSIC_BOT_TOKEN") or os.environ.get("BOT_TOKEN", "")
 BOT_TOKEN = MUSIC_BOT_TOKEN
 
-# 下一首歌曲至少预解码 5 分钟。PCM 为 48kHz / 16-bit / stereo，约 55 MiB。
-MUSIC_PRELOAD_SECONDS = max(300, int(os.environ.get("MUSIC_PRELOAD_SECONDS", "300")))
+# 下一首歌曲默认预解码 10 分钟。PCM 为 48kHz / 16-bit / stereo，约 110 MiB；
+# 每个频道仍然只预载队首下一首，不会把整个歌单同时放进内存。
+MUSIC_PRELOAD_SECONDS = max(300, int(os.environ.get("MUSIC_PRELOAD_SECONDS", "600")))
 MUSIC_CACHE_TTL = max(600, int(os.environ.get("MUSIC_CACHE_TTL", "900")))
 MUSIC_CACHE_MAX_SONGS = max(1, int(os.environ.get("MUSIC_CACHE_MAX_SONGS", "3")))
+
+# 实时播放由独立解码生产者持续向有界缓冲写入，RTP 发送线程只按 20ms 消费。
+MUSIC_STREAM_BUFFER_SECONDS = max(15, int(os.environ.get("MUSIC_STREAM_BUFFER_SECONDS", "45")))
+MUSIC_STARTUP_BUFFER_SECONDS = max(3, int(os.environ.get("MUSIC_STARTUP_BUFFER_SECONDS", "8")))
+MUSIC_STARTUP_GRACE_SECONDS = max(0.5, float(os.environ.get("MUSIC_STARTUP_GRACE_SECONDS", "2.5")))
+MUSIC_CONTINUATION_LEAD_SECONDS = max(30, int(os.environ.get("MUSIC_CONTINUATION_LEAD_SECONDS", "90")))
+MUSIC_IDLE_DISCONNECT_SECONDS = max(0.0, float(os.environ.get("MUSIC_IDLE_DISCONNECT_SECONDS", "3")))
 
 def resolve_media_binary(env_name: str, command: str, linux_default: str) -> str:
     """优先使用有效的显式路径，否则自动发现 macOS/Linux PATH 中的程序。"""

@@ -18,9 +18,27 @@ except ImportError:
     from requestor import VoiceRequestor
 
 try:
-    from ..config import MUSIC_CACHE_MAX_SONGS, MUSIC_CACHE_TTL, MUSIC_PRELOAD_SECONDS
+    from ..config import (
+        MUSIC_CACHE_MAX_SONGS,
+        MUSIC_CACHE_TTL,
+        MUSIC_CONTINUATION_LEAD_SECONDS,
+        MUSIC_IDLE_DISCONNECT_SECONDS,
+        MUSIC_PRELOAD_SECONDS,
+        MUSIC_STARTUP_BUFFER_SECONDS,
+        MUSIC_STARTUP_GRACE_SECONDS,
+        MUSIC_STREAM_BUFFER_SECONDS,
+    )
 except ImportError:
-    from config import MUSIC_CACHE_MAX_SONGS, MUSIC_CACHE_TTL, MUSIC_PRELOAD_SECONDS
+    from config import (
+        MUSIC_CACHE_MAX_SONGS,
+        MUSIC_CACHE_TTL,
+        MUSIC_CONTINUATION_LEAD_SECONDS,
+        MUSIC_IDLE_DISCONNECT_SECONDS,
+        MUSIC_PRELOAD_SECONDS,
+        MUSIC_STARTUP_BUFFER_SECONDS,
+        MUSIC_STARTUP_GRACE_SECONDS,
+        MUSIC_STREAM_BUFFER_SECONDS,
+    )
 
 # 配置日志
 logger = logging.getLogger(__name__)
@@ -84,7 +102,12 @@ PCM_SILENCE_FRAME = bytes(PCM_FRAME_BYTES)
 VOLUME_RAMP_SECONDS = 0.12
 preload_seconds = max(300, MUSIC_PRELOAD_SECONDS)
 preload_max_bytes = preload_seconds * PCM_BYTES_PER_SECOND
-continuation_lead_seconds = 15
+continuation_lead_seconds = MUSIC_CONTINUATION_LEAD_SECONDS
+decoder_buffer_seconds = MUSIC_STREAM_BUFFER_SECONDS
+startup_buffer_seconds = min(MUSIC_STARTUP_BUFFER_SECONDS, decoder_buffer_seconds)
+startup_grace_seconds = MUSIC_STARTUP_GRACE_SECONDS
+idle_disconnect_seconds = MUSIC_IDLE_DISCONNECT_SECONDS
+PCM_DECODER_READ_BYTES = PCM_BYTES_PER_SECOND // 2
 audio_cache = {}  # key -> {data, complete, duration, owner_guild, ...}
 preload_queue = {}  # guild_id -> {key, generation, running}
 cache_lock = threading.RLock()
@@ -272,6 +295,68 @@ class PCMVolumeRamp:
         return apply_pcm_gain(pcm_data, self.current)
 
 
+class BufferedPCMDecoder:
+    """持续读取 FFmpeg 输出，并与 20ms RTP 发送时钟解耦。"""
+
+    def __init__(self, process, capacity_seconds=decoder_buffer_seconds):
+        self.process = process
+        chunk_capacity = max(
+            2,
+            int(capacity_seconds * PCM_BYTES_PER_SECOND / PCM_DECODER_READ_BYTES),
+        )
+        self.queue = asyncio.Queue(maxsize=chunk_capacity)
+        self.buffered_bytes = 0
+        self.eof = False
+        self.error = None
+        self._closed = False
+        self.task = asyncio.create_task(self._pump())
+
+    async def _pump(self):
+        try:
+            if not self.process or not self.process.stdout:
+                return
+            while not self._closed:
+                reached_eof = False
+                try:
+                    # 固定聚合为 0.5 秒块，队列容量才能准确对应配置的秒数。
+                    chunk = await self.process.stdout.readexactly(PCM_DECODER_READ_BYTES)
+                except asyncio.IncompleteReadError as exc:
+                    chunk = exc.partial
+                    reached_eof = True
+                if not chunk:
+                    break
+                await self.queue.put(chunk)
+                self.buffered_bytes += len(chunk)
+                if reached_eof:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.eof = True
+
+    async def read(self, timeout=PCM_FRAME_DURATION):
+        """有数据返回 bytes，暂时缺数据返回 None，完整结束返回 b''。"""
+        if self.eof and self.queue.empty():
+            return b''
+        try:
+            chunk = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return b'' if self.eof and self.queue.empty() else None
+        self.buffered_bytes = max(0, self.buffered_bytes - len(chunk))
+        return chunk
+
+    async def close(self):
+        self._closed = True
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+
 def resolve_audio_source(music_info):
     """把音源标记解析为临时播放 URL，并在过期前复用。"""
     file_path = music_info.get('file', '')
@@ -311,6 +396,9 @@ def resolve_audio_source(music_info):
             except ImportError:
                 from utils import get_music_url
             resolved = get_music_url(parts[1])
+            extra['_resolved_url'] = resolved
+            # 网易云播放 URL 通常是临时地址；保守地在 4 分钟后重新解析。
+            extra['_resolved_expires_at'] = time.time() + 240
         if resolved:
             music_info['resolved_file'] = resolved
         return resolved
@@ -320,7 +408,7 @@ def resolve_audio_source(music_info):
         return ''
 
 
-def decode_audio_prefix(file_path, ss_value=0, extra_command=''):
+def decode_audio_prefix(file_path, ss_value=0, extra_command='', cancel_event=None):
     """同步预解码最多 preload_seconds 秒 PCM，并标记是否已经读完整首。"""
     command = (
         f'{ffmpeg_bin} -loglevel error -nostats -reconnect 1 -reconnect_streamed 1 '
@@ -337,8 +425,12 @@ def decode_audio_prefix(file_path, ss_value=0, extra_command=''):
     )
     audio_data = bytearray()
     complete = False
+    cancelled = False
     try:
         while len(audio_data) < preload_max_bytes:
+            if cancel_event and cancel_event.is_set():
+                cancelled = True
+                break
             remaining = preload_max_bytes - len(audio_data)
             chunk = process.stdout.read(min(96000, remaining)) if process.stdout else b''
             if not chunk:
@@ -364,6 +456,7 @@ def decode_audio_prefix(file_path, ss_value=0, extra_command=''):
         'duration': len(data) / PCM_BYTES_PER_SECOND,
         'size': len(data),
         'timestamp': time.time(),
+        'cancelled': cancelled,
     }
 
 
@@ -384,16 +477,28 @@ def schedule_next_preload(guild_id):
                     and not value.get('in_use')):
                 del audio_cache[key]
 
+        existing_job = preload_queue.get(guild_id, {})
         if not next_song:
+            cancel_event = existing_job.get('cancel_event')
+            if cancel_event:
+                cancel_event.set()
             preload_queue.pop(guild_id, None)
             return
-        existing_job = preload_queue.get(guild_id, {})
         if next_key in audio_cache or (
             existing_job.get('key') == next_key and existing_job.get('running')
         ):
             return
+        previous_cancel_event = existing_job.get('cancel_event')
+        if previous_cancel_event:
+            previous_cancel_event.set()
         generation = time.time_ns()
-        preload_queue[guild_id] = {'key': next_key, 'generation': generation, 'running': True}
+        cancel_event = threading.Event()
+        preload_queue[guild_id] = {
+            'key': next_key,
+            'generation': generation,
+            'running': True,
+            'cancel_event': cancel_event,
+        }
 
     def run_preload():
         try:
@@ -406,7 +511,32 @@ def schedule_next_preload(guild_id):
                 file_path,
                 next_song.get('ss', 0),
                 extra_command,
+                cancel_event,
             )
+            if cached.get('cancelled'):
+                if log_enabled:
+                    logger.info(f'下一首预加载已取消: {next_key}')
+                return
+            try:
+                expected_remaining = max(
+                    0.0,
+                    float(extra.get('duration', 0) or 0) - float(next_song.get('ss', 0) or 0),
+                )
+            except (TypeError, ValueError):
+                expected_remaining = 0.0
+            if (cached.get('complete') and expected_remaining > 0
+                    and cached.get('duration', 0) < expected_remaining - 2.0):
+                # FFmpeg 正常退出不代表歌曲真的完整；临时 URL 失效时也可能只返回
+                # 一个短片段。按 API 元数据识别“假 EOF”，保留前缀并继续续流。
+                cached['complete'] = False
+                next_song.pop('resolved_file', None)
+                extra.pop('_resolved_url', None)
+                extra.pop('_resolved_expires_at', None)
+                if log_enabled:
+                    logger.warning(
+                        f'下一首预加载提前结束: 得到 {cached["duration"]:.1f}s / '
+                        f'预期 {expected_remaining:.1f}s，将在播放时刷新 URL 续流'
+                    )
             with cache_lock:
                 job = preload_queue.get(guild_id, {})
                 current_queue = play_list.get(guild_id, {}).get('play_list', [])
@@ -415,6 +545,7 @@ def schedule_next_preload(guild_id):
                     return
                 cached['owner_guild'] = guild_id
                 cached['in_use'] = False
+                cached.pop('cancelled', None)
                 audio_cache[next_key] = cached
                 job['running'] = False
                 if log_enabled:
@@ -535,7 +666,8 @@ class Player:
         
         if log_enabled:
             logger.info(f'添加音乐到播放列表，服务器: {self.guild_id}，音乐: {music}')
-        if self.guild_id in guild_status and guild_status[self.guild_id] == Status.WAIT:
+        if (self.guild_id in guild_status
+                and guild_status[self.guild_id] in (Status.WAIT, Status.EMPTY)):
             guild_status[self.guild_id] = Status.END
         if need_start:
             if play_list[self.guild_id]['play_list']:
@@ -558,7 +690,7 @@ class Player:
             logger.info(f'停止播放，服务器: {self.guild_id}')
 
     def clear(self):
-        """清空该服务器的全部音乐状态，并触发完整的停止、退频道流程。"""
+        """清空全部音乐；播放线程保留短暂冷却，期间有新歌则继续复用连接。"""
         global guild_status
 
         guild_playlist = play_list.get(self.guild_id)
@@ -570,16 +702,23 @@ class Player:
         song_play_count.pop(self.guild_id, None)
 
         # 取消下一首预加载目标并移除本服务器缓存；播放循环已经持有的数据
-        # 仍有自己的引用，可安全等待 STOP 在下一帧边界结束。
+        # 仍有自己的引用，可安全等待 SKIP 在下一帧边界结束。
         with cache_lock:
-            preload_queue.pop(self.guild_id, None)
+            preload_job = preload_queue.pop(self.guild_id, None)
+            cancel_event = preload_job.get('cancel_event') if preload_job else None
+            if cancel_event:
+                cancel_event.set()
             for key, value in list(audio_cache.items()):
                 if value.get('owner_guild') == self.guild_id:
                     del audio_cache[key]
 
-        guild_status[self.guild_id] = Status.STOP
+        # SKIP 会立即停止当前歌曲，但不会立刻拆掉 RTP/语音连接。
+        guild_status[self.guild_id] = Status.SKIP
         if log_enabled:
-            logger.info(f'清空全部音乐并退出语音频道，服务器: {self.guild_id}')
+            logger.info(
+                f'清空全部音乐，进入 {idle_disconnect_seconds:.1f}s 退出冷却，'
+                f'服务器: {self.guild_id}'
+            )
 
     def skip(self, skip_amount: int = 1):
         '''
@@ -819,6 +958,21 @@ class PlayHandler(threading.Thread):
                         time.monotonic() + PCM_FRAME_DURATION,
                     )
 
+                async def wait_for_queue_during_cooldown():
+                    """队列暂空时维持 RTP，冷却结束仍无新歌才真正离开频道。"""
+                    deadline = time.monotonic() + idle_disconnect_seconds
+                    while time.monotonic() < deadline:
+                        if guild_status.get(self.guild) == Status.STOP:
+                            return False
+                        queue = play_list.get(self.guild, {}).get('play_list', [])
+                        if queue:
+                            guild_status[self.guild] = Status.END
+                            if log_enabled:
+                                logger.info(f'退出冷却期间收到新歌曲，继续复用语音连接: {self.guild}')
+                            return True
+                        await send_transport_frame(PCM_SILENCE_FRAME)
+                    return False
+
                 while True:
                     await asyncio.sleep(0.5)
                     if self.guild in play_list:
@@ -827,11 +981,14 @@ class PlayHandler(threading.Thread):
                         else:
                             if play_list[self.guild]['play_list']:
                                 music_info = play_list[self.guild]['play_list'].pop(0)
-                                music_info['start'] = time.time()
+                                if guild_status.get(self.guild) in (Status.SKIP, Status.EMPTY):
+                                    guild_status[self.guild] = Status.END
                                 play_list[self.guild]['now_playing'] = music_info
                                 # 当前歌曲出队后，立即且只预加载新的队首歌曲。
                                 schedule_next_preload(self.guild)
                             else:
+                                if await wait_for_queue_during_cooldown():
+                                    continue
                                 break
                         
                         if isinstance(music_info, dict) and 'file' in music_info:
@@ -841,116 +998,67 @@ class PlayHandler(threading.Thread):
                                     logger.warning('无法解析歌曲播放地址，跳过当前歌曲')
                                 continue
 
-                            extra_command = ''
-                            if 'extra' in music_info and music_info['extra']:
-                                extra_data = music_info['extra']
-                                extra_command = extra_data.get('extra_command', '')
+                            extra_data = music_info.get('extra') or {}
+                            extra_command = extra_data.get('extra_command', '')
+                            if extra_data:
 
                                 def pack_command(full_command, name, value):
                                     if value:
                                         full_command += f' -{name} "{value}"'
                                     return full_command
 
-                                if isinstance(extra_data, dict):
-                                    extra_command = pack_command(extra_command, 'headers', extra_data.get('header'))
-                                    extra_command = pack_command(extra_command, 'cookies', extra_data.get('cookies'))
-                                    extra_command = pack_command(extra_command, 'user_agent', extra_data.get('user_agent'))
-                                    extra_command = pack_command(extra_command, 'referer', extra_data.get('referer'))
+                                extra_command = pack_command(extra_command, 'headers', extra_data.get('header'))
+                                extra_command = pack_command(extra_command, 'cookies', extra_data.get('cookies'))
+                                extra_command = pack_command(extra_command, 'user_agent', extra_data.get('user_agent'))
+                                extra_command = pack_command(extra_command, 'referer', extra_data.get('referer'))
 
                             ss_value = music_info.get('ss', 0)
-                            
-                            # 检查网络连接状态（仅对HTTP URL）
-                            if file.startswith('http'):
-                                if log_enabled:
-                                    logger.info(f'检查网络连接状态: {file[:50]}...')
-                                try:
-                                    import requests
-                                    # 发送HEAD请求检查URL是否可访问
-                                    response = requests.head(file, timeout=5, allow_redirects=True)
-                                    if response.status_code not in [200, 206]:  # 206是部分内容响应
-                                        if log_enabled:
-                                            logger.warning(f'URL可能不可访问，状态码: {response.status_code}')
-                                except Exception as e:
-                                    if log_enabled:
-                                        logger.warning(f'网络连接检查失败: {e}')
-                            
-                            # 获取音频时长
-                            if log_enabled:
-                                logger.info(f'获取音频时长: {file}')
-                            
-                            audio_duration = 0
+
+                            # API 元数据已经包含时长时不再额外 HEAD/ffprobe 网络 URL；
+                            # 旧逻辑的 HEAD 加整曲 ffmpeg 备用探测会阻塞首播数秒甚至整首歌。
                             try:
-                                # 使用ffprobe获取音频时长
+                                expected_duration = float(extra_data.get('duration', 0) or 0)
+                            except (TypeError, ValueError):
+                                expected_duration = 0
+
+                            if expected_duration <= 0:
                                 try:
-                                    from ..config import FFPROBE_PATH
-                                except ImportError:
-                                    from config import FFPROBE_PATH
-                                duration_command = f'"{FFPROBE_PATH}" -v quiet -show_entries format=duration -of csv=p=0 "{file}"'
-                                
-                                if log_enabled:
-                                    logger.info(f'执行时长获取命令: {duration_command}')
-                                
-                                duration_process = await asyncio.create_subprocess_shell(
-                                    duration_command,
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.PIPE
-                                )
-                                stdout, stderr = await duration_process.communicate()
-                                
-                                if stdout:
+                                    try:
+                                        from ..config import FFPROBE_PATH
+                                    except ImportError:
+                                        from config import FFPROBE_PATH
+                                    duration_process = await asyncio.create_subprocess_exec(
+                                        FFPROBE_PATH,
+                                        '-v', 'quiet',
+                                        '-show_entries', 'format=duration',
+                                        '-of', 'csv=p=0',
+                                        file,
+                                        stdout=asyncio.subprocess.PIPE,
+                                        stderr=asyncio.subprocess.PIPE,
+                                    )
+                                    stdout, _ = await asyncio.wait_for(
+                                        duration_process.communicate(),
+                                        timeout=8,
+                                    )
                                     duration_text = stdout.decode('utf-8', errors='ignore').strip()
                                     if duration_text and duration_text != 'N/A':
-                                        try:
-                                            audio_duration = float(duration_text)
-                                            if log_enabled:
-                                                logger.info(f'音频时长: {audio_duration:.2f} 秒')
-                                        except ValueError:
-                                            if log_enabled:
-                                                logger.warning(f'无法解析音频时长: {duration_text}')
-                                    else:
-                                        if log_enabled:
-                                            logger.warning(f'ffprobe返回空时长: {duration_text}')
-                                else:
+                                        expected_duration = float(duration_text)
+                                except asyncio.TimeoutError:
+                                    try:
+                                        duration_process.kill()
+                                        await duration_process.wait()
+                                    except Exception:
+                                        pass
                                     if log_enabled:
-                                        logger.warning(f'ffprobe无输出，尝试备用方法')
-                                    
-                                    # 备用方法：使用ffmpeg获取时长
-                                    backup_command = f'{ffmpeg_bin} -i "{file}" {extra_command} -f null - 2>&1'
-                                    backup_process = await asyncio.create_subprocess_shell(
-                                        backup_command,
-                                        stdout=asyncio.subprocess.PIPE,
-                                        stderr=asyncio.subprocess.PIPE
-                                    )
-                                    _, stderr = await backup_process.communicate()
-                                    stderr_text = stderr.decode('utf-8', errors='ignore')
-                                    
-                                    # 解析音频时长
-                                    import re
-                                    duration_match = re.search(r'Duration: (\d{2}):(\d{2}):(\d{2})\.(\d{2})', stderr_text)
-                                    if duration_match:
-                                        hours = int(duration_match.group(1))
-                                        minutes = int(duration_match.group(2))
-                                        seconds = int(duration_match.group(3))
-                                        centiseconds = int(duration_match.group(4))
-                                        audio_duration = hours * 3600 + minutes * 60 + seconds + centiseconds / 100
-                                        if log_enabled:
-                                            logger.info(f'备用方法获取音频时长: {audio_duration:.2f} 秒')
-                                    else:
-                                        if log_enabled:
-                                            logger.warning(f'备用方法也无法获取音频时长')
-                                            
-                            except Exception as e:
-                                if log_enabled:
-                                    logger.error(f'获取音频时长失败: {e}')
-                                audio_duration = 0
-                            
-                            expected_duration = audio_duration
-                            
-                            # 如果无法获取音频时长，设置默认时长（3分钟）
+                                        logger.warning(f'ffprobe 获取时长超时: {file[:80]}')
+                                except Exception as exc:
+                                    if log_enabled:
+                                        logger.warning(f'ffprobe 获取时长失败: {exc}')
+
                             if expected_duration <= 0:
-                                expected_duration = 180.0  # 3分钟
+                                expected_duration = 180.0
                                 if log_enabled:
-                                    logger.info(f'使用默认音频时长: {expected_duration:.2f} 秒')
+                                    logger.info(f'缺少音源时长，暂用默认值: {expected_duration:.2f}s')
                             
                             # 将预期时长写入当前播放信息，供前端显示总时长
                             try:
@@ -972,10 +1080,11 @@ class PlayHandler(threading.Thread):
                             continuation_offset = float(ss_value) + cached_duration
 
                             async def start_decoder(start_position):
+                                decoder_file = resolve_audio_source(music_info) or file
                                 command2 = (
                                     f'{ffmpeg_bin} -loglevel warning -nostats -reconnect 1 '
                                     f'-reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 '
-                                    f'-ss {start_position} -i "{file}" {extra_command} '
+                                    f'-ss {start_position} -i "{decoder_file}" {extra_command} '
                                     f'-acodec pcm_s16le '
                                     f'-ac {PCM_CHANNELS} -ar {PCM_SAMPLE_RATE} -f s16le -y -'
                                 )
@@ -997,7 +1106,30 @@ class PlayHandler(threading.Thread):
                                     return None
 
                             p2 = None
+                            decoder_buffer = None
                             continuation_started = False
+
+                            async def close_decoder():
+                                """先停止后台读协程，再回收 FFmpeg，避免 stdout 读取任务泄漏。"""
+                                nonlocal p2, decoder_buffer
+                                old_buffer = decoder_buffer
+                                old_decoder = p2
+                                decoder_buffer = None
+                                p2 = None
+                                if old_buffer:
+                                    await old_buffer.close()
+                                await terminate_process(old_decoder)
+
+                            async def open_decoder(start_position):
+                                """启动持续预读的解码器；RTP 发送循环只消费内存缓冲。"""
+                                nonlocal p2, decoder_buffer
+                                p2 = await start_decoder(start_position)
+                                if not p2:
+                                    decoder_buffer = None
+                                    return False
+                                decoder_buffer = BufferedPCMDecoder(p2)
+                                return True
+
                             if cached_audio:
                                 if log_enabled:
                                     logger.info(
@@ -1005,10 +1137,55 @@ class PlayHandler(threading.Thread):
                                         f'{len(cached_audio) / 1024 / 1024:.1f}MiB, complete={cache_complete}'
                                     )
                             else:
-                                p2 = await start_decoder(ss_value)
                                 continuation_started = True
-                                if not p2:
+                                if not await open_decoder(ss_value):
                                     continue
+
+                                # 首曲没有预缓存时，先给解码器留出固定握手时间并积累一段 PCM。
+                                # 期间 RTP 仍持续发送静音，因此 KOOK 连接已就绪但歌曲时钟尚未启动。
+                                warmup_started = time.monotonic()
+                                warmup_deadline = warmup_started + max(
+                                    startup_grace_seconds + 8.0,
+                                    startup_buffer_seconds + 4.0,
+                                )
+                                warmup_target_bytes = startup_buffer_seconds * PCM_BYTES_PER_SECOND
+                                skip_before_start = False
+                                while time.monotonic() < warmup_deadline:
+                                    state = guild_status.get(self.guild, Status.STOP)
+                                    if state == Status.STOP:
+                                        if self.guild in play_list:
+                                            play_list[self.guild]['play_list'] = []
+                                        await close_decoder()
+                                        await terminate_process(p)
+                                        return
+                                    if state == Status.SKIP:
+                                        guild_status[self.guild] = Status.END
+                                        skip_before_start = True
+                                        break
+
+                                    elapsed = time.monotonic() - warmup_started
+                                    buffered_bytes = decoder_buffer.buffered_bytes if decoder_buffer else 0
+                                    decoder_finished = bool(decoder_buffer and decoder_buffer.eof)
+                                    if (elapsed >= startup_grace_seconds
+                                            and (buffered_bytes >= warmup_target_bytes or decoder_finished)):
+                                        break
+                                    await send_transport_frame(PCM_SILENCE_FRAME)
+
+                                if skip_before_start:
+                                    await close_decoder()
+                                    if self.guild in play_list:
+                                        play_list[self.guild]['now_playing'] = None
+                                        schedule_next_preload(self.guild)
+                                    continue
+                                if log_enabled:
+                                    ready_seconds = (
+                                        decoder_buffer.buffered_bytes / PCM_BYTES_PER_SECOND
+                                        if decoder_buffer else 0
+                                    )
+                                    logger.info(
+                                        f'首播预热完成: 等待 {time.monotonic() - warmup_started:.2f}s, '
+                                        f'已预读 {ready_seconds:.1f}s'
+                                    )
 
                             # 音频播放逻辑 - 解码到编码管道
                             if log_enabled:
@@ -1019,6 +1196,7 @@ class PlayHandler(threading.Thread):
                                 guild_status[self.guild] = Status.END
 
                             if guild_status[self.guild] == Status.END:
+                                music_info['start'] = time.time()
                                 if original_loop:
                                     asyncio.run_coroutine_threadsafe(
                                         trigger_event(
@@ -1054,7 +1232,7 @@ class PlayHandler(threading.Thread):
 
                             async def restart_decoder(reason):
                                 """上游在暂停或网络抖动后失效时，从已发送采样处精确续流。"""
-                                nonlocal p2, total_audio, consecutive_empty_reads
+                                nonlocal total_audio, consecutive_empty_reads
                                 nonlocal continuation_started, decoder_restart_attempts
 
                                 restart_position = current_media_position()
@@ -1069,17 +1247,23 @@ class PlayHandler(threading.Thread):
                                         f'({decoder_restart_attempts}/{max_decoder_restart_attempts})'
                                     )
 
-                                old_decoder = p2
-                                p2 = None
-                                await terminate_process(old_decoder)
+                                await close_decoder()
 
                                 # 未满一帧的数据尚未计入歌曲时钟；丢弃后由新解码器重取，
                                 # 避免旧半帧与 seek 后的新数据发生重复拼接。
                                 total_audio = b''
                                 consecutive_empty_reads = 0
-                                p2 = await start_decoder(restart_position)
+                                if music_info.get('file', '').startswith(
+                                    ('PLAYLIST_SONG:', 'MUSIC_SOURCE:')
+                                ):
+                                    # 提前 EOF 往往是临时播放 URL 已失效；强制重新解析，
+                                    # 不能用同一条坏地址机械重试。
+                                    music_info.pop('resolved_file', None)
+                                    extra_data.pop('_resolved_url', None)
+                                    extra_data.pop('_resolved_expires_at', None)
+                                decoder_ready = await open_decoder(restart_position)
                                 continuation_started = True
-                                return p2 is not None
+                                return decoder_ready
 
                             update_media_position()
 
@@ -1098,13 +1282,13 @@ class PlayHandler(threading.Thread):
                                     if state == Status.STOP:
                                         if self.guild in play_list:
                                             play_list[self.guild]['play_list'] = []
-                                        await terminate_process(p2)
+                                        await close_decoder()
                                         await terminate_process(p)
                                         return
                                     if state == Status.SKIP:
                                         guild_status[self.guild] = Status.END
                                         skip_song = True
-                                        await terminate_process(p2)
+                                        await close_decoder()
                                         break
                                     if state == Status.PAUSE:
                                         # 仅推进 RTP 传输时钟，不推进歌曲时钟或解码游标。
@@ -1113,13 +1297,13 @@ class PlayHandler(threading.Thread):
 
                                     new_audio = None
                                     
-                                    # 缓存还剩 15 秒时启动续流解码，避免连接空闲 5 分钟后失效。
+                                    # 缓存到达提前量时启动续流，并让后台读协程先积累数据。
                                     if cached_audio:
                                         remaining_cache = len(cached_audio) - audio_data_index
                                         if (not cache_complete and not continuation_started
                                                 and remaining_cache <= continuation_lead_seconds * PCM_BYTES_PER_SECOND):
                                             continuation_started = True
-                                            p2 = await start_decoder(continuation_offset)
+                                            await open_decoder(continuation_offset)
                                         if audio_data_index < len(cached_audio):
                                             end_index = min(audio_data_index + chunk_size, len(cached_audio))
                                             new_audio = cached_audio[audio_data_index:end_index]
@@ -1129,24 +1313,13 @@ class PlayHandler(threading.Thread):
                                                 if log_enabled:
                                                     logger.info('缓存播放完毕，切换到续流解码')
                                                 cached_audio = None
-                                                if (not cache_complete
-                                                        and (not p2 or p2.returncode not in (None, 0))):
-                                                    p2 = await start_decoder(continuation_offset)
+                                                if not cache_complete and not decoder_buffer:
+                                                    await open_decoder(continuation_offset)
                                         else:
                                             cached_audio = None
-                                    elif p2 and p2.stdout:
-                                        try:
-                                            # 使用超时读取，避免无限阻塞
-                                            new_audio = await asyncio.wait_for(
-                                                p2.stdout.read(chunk_size),
-                                                timeout=PCM_FRAME_DURATION,
-                                            )
-                                        except asyncio.TimeoutError:
-                                            if p2.returncode is not None:
-                                                if await restart_decoder(f'异常退出（{p2.returncode}）'):
-                                                    await send_transport_frame(PCM_SILENCE_FRAME)
-                                                    continue
-                                                break
+                                    elif decoder_buffer:
+                                        new_audio = await decoder_buffer.read(PCM_FRAME_DURATION)
+                                        if new_audio is None:
                                             consecutive_empty_reads += 1
                                             if consecutive_empty_reads >= max_empty_reads:
                                                 if await restart_decoder('连续 10 秒无数据'):
@@ -1155,24 +1328,18 @@ class PlayHandler(threading.Thread):
                                                 if log_enabled:
                                                     logger.warning(f'解码流连续 10 秒无数据且无法恢复: {file}')
                                                 break
-                                            # 缓冲期间维持 RTP 连续，歌曲位置保持不变。
+                                            # 上游短暂抖动只消耗预读缓冲；真正耗尽时才补静音。
                                             await send_transport_frame(PCM_SILENCE_FRAME)
                                             continue
-
-                                        if not new_audio:
-                                            consecutive_empty_reads += 1
-                                            if p2.returncode is not None:
-                                                if await restart_decoder(f'提前结束（{p2.returncode}）'):
-                                                    await send_transport_frame(PCM_SILENCE_FRAME)
-                                                    continue
-                                                break
-                                            if consecutive_empty_reads >= max_empty_reads:
-                                                if await restart_decoder('连续返回空数据'):
-                                                    await send_transport_frame(PCM_SILENCE_FRAME)
-                                                    continue
-                                                break
-                                            await send_transport_frame(PCM_SILENCE_FRAME)
-                                            continue
+                                        if new_audio == b'':
+                                            return_code = p2.returncode if p2 else None
+                                            if (current_media_position() < expected_duration - 1.0
+                                                    and await restart_decoder(
+                                                        f'提前结束（{return_code}）'
+                                                    )):
+                                                await send_transport_frame(PCM_SILENCE_FRAME)
+                                                continue
+                                            break
                                         else:
                                             consecutive_empty_reads = 0
                                     else:
@@ -1190,12 +1357,12 @@ class PlayHandler(threading.Thread):
                                             if state == Status.SKIP:
                                                 guild_status[self.guild] = Status.END
                                                 skip_song = True
-                                                await terminate_process(p2)
+                                                await close_decoder()
                                                 break
                                             if state == Status.STOP:
                                                 if self.guild in play_list:
                                                     play_list[self.guild]['play_list'] = []
-                                                await terminate_process(p2)
+                                                await close_decoder()
                                                 await terminate_process(p)
                                                 return
                                             audio_slice = total_audio[:chunk_size]
@@ -1229,7 +1396,7 @@ class PlayHandler(threading.Thread):
                                         elif final_state == Status.STOP:
                                             if self.guild in play_list:
                                                 play_list[self.guild]['play_list'] = []
-                                            await terminate_process(p2)
+                                            await close_decoder()
                                             await terminate_process(p)
                                             return
                                         else:
@@ -1267,7 +1434,7 @@ class PlayHandler(threading.Thread):
                                             except Exception as stderr_e:
                                                 logger.error(f'错误详情 - 读取编码器stderr失败: {stderr_e}')
                             finally:
-                                await terminate_process(p2)
+                                await close_decoder()
                                 if cache_entry:
                                     with cache_lock:
                                         live_entry = audio_cache.get(cache_key)
@@ -1302,24 +1469,20 @@ class PlayHandler(threading.Thread):
                             # 执行智能清理
                             smart_cleanup(self.guild)
                             
-                            # 检查是否还有更多歌曲
+                            # 编码器保持到外层 3 秒冷却结束，期间新歌曲可直接复用连接。
                             if self.guild in play_list and len(play_list[self.guild]['play_list']) == 0:
-                                try:
-                                    await terminate_process(p)
-                                    await terminate_process(p2)
-                                except Exception as e:
-                                    if log_enabled:
-                                        logger.error(f'关闭FFMPEG进程异常: {e}')
-                                if self.guild in playlist_handle_status:
-                                    playlist_handle_status[self.guild] = False
                                 if log_enabled:
-                                    logger.info(f'播放列表结束，服务器: {self.guild}')
+                                    logger.info(
+                                        f'播放列表暂空，进入 {idle_disconnect_seconds:.1f}s '
+                                        f'退出冷却: {self.guild}'
+                                    )
                             else:
                                 # 还有更多歌曲，继续播放下一首
                                 if log_enabled:
                                     logger.info(f'准备播放下一首歌曲，服务器: {self.guild}')
                     else:
                         break
+                await terminate_process(p)
         except Exception as e:
             if log_enabled:
                 logger.error(f'推流过程中出现错误: {str(e)}', exc_info=True)

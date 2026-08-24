@@ -202,6 +202,8 @@ let qqLoginTimer: number | undefined
 let neteaseLoginTimer: number | undefined
 let systemMonitorTimer: number | undefined
 let terminalLogTimer: number | undefined
+let searchInputTimer: number | undefined
+let searchAutoFillRunning = false
 let lastNetworkSample: { sent: number; received: number; sampledAt: number } | null = null
 let lastLatencyCheckedAt = 0
 let playlistRequestVersion = 0
@@ -774,6 +776,7 @@ onBeforeUnmount(() => {
   if (progressTimer) window.clearInterval(progressTimer)
   if (toastTimer) window.clearTimeout(toastTimer)
   if (volumeTimer) window.clearTimeout(volumeTimer)
+  if (searchInputTimer) window.clearTimeout(searchInputTimer)
   stopQQLoginPoll()
   stopNeteaseLoginPoll()
   stopSettingsMonitor()
@@ -795,7 +798,11 @@ watch([isPlaying, () => current.value?.id, duration], () => {
 }, { immediate: true })
 
 watch(searchOpen, async (open) => {
-  if (!open) return
+  if (!open) {
+    if (searchInputTimer) window.clearTimeout(searchInputTimer)
+    searchInputTimer = undefined
+    return
+  }
   await nextTick()
   if (!query.value.trim()) void loadDiscovery()
   window.setTimeout(() => searchInput.value?.focus(), 80)
@@ -945,8 +952,8 @@ async function clearQueue() {
   }
   clearingQueue.value = true
   try {
-    await postJson('/api/clear', { guild_id: guildId.value })
-    tracks.value = []
+    const data = await postJson<{ disconnected?: boolean; playlist?: Track[] }>('/api/clear', { guild_id: guildId.value })
+    tracks.value = data.playlist ?? []
     lyrics.value = []
     lyricState.value = 'empty'
     lyricsTrackId.value = ''
@@ -954,9 +961,9 @@ async function clearQueue() {
     lyricRequestVersion += 1
     syncPlaybackPosition(0, true)
     isPlaying.value = false
-    connected.value = false
-    connectedChannelId.value = ''
-    notify('已清空全部音乐并退出语音频道')
+    connected.value = data.disconnected === false
+    connectedChannelId.value = connected.value ? channelId.value : ''
+    notify(connected.value ? '冷却期间收到新歌曲，机器人继续播放' : '已清空全部音乐并退出语音频道')
   } catch (error) {
     notify(error instanceof Error ? error.message : '清空失败')
     await Promise.all([loadPlaylist(), loadPlayerState(guildId.value)])
@@ -1043,7 +1050,23 @@ async function connectVoice() {
 
 function getSearchPageSize() {
   const availableHeight = searchResultsBox.value?.clientHeight || 420
-  return Math.max(4, Math.min(12, Math.ceil(availableHeight / 67)))
+  // 多取一行，确保首屏天然可滚动；仍只请求当前抽屉所需的小批量数据。
+  return Math.max(5, Math.min(12, Math.ceil(availableHeight / 67) + 1))
+}
+
+async function ensureSearchResultsScrollable() {
+  if (searchAutoFillRunning || !searchOpen.value) return
+  searchAutoFillRunning = true
+  try {
+    for (let attempt = 0; attempt < 4 && searchHasMore.value; attempt += 1) {
+      await nextTick()
+      const box = searchResultsBox.value
+      if (!box || box.scrollHeight > box.clientHeight + 2) break
+      await loadMoreSearchResults()
+    }
+  } finally {
+    searchAutoFillRunning = false
+  }
 }
 
 async function loadDiscovery() {
@@ -1077,13 +1100,27 @@ async function loadDiscovery() {
     searchResults.value = []
     searchHasMore.value = false
   } finally {
-    if (requestVersion === searchRequestVersion) discovering.value = false
+    if (requestVersion === searchRequestVersion) {
+      discovering.value = false
+      void ensureSearchResultsScrollable()
+    }
   }
 }
 
 async function handleSearchQueryInput() {
+  if (searchInputTimer) window.clearTimeout(searchInputTimer)
+  searchInputTimer = undefined
+  // 输入发生变化时立刻废弃旧请求，避免慢响应覆盖新关键词。
+  searchRequestVersion += 1
   await nextTick()
-  if (!query.value.trim()) void loadDiscovery()
+  if (!query.value.trim()) {
+    void loadDiscovery()
+    return
+  }
+  searchInputTimer = window.setTimeout(() => {
+    searchInputTimer = undefined
+    void runSearch()
+  }, 280)
 }
 
 function runHotSearch(keyword: string) {
@@ -1092,6 +1129,8 @@ function runHotSearch(keyword: string) {
 }
 
 async function runSearch() {
+  if (searchInputTimer) window.clearTimeout(searchInputTimer)
+  searchInputTimer = undefined
   const keyword = query.value.trim()
   if (!keyword) {
     void loadDiscovery()
@@ -1124,7 +1163,10 @@ async function runSearch() {
     searchHasMore.value = false
     notify(error instanceof Error ? error.message : '搜索服务暂时不可用')
   } finally {
-    if (requestVersion === searchRequestVersion) searching.value = false
+    if (requestVersion === searchRequestVersion) {
+      searching.value = false
+      void ensureSearchResultsScrollable()
+    }
   }
 }
 
@@ -1178,6 +1220,7 @@ async function addSong(song: SearchTrack) {
       artist_name: song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家',
       album_name: song.al?.name || '',
       cover_url: song.al?.picUrl || '',
+      duration: (song.dt || 0) / 1000,
       provider,
     })
     notify(`《${song.name}》已加入队列`)
@@ -1256,6 +1299,29 @@ async function dropQueue(targetIndex: number) {
       notify(error instanceof Error ? error.message : '排序保存失败')
       await loadPlaylist()
     }
+  }
+}
+
+const removingQueueIndex = ref<number | null>(null)
+
+async function removeQueuedTrack(track: Track, visualIndex: number) {
+  if (!guildId.value || removingQueueIndex.value !== null) return
+  const queueIndex = track.queue_index ?? visualIndex
+  removingQueueIndex.value = visualIndex
+  const playing = tracks.value.filter((item) => item.playing)
+  const remaining = queuedTracks.value
+    .filter((_, index) => index !== visualIndex)
+    .map((item, index) => ({ ...item, queue_index: index }))
+  tracks.value = [...playing, ...remaining]
+  try {
+    await postJson('/api/remove', { guild_id: guildId.value, index: queueIndex })
+    notify(`已从队列移除《${track.name}》`)
+    await loadPlaylist()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '移除失败')
+    await loadPlaylist()
+  } finally {
+    removingQueueIndex.value = null
   }
 }
 </script>
@@ -1426,12 +1492,12 @@ async function dropQueue(targetIndex: number) {
           <article v-if="current" class="queue-card is-current">
             <span class="queue-playing-bars" aria-label="正在播放"><i /><i /><i /></span><span class="queue-number">NOW</span>
             <img :src="current.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <div class="queue-track-meta"><strong>{{ current.name }}</strong><span>{{ current.artist }}</span></div><span class="queue-duration">{{ formatTime(current.duration) }}</span>
+            <div class="queue-track-meta"><strong>{{ current.name }}</strong><span>{{ current.artist }}</span></div><div class="queue-actions"><span class="queue-duration">{{ formatTime(current.duration) }}</span></div>
           </article>
           <article v-for="(track, index) in queuedTracks" :key="`${track.id}-${track.queue_index ?? index}`" class="queue-card" :class="{ 'is-dragging': dragIndex === index, 'is-drag-over': dragIndex !== null && dragTargetIndex === index && dragIndex !== index }" draggable="true" @dragstart="handleDragStart($event, index)" @dragend="cancelDrag" @dragenter.prevent="handleDragEnter(index)" @dragover.prevent @drop.prevent="dropQueue(index)" @pointerenter="handleDragEnter(index)">
             <GripVertical class="drag-handle" :size="17" aria-label="拖动调整顺序" @pointerdown="handlePointerDragStart($event, index)" /><span class="queue-number">{{ String(index + 1).padStart(2, '0') }}</span>
             <img :src="track.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <div class="queue-track-meta"><strong>{{ track.name }}</strong><span>{{ track.artist }}</span></div><span class="queue-duration">{{ formatTime(track.duration) }}</span>
+            <div class="queue-track-meta"><strong>{{ track.name }}</strong><span>{{ track.artist }}</span></div><div class="queue-actions"><button class="queue-remove" :disabled="removingQueueIndex !== null" :title="`从队列移除《${track.name}》`" :aria-label="`从队列移除《${track.name}》`" @pointerdown.stop @click.stop="removeQueuedTrack(track, index)"><LoaderCircle v-if="removingQueueIndex === index" :size="13" class="continuous-spin" /><X v-else :size="14" /></button><span class="queue-duration">{{ formatTime(track.duration) }}</span></div>
           </article>
           <div v-if="!current && !queuedTracks.length" class="empty-queue"><Music2 :size="30" /><strong>播放队列为空</strong><span>搜索一首歌，让声音填满这里</span></div>
         </div>
@@ -1512,7 +1578,7 @@ async function dropQueue(targetIndex: number) {
             <div class="provider-settings-head">
               <span class="provider-settings-icon"><img class="provider-logo is-netease" :src="providerIcon('netease')" alt="网易云音乐图标" /></span>
               <div><h3>网易云音乐</h3><p>扫码自动获取 Cookie，也可以手动替换</p></div>
-              <span class="provider-status" :class="{ 'is-online': neteaseAuth.authenticated }">{{ neteaseAuthLoading ? '读取中' : neteaseAuth.authenticated ? '已持久化' : '未登录' }}</span>
+              <span class="provider-status" :class="{ 'is-online': neteaseAuth.authenticated, 'is-loading': neteaseAuthLoading }">{{ neteaseAuthLoading ? '读取中' : neteaseAuth.authenticated ? '已持久化' : '未登录' }}</span>
             </div>
             <div class="provider-credential-summary">
               <strong>{{ neteaseAuth.authenticated ? '会员登录态可用' : '当前使用匿名接口' }}</strong>
@@ -1541,7 +1607,7 @@ async function dropQueue(targetIndex: number) {
             <div class="provider-settings-head">
               <span class="provider-settings-icon"><img class="provider-logo is-qqmusic" :src="providerIcon('qqmusic')" alt="QQ音乐图标" /></span>
               <div><h3>QQ音乐</h3><p>扫码保存可刷新的会员凭证</p></div>
-              <span class="provider-status" :class="{ 'is-online': qqAuth.authenticated }">{{ qqAuthLoading ? '读取中' : qqAuth.authenticated ? '已持久化' : '未登录' }}</span>
+              <span class="provider-status" :class="{ 'is-online': qqAuth.authenticated, 'is-loading': qqAuthLoading }">{{ qqAuthLoading ? '读取中' : qqAuth.authenticated ? '已持久化' : '未登录' }}</span>
             </div>
             <div class="provider-credential-summary">
               <strong>{{ qqAuth.authenticated ? 'QQ音乐会员登录态可用' : '搜索可用，完整播放需要登录' }}</strong>

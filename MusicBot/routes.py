@@ -5,8 +5,9 @@ import functools
 import hmac
 import json
 import time
+from pathlib import Path
 import kookvoice
-from config import MUSIC_SETTINGS_TOKEN
+from config import MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN
 from utils import (
     search_music,
     search_music_page,
@@ -33,6 +34,7 @@ except ImportError:
     import qqmusic_service as qqmusic
 
 logger = logging.getLogger(__name__)
+LOG_DIRECTORY = Path(__file__).resolve().parent
 
 # 全局变量
 guild_data = {}  # 存储服务器信息
@@ -595,6 +597,10 @@ def register_routes(app, bot, socketio=None):
         artist_name = data.get('artist_name', '')
         album_name = data.get('album_name', '')
         cover_url = data.get('cover_url', '')
+        try:
+            duration = max(0.0, float(data.get('duration', 0) or 0))
+        except (TypeError, ValueError):
+            duration = 0.0
         
         if not guild_id or not song_id:
             return jsonify({'success': False, 'error': '缺少必要参数'})
@@ -616,16 +622,18 @@ def register_routes(app, bot, socketio=None):
                 )
                 album_name = album_name or album_data.get('name', '')
                 cover_url = cover_url or album_data.get('picUrl', '')
-                duration = (normalized.get('dt', 0) or 0) / 1000
+                duration = (normalized.get('dt', 0) or 0) / 1000 or duration
                 source = f'MUSIC_SOURCE:qqmusic:{song_id}'
             else:
                 resolved_url = get_music_url(song_id)
                 if not resolved_url:
                     return jsonify({'success': False, 'error': '无法获取音乐URL'})
-                detail = get_song_detail(song_id) if not (album_name and cover_url) else {}
+                detail = get_song_detail(song_id) if not (album_name and cover_url and duration) else {}
                 album_data = detail.get('al', {}) if detail else {}
-                duration = (detail.get('dt', 0) or 0) / 1000 if detail else 0
-                source = resolved_url
+                duration = ((detail.get('dt', 0) or 0) / 1000 if detail else 0) or duration
+                # 队列中只保存歌曲 ID。轮到预加载/播放时再刷新临时 URL，
+                # 避免排队期间网易云地址过期造成后半段断流。
+                source = f'PLAYLIST_SONG:{song_id}:{song_name}:{artist_name}'
 
             from config import BOT_TOKEN
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
@@ -637,8 +645,10 @@ def register_routes(app, bot, socketio=None):
                 'cover': cover_url or album_data.get('picUrl', ''),
                 'duration': duration,
                 'provider': provider,
-                '_resolved_url': resolved_url if provider == 'qqmusic' else '',
-                '_resolved_expires_at': resolved_expires_at,
+                '_resolved_url': resolved_url,
+                '_resolved_expires_at': (
+                    resolved_expires_at if provider == 'qqmusic' else time.time() + 240
+                ),
             })
             
             return jsonify({'success': True, 'provider': provider})
@@ -1024,14 +1034,23 @@ def register_routes(app, bot, socketio=None):
         try:
             if guild_id in kookvoice.play_list:
                 kookvoice.Player(guild_id).clear()
-                deadline = time.time() + 4
+                deadline = time.time() + MUSIC_IDLE_DISCONNECT_SECONDS + 5
                 while guild_id in kookvoice.play_list and time.time() < deadline:
+                    waiting = kookvoice.play_list[guild_id].get('play_list', [])
+                    if waiting:
+                        return jsonify({
+                            'success': True,
+                            'disconnected': False,
+                            'playlist': format_playlist_data(kookvoice.play_list[guild_id]),
+                        })
                     time.sleep(0.05)
                 if guild_id in kookvoice.play_list:
                     return jsonify({
-                        'success': False,
-                        'error': '播放线程仍在退出，请稍后再试',
-                    }), 409
+                        'success': True,
+                        'disconnected': False,
+                        'playlist': [],
+                        'cooling_down': True,
+                    })
             else:
                 # 即使连接已结束，也确保旧历史与缓存目标不会残留。
                 kookvoice.Player(guild_id).clear()
@@ -1167,9 +1186,9 @@ def register_routes(app, bot, socketio=None):
             
             # 确定日志文件路径
             if log_type == 'app':
-                log_file = 'app.log'
+                log_file = LOG_DIRECTORY / 'app.log'
             elif log_type == 'debug':
-                log_file = 'debug.log'
+                log_file = LOG_DIRECTORY / 'debug.log'
             else:
                 return jsonify({'success': False, 'error': '无效的日志类型'})
             
@@ -1247,9 +1266,9 @@ def register_routes(app, bot, socketio=None):
             log_type = request.json.get('type', 'app') if request.json else 'app'
             
             if log_type == 'app':
-                log_file = 'app.log'
+                log_file = LOG_DIRECTORY / 'app.log'
             elif log_type == 'debug':
-                log_file = 'debug.log'
+                log_file = LOG_DIRECTORY / 'debug.log'
             else:
                 return jsonify({'success': False, 'error': '无效的日志类型'})
             
@@ -1350,7 +1369,7 @@ def register_routes(app, bot, socketio=None):
             last_position = request.args.get('last_position', 0, type=int)
             
             # 获取最新的终端输出
-            log_file = 'app.log'
+            log_file = LOG_DIRECTORY / 'app.log'
             if os.path.exists(log_file):
                 # 获取文件大小
                 file_size = os.path.getsize(log_file)

@@ -447,7 +447,7 @@ def format_playlist_data(play_list_data):
                     'artist': artist_name,
                     'album': extra_data.get('album', ''),
                     'cover': extra_data.get('cover', ''),
-                    'duration': now_playing.get('duration', 0),
+                    'duration': now_playing.get('duration', extra_data.get('duration', 0)),
                     'provider': extra_data.get('provider', 'netease'),
                     'playing': True,
                     'position': now_playing.get('ss', 0),

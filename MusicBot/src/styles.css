@@ -397,6 +397,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .queue-track-meta span { overflow: hidden; color: #6f6d68; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .is-current .queue-track-meta strong { color: #fff5f2; }
 .queue-duration { padding-left: 4px; color: #6f6d68; font-size: 9px; font-variant-numeric: tabular-nums; }
+.queue-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+.queue-remove { width: 25px; height: 25px; display: grid; place-items: center; border: 0; color: #686661; background: transparent; border-radius: 8px; cursor: pointer; transition: color 150ms ease, background 150ms ease; }
+.queue-remove:hover { color: #ff8d83; background: rgba(255, 91, 77, 0.11); }
+.queue-remove:disabled { opacity: 0.45; cursor: wait; }
 .queue-playing-bars { width: 16px; height: 16px; display: flex; align-items: flex-end; justify-content: center; gap: 2px; }
 .queue-playing-bars i { width: 2px; height: 10px; background: var(--red); border-radius: 3px; animation: music-bars 900ms ease-in-out infinite alternate; }
 .queue-playing-bars i:nth-child(2) { height: 14px; animation-delay: -320ms; }
@@ -492,8 +496,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .provider-settings-icon .provider-logo.is-qqmusic { border-radius: 50%; transform: scale(1.06); }
 .provider-settings-head h3 { margin: 0; font-size: 13px; }
 .provider-settings-head p { margin: 4px 0 0; color: #696661; font-size: 9px; }
-.provider-status { padding: 6px 8px; color: #7b7872; background: #2b2b28; border-radius: 8px; font-size: 8px; font-weight: 700; letter-spacing: 0.04em; }
-.provider-status.is-online { color: var(--provider-color); background: var(--provider-soft); }
+.provider-status { padding: 6px 8px; color: #ef8178; background: rgba(255, 91, 77, 0.11); border-radius: 8px; font-size: 8px; font-weight: 700; letter-spacing: 0.04em; }
+.provider-status.is-online { color: #75d99a; background: rgba(69, 197, 119, 0.12); }
+.provider-status.is-loading { color: #8b8881; background: #2b2b28; }
 .provider-credential-summary { min-height: 52px; margin-top: 13px; padding: 10px 11px; display: flex; flex-direction: column; justify-content: center; gap: 4px; background: #191918; border-radius: 12px; }
 .provider-credential-summary strong { color: #d6d2cb; font-size: 10px; font-weight: 600; }
 .provider-credential-summary span { color: #67645f; font-size: 8px; line-height: 1.45; }
@@ -558,7 +563,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .connection-picker > button.disconnect-button { color: #e7857d; background: rgba(255, 91, 77, 0.11); }
 .connection-picker > button.connect-button { color: #91dfaa; background: rgba(109, 213, 140, 0.11); }
 .connection-picker > button:disabled { opacity: 0.58; cursor: wait; }
-.search-results { flex: 1; min-height: 150px; margin-top: 14px; overflow-y: auto; }
+.search-results { flex: 1 1 0; min-height: 0; margin-top: 14px; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #343431 transparent; }
 .discover-section { padding: 3px 5px 8px; }
 .discover-heading { display: flex; align-items: center; justify-content: space-between; padding: 4px 4px 10px; }
 .discover-title { display: inline-flex; align-items: center; gap: 7px; color: #d7d3cc; font-size: 11px; font-weight: 650; }

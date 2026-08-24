@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Union, Optional
 import threading
 import requests
 import logging
+from pathlib import Path
 from khl import Bot, Message
 
 # 修复相对导入
@@ -19,15 +20,21 @@ except ImportError:
     from config import *
     from utils import search_music, get_music_url, get_playlist, get_playlist_urls
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,  # 保持INFO级别，显示正常信息
-    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-    handlers=[
-        logging.FileHandler('debug.log'),
-        logging.StreamHandler()
-    ]
-)
+# run.py 会先注册控制台 handler，之后再次调用 basicConfig 不会生效。
+# 因此显式挂载绝对路径 FileHandler，确保从任意工作目录启动都能写入日志。
+DEBUG_LOG_PATH = Path(__file__).resolve().with_name('debug.log')
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+if not any(
+    isinstance(handler, logging.FileHandler)
+    and Path(handler.baseFilename).resolve() == DEBUG_LOG_PATH
+    for handler in root_logger.handlers
+):
+    file_handler = logging.FileHandler(DEBUG_LOG_PATH, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
 logger = logging.getLogger(__name__)
 
 # 只关闭Flask的HTTP访问日志，保留其他日志
@@ -181,6 +188,11 @@ async def play_music(msg: Message, music_input: str):
         if music_input.startswith("http"):
             music_url = music_input
             song_name = "直链音乐"
+            song_id = ''
+            artist_name = '网络音频'
+            album_name = ''
+            cover_url = ''
+            duration = 0
         else:
             try:
                 # 搜索歌曲
@@ -202,6 +214,10 @@ async def play_music(msg: Message, music_input: str):
                 song_id = song['id']
                 song_name = song.get('name', music_input)
                 artist_name = song.get('ar', [{}])[0].get('name', '未知')
+                album_data = song.get('al', {}) or {}
+                album_name = album_data.get('name', '')
+                cover_url = album_data.get('picUrl', '')
+                duration = (song.get('dt', 0) or 0) / 1000
                 
                 print(f"🎵 找到歌曲: {song_name} - {artist_name} (ID: {song_id})")
                 
@@ -234,8 +250,22 @@ async def play_music(msg: Message, music_input: str):
         
         # 添加音乐到播放队列
         player = kookvoice.Player(msg.ctx.guild.id, voice_channel_id, BOT_TOKEN)
-        extra_data = {"音乐名字": song_name, "点歌人": msg.author_id, "文字频道": msg.ctx.channel.id}
-        player.add_music(music_url, extra_data)
+        extra_data = {
+            'song_id': str(song_id or 'direct'),
+            'title': song_name,
+            'artist': artist_name,
+            'album': album_name,
+            'cover': cover_url,
+            'duration': duration,
+            'provider': 'netease',
+            '点歌人': msg.author_id,
+            '文字频道': msg.ctx.channel.id,
+        }
+        source = (
+            f'PLAYLIST_SONG:{song_id}:{song_name}:{artist_name}'
+            if song_id else music_url
+        )
+        player.add_music(source, extra_data)
         
         await msg.reply(f"✅ {song_name} 已加入播放队列")
         
@@ -356,29 +386,25 @@ async def playlist_play(msg: Message, playlist_input: str):
                             song = songs[0]
                             song_name = song.get('name', f'歌曲{song_id}')
                             artist_name = song.get('ar', [{}])[0].get('name', '未知歌手')
-                            
-                            # 获取歌曲URL
-                            url_api = f"{MUSIC_API_BASE}/song/url?id={song_id}"
-                            url_res = requests.get(url_api, timeout=10)
-                            
-                            if url_res.status_code == 200:
-                                url_result = url_res.json()
-                                music_url = url_result['data'][0]['url']
-                                
-                                if music_url:
-                                    extra_data = {
-                                        "音乐名字": song_name,
-                                        "点歌人": msg.author_id,
-                                        "文字频道": msg.ctx.channel.id,
-                                        "歌单来源": playlist_name
-                                    }
-                                    player.add_music(music_url, extra_data)
-                                    added_count += 1
-                                    print(f"✅ 已添加: {song_name} - {artist_name}")
-                                else:
-                                    print(f"⚠️ 无法获取URL: {song_name}")
-                            else:
-                                print(f"⚠️ 获取URL失败: {song_name}")
+                            album_data = song.get('al', {}) or {}
+                            extra_data = {
+                                'song_id': str(song_id),
+                                'title': song_name,
+                                'artist': artist_name,
+                                'album': album_data.get('name', ''),
+                                'cover': album_data.get('picUrl', ''),
+                                'duration': (song.get('dt', 0) or 0) / 1000,
+                                'provider': 'netease',
+                                '点歌人': msg.author_id,
+                                '文字频道': msg.ctx.channel.id,
+                                '歌单来源': playlist_name,
+                            }
+                            player.add_music(
+                                f'PLAYLIST_SONG:{song_id}:{song_name}:{artist_name}',
+                                extra_data,
+                            )
+                            added_count += 1
+                            print(f"✅ 已添加: {song_name} - {artist_name}")
                         else:
                             print(f"⚠️ 无法获取歌曲信息: {song_id}")
                     else:
