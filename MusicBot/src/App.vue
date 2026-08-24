@@ -1,16 +1,22 @@
 <script setup lang="ts">
 import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronDown,
   CirclePlus,
   Clock3,
+  Cpu,
   GripVertical,
   Headphones,
   KeyRound,
   ListMusic,
   LoaderCircle,
+  MemoryStick,
   Minus,
   Music2,
+  Network,
   LogOut,
   Pause,
   Play,
@@ -28,6 +34,7 @@ import {
   Shuffle,
   SkipBack,
   SkipForward,
+  Terminal,
   Trash2,
   Volume2,
   Wifi,
@@ -80,8 +87,33 @@ type MusicAuthStatus = {
   cookie_count?: number
   updated_at?: number
 }
+type SystemStatusResponse = {
+  system: {
+    cpu_percent: number
+    memory: { total: number; available: number; percent: number; used: number }
+    network: { bytes_sent: number; bytes_recv: number; packets_sent: number; packets_recv: number }
+  }
+  process: { pid: number; memory_rss: number; cpu_percent: number; uptime: number }
+  playback: { active_guilds: number; playing_songs: number; queued_songs: number }
+  timestamp: number
+}
+type MonitorLog = {
+  timestamp: string
+  level: 'error' | 'warning' | 'info' | 'debug'
+  message: string
+  raw: string
+}
+type BotLatency = {
+  kookMs: number
+  consoleMs: number
+  measuredAt: number
+}
 
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
+const PROVIDER_META = {
+  netease: { label: 'NETEASE', name: '网易云', icon: assetUrl('netease.png') },
+  qqmusic: { label: 'QQ MUSIC', name: 'QQ音乐', icon: assetUrl('QQ.png') },
+} as const
 const MODE_META = {
   order: { label: '顺序播放', icon: Repeat2 },
   'repeat-one': { label: '单曲循环', icon: Repeat1 },
@@ -129,6 +161,16 @@ const settingsToken = ref(sessionStorage.getItem('musicSettingsToken') ?? '')
 const settingsUnlocked = ref(Boolean(settingsToken.value))
 const settingsUnlocking = ref(false)
 const settingsError = ref('')
+const botLatency = ref<BotLatency | null>(null)
+const botLatencyLoading = ref(false)
+const botLatencyError = ref('')
+const systemStatus = ref<SystemStatusResponse | null>(null)
+const systemStatusLoading = ref(false)
+const systemStatusError = ref('')
+const networkRate = ref({ download: 0, upload: 0, ready: false })
+const terminalLogs = ref<MonitorLog[]>([])
+const terminalLogsLoading = ref(false)
+const terminalLogsError = ref('')
 const guilds = ref<Guild[]>([])
 const channels = ref<Channel[]>([])
 const savedGuildId = localStorage.getItem('currentGuildId') ?? ''
@@ -151,12 +193,17 @@ const dragIndex = ref<number | null>(null)
 const dragTargetIndex = ref<number | null>(null)
 const searchInput = ref<HTMLInputElement | null>(null)
 const searchResultsBox = ref<HTMLElement | null>(null)
+const terminalLogBox = ref<HTMLElement | null>(null)
 let pollTimer: number | undefined
 let progressTimer: number | undefined
 let toastTimer: number | undefined
 let volumeTimer: number | undefined
 let qqLoginTimer: number | undefined
 let neteaseLoginTimer: number | undefined
+let systemMonitorTimer: number | undefined
+let terminalLogTimer: number | undefined
+let lastNetworkSample: { sent: number; received: number; sampledAt: number } | null = null
+let lastLatencyCheckedAt = 0
 let playlistRequestVersion = 0
 let lyricRequestVersion = 0
 let searchRequestVersion = 0
@@ -176,12 +223,133 @@ const modeIcon = computed(() => MODE_META[playMode.value].icon)
 const rangeProgressStyle = computed(() => ({ '--range-progress': `${progress.value}%` }))
 const volumeProgressStyle = computed(() => ({ '--range-progress': `${volume.value}%` }))
 const currentProvider = computed<MusicProvider>(() => current.value?.provider || 'netease')
-const currentProviderLabel = computed(() => currentProvider.value === 'qqmusic' ? 'QQ MUSIC' : 'NETEASE')
-const selectedProviderName = computed(() => musicSource.value === 'qqmusic' ? 'QQ音乐' : '网易云')
+const currentProviderLabel = computed(() => PROVIDER_META[currentProvider.value].label)
+const selectedProviderName = computed(() => PROVIDER_META[musicSource.value].name)
+const selectedProviderIcon = computed(() => PROVIDER_META[musicSource.value].icon)
+
+function providerIcon(provider: MusicProvider) {
+  return PROVIDER_META[provider].icon
+}
 
 function formatTime(seconds = 0) {
   if (!Number.isFinite(seconds) || seconds < 0) return '00:00'
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
+}
+
+function formatBytes(bytes = 0) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const value = bytes / (1024 ** unitIndex)
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`
+}
+
+function formatNetworkRate(bytesPerSecond = 0) {
+  return `${formatBytes(bytesPerSecond)}/s`
+}
+
+function formatUptime(seconds = 0) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '—'
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  if (days > 0) return `${days}天 ${hours}小时`
+  if (hours > 0) return `${hours}小时 ${minutes}分钟`
+  return `${minutes}分钟`
+}
+
+const latencyQuality = computed(() => {
+  if (!botLatency.value) return { label: '等待探测', className: '' }
+  if (botLatency.value.kookMs < 100) return { label: '优秀', className: 'is-good' }
+  if (botLatency.value.kookMs < 250) return { label: '正常', className: 'is-normal' }
+  return { label: '偏高', className: 'is-slow' }
+})
+
+async function loadBotLatency(force = false) {
+  const now = Date.now()
+  if (botLatencyLoading.value || (!force && now - lastLatencyCheckedAt < 10_000)) return
+  botLatencyLoading.value = true
+  botLatencyError.value = ''
+  const startedAt = performance.now()
+  try {
+    const data = await getJson<{ online: boolean; kook_ms: number; measured_at: number }>('/api/network/latency')
+    botLatency.value = {
+      kookMs: data.kook_ms,
+      consoleMs: Math.round(performance.now() - startedAt),
+      measuredAt: data.measured_at,
+    }
+    lastLatencyCheckedAt = Date.now()
+  } catch (error) {
+    botLatencyError.value = error instanceof Error ? error.message : '延迟探测失败'
+    lastLatencyCheckedAt = Date.now()
+  } finally {
+    botLatencyLoading.value = false
+  }
+}
+
+async function loadSystemStatus() {
+  if (systemStatusLoading.value) return
+  systemStatusLoading.value = true
+  systemStatusError.value = ''
+  try {
+    const data = await getJson<SystemStatusResponse>('/api/system/status')
+    const sampledAt = performance.now()
+    if (lastNetworkSample) {
+      const elapsedSeconds = Math.max((sampledAt - lastNetworkSample.sampledAt) / 1000, 0.001)
+      networkRate.value = {
+        download: Math.max(0, (data.system.network.bytes_recv - lastNetworkSample.received) / elapsedSeconds),
+        upload: Math.max(0, (data.system.network.bytes_sent - lastNetworkSample.sent) / elapsedSeconds),
+        ready: true,
+      }
+    }
+    lastNetworkSample = {
+      sent: data.system.network.bytes_sent,
+      received: data.system.network.bytes_recv,
+      sampledAt,
+    }
+    systemStatus.value = data
+  } catch (error) {
+    systemStatusError.value = error instanceof Error ? error.message : '无法读取服务器状态'
+  } finally {
+    systemStatusLoading.value = false
+  }
+}
+
+async function loadTerminalLogs() {
+  if (terminalLogsLoading.value) return
+  terminalLogsLoading.value = true
+  terminalLogsError.value = ''
+  const box = terminalLogBox.value
+  const stickToBottom = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 36
+  try {
+    const data = await getJson<{ logs: MonitorLog[] }>('/api/logs?type=debug&lines=120')
+    terminalLogs.value = data.logs ?? []
+    if (stickToBottom) {
+      await nextTick()
+      if (terminalLogBox.value) terminalLogBox.value.scrollTop = terminalLogBox.value.scrollHeight
+    }
+  } catch (error) {
+    terminalLogsError.value = error instanceof Error ? error.message : '无法读取服务日志'
+  } finally {
+    terminalLogsLoading.value = false
+  }
+}
+
+function stopSettingsMonitor() {
+  if (systemMonitorTimer) window.clearInterval(systemMonitorTimer)
+  if (terminalLogTimer) window.clearInterval(terminalLogTimer)
+  systemMonitorTimer = undefined
+  terminalLogTimer = undefined
+}
+
+function startSettingsMonitor() {
+  stopSettingsMonitor()
+  lastNetworkSample = null
+  networkRate.value = { download: 0, upload: 0, ready: false }
+  void loadSystemStatus()
+  void loadTerminalLogs()
+  systemMonitorTimer = window.setInterval(() => { void loadSystemStatus() }, 5000)
+  terminalLogTimer = window.setInterval(() => { void loadTerminalLogs() }, 3000)
 }
 
 function parseLyrics(raw = ''): LyricLine[] {
@@ -223,6 +391,7 @@ function settingsFailure(error: unknown, fallback: string) {
   if (message.includes('管理密钥')) {
     settingsUnlocked.value = false
     sessionStorage.removeItem('musicSettingsToken')
+    stopSettingsMonitor()
   }
   return message
 }
@@ -256,6 +425,7 @@ async function unlockMusicSettings() {
     sessionStorage.setItem('musicSettingsToken', token)
     settingsUnlocked.value = true
     await loadMusicProviders()
+    if (settingsOpen.value) startSettingsMonitor()
     notify('音乐后台已解锁')
   } catch (error) {
     settingsUnlocked.value = false
@@ -268,6 +438,7 @@ async function unlockMusicSettings() {
 function lockMusicSettings() {
   stopQQLoginPoll()
   stopNeteaseLoginPoll()
+  stopSettingsMonitor()
   settingsUnlocked.value = false
   settingsToken.value = ''
   settingsError.value = ''
@@ -605,6 +776,7 @@ onBeforeUnmount(() => {
   if (volumeTimer) window.clearTimeout(volumeTimer)
   stopQQLoginPoll()
   stopNeteaseLoginPoll()
+  stopSettingsMonitor()
   window.removeEventListener('popstate', handlePopState)
   window.removeEventListener('pointerup', finishPointerDrag)
   document.body.classList.remove('is-queue-dragging')
@@ -633,10 +805,12 @@ watch(settingsOpen, async (open) => {
   if (!open) {
     stopQQLoginPoll()
     stopNeteaseLoginPoll()
+    stopSettingsMonitor()
     return
   }
   await loadMusicProviders()
   if (!settingsUnlocked.value) return
+  startSettingsMonitor()
   if (qqLoginIdentifier.value && !qqLoginTimer) {
     qqLoginTimer = window.setInterval(() => { void pollQQLogin() }, 1600)
   }
@@ -1131,9 +1305,24 @@ async function dropQueue(targetIndex: number) {
         </div>
       </div>
       <div class="top-actions">
-        <button class="connection-state" :class="connected ? 'is-connected' : 'is-disconnected'" :disabled="voiceControlPending" :aria-busy="voiceControlPending" :title="connected ? '点击断开语音连接' : '点击连接所选语音频道'" @click="connectVoice">
-          <LoaderCircle v-if="voiceControlPending" :size="17" class="continuous-spin" /><Wifi v-else-if="connected" :size="17" /><WifiOff v-else :size="17" /><span>{{ voiceControlPending ? '处理中' : connected ? '已连接' : channelId ? '待连接' : '未选择' }}</span>
-        </button>
+        <div class="connection-latency-anchor" @mouseenter="loadBotLatency()" @focusin="loadBotLatency()">
+          <button class="connection-state" :class="connected ? 'is-connected' : 'is-disconnected'" :disabled="voiceControlPending" :aria-busy="voiceControlPending" aria-describedby="connection-latency-tip" :title="connected ? '点击断开语音连接' : '点击连接所选语音频道'" @click="connectVoice">
+            <LoaderCircle v-if="voiceControlPending" :size="17" class="continuous-spin" /><Wifi v-else-if="connected" :size="17" /><WifiOff v-else :size="17" /><span>{{ voiceControlPending ? '处理中' : connected ? '已连接' : channelId ? '待连接' : '未选择' }}</span>
+          </button>
+          <div id="connection-latency-tip" class="latency-tooltip" role="tooltip">
+            <div class="latency-tooltip-head">
+              <span><Activity :size="15" />网络延迟</span>
+              <span v-if="botLatency" class="latency-quality" :class="latencyQuality.className">{{ latencyQuality.label }}</span>
+            </div>
+            <div v-if="botLatencyLoading && !botLatency" class="latency-loading"><LoaderCircle :size="15" class="continuous-spin" />正在探测链路</div>
+            <div v-else-if="botLatencyError && !botLatency" class="latency-error">{{ botLatencyError }}</div>
+            <template v-else-if="botLatency">
+              <div class="latency-row"><span>MusicBot → KOOK</span><strong>{{ botLatency.kookMs }} ms</strong></div>
+              <div class="latency-row"><span>浏览器 → 控制台</span><strong>{{ botLatency.consoleMs }} ms</strong></div>
+              <div class="latency-foot"><span class="live-dot" />按需探测 · 10 秒内复用结果</div>
+            </template>
+          </div>
+        </div>
         <button class="icon-button" aria-label="搜索音乐" title="搜索音乐" @click="searchOpen = true"><Search :size="19" /></button>
         <button class="icon-button" aria-label="刷新页面状态" title="刷新页面状态" @click="refreshAll"><RefreshCw :size="19" :class="{ 'spin-once': refreshing }" /></button>
         <button class="icon-button" aria-label="音乐后台设置" title="音乐后台设置" @click="settingsOpen = true"><Settings :size="19" /></button>
@@ -1152,7 +1341,7 @@ async function dropQueue(targetIndex: number) {
           <p>{{ current?.album || '互联网垃圾桶音乐控制台' }}</p>
         </div>
         <div class="source-row">
-          <span class="source-dot" :class="`is-${currentProvider}`"><Music2 :size="13" /></span><span class="source-name">{{ currentProviderLabel }}</span>
+          <span class="source-dot" :class="`is-${currentProvider}`"><img class="provider-logo" :class="`is-${currentProvider}`" :src="providerIcon(currentProvider)" :alt="`${currentProviderLabel} 图标`" /></span><span class="source-name">{{ currentProviderLabel }}</span>
         </div>
         <div class="slider-block progress-block">
           <input
@@ -1275,9 +1464,53 @@ async function dropQueue(targetIndex: number) {
             <button @click="lockMusicSettings">锁定</button>
           </div>
 
+          <section class="system-monitor-card">
+            <div class="system-monitor-head">
+              <div>
+                <span class="system-monitor-icon"><Activity :size="17" /></span>
+                <span><strong>运行状态</strong><small v-if="systemStatus">PID {{ systemStatus.process.pid }} · 已运行 {{ formatUptime(systemStatus.process.uptime) }}</small><small v-else>MusicBot 服务资源</small></span>
+              </div>
+              <button title="立即刷新运行状态与日志" :disabled="systemStatusLoading || terminalLogsLoading" @click="loadSystemStatus(); loadTerminalLogs()"><RefreshCw :size="15" :class="{ 'continuous-spin': systemStatusLoading }" />刷新</button>
+            </div>
+
+            <p v-if="systemStatusError" class="monitor-inline-error">{{ systemStatusError }}</p>
+            <div class="system-metrics-grid">
+              <article class="system-metric">
+                <div class="system-metric-label"><span><Cpu :size="15" />CPU</span><strong>{{ systemStatus ? `${systemStatus.system.cpu_percent.toFixed(0)}%` : '—' }}</strong></div>
+                <div class="system-meter"><i :style="{ width: `${Math.min(systemStatus?.system.cpu_percent || 0, 100)}%` }" /></div>
+                <small>{{ systemStatus ? '系统 1 秒平均采样' : '等待采样' }}</small>
+              </article>
+              <article class="system-metric">
+                <div class="system-metric-label"><span><MemoryStick :size="15" />内存</span><strong>{{ systemStatus ? `${systemStatus.system.memory.percent.toFixed(0)}%` : '—' }}</strong></div>
+                <div class="system-meter is-memory"><i :style="{ width: `${Math.min(systemStatus?.system.memory.percent || 0, 100)}%` }" /></div>
+                <small>{{ systemStatus ? `${formatBytes(systemStatus.system.memory.total - systemStatus.system.memory.available)} / ${formatBytes(systemStatus.system.memory.total)}` : '等待采样' }}</small>
+              </article>
+              <article class="system-metric is-network">
+                <div class="system-metric-label"><span><Network :size="15" />网络</span><strong>{{ networkRate.ready ? '实时' : '采样中' }}</strong></div>
+                <div class="network-rate-row"><span><ArrowDown :size="13" />{{ networkRate.ready ? formatNetworkRate(networkRate.download) : '—' }}</span><span><ArrowUp :size="13" />{{ networkRate.ready ? formatNetworkRate(networkRate.upload) : '—' }}</span></div>
+                <small>下载 / 上传 · 主机总流量</small>
+              </article>
+            </div>
+
+            <div class="monitor-terminal-shell">
+              <div class="monitor-terminal-head">
+                <span><Terminal :size="14" />debug.log</span>
+                <span class="terminal-live-state"><i />LIVE · {{ terminalLogs.length }} 行</span>
+              </div>
+              <div ref="terminalLogBox" class="monitor-terminal" aria-label="MusicBot 实时日志" aria-live="polite">
+                <div v-if="terminalLogsLoading && !terminalLogs.length" class="terminal-placeholder"><LoaderCircle :size="15" class="continuous-spin" />正在连接日志流</div>
+                <div v-else-if="terminalLogsError" class="terminal-placeholder is-error">{{ terminalLogsError }}</div>
+                <div v-else-if="!terminalLogs.length" class="terminal-placeholder">debug.log 暂时没有内容</div>
+                <div v-for="(log, index) in terminalLogs" :key="`${log.timestamp}-${index}-${log.raw}`" class="terminal-line" :class="`is-${log.level}`">
+                  <span class="terminal-line-number">{{ String(index + 1).padStart(3, '0') }}</span><code>{{ log.raw }}</code>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section class="provider-settings-card is-netease">
             <div class="provider-settings-head">
-              <span class="provider-settings-icon"><Music2 :size="19" /></span>
+              <span class="provider-settings-icon"><img class="provider-logo is-netease" :src="providerIcon('netease')" alt="网易云音乐图标" /></span>
               <div><h3>网易云音乐</h3><p>扫码自动获取 Cookie，也可以手动替换</p></div>
               <span class="provider-status" :class="{ 'is-online': neteaseAuth.authenticated }">{{ neteaseAuthLoading ? '读取中' : neteaseAuth.authenticated ? '已持久化' : '未登录' }}</span>
             </div>
@@ -1306,7 +1539,7 @@ async function dropQueue(targetIndex: number) {
 
           <section class="provider-settings-card is-qqmusic">
             <div class="provider-settings-head">
-              <span class="provider-settings-icon"><Music2 :size="19" /></span>
+              <span class="provider-settings-icon"><img class="provider-logo is-qqmusic" :src="providerIcon('qqmusic')" alt="QQ音乐图标" /></span>
               <div><h3>QQ音乐</h3><p>扫码保存可刷新的会员凭证</p></div>
               <span class="provider-status" :class="{ 'is-online': qqAuth.authenticated }">{{ qqAuthLoading ? '读取中' : qqAuth.authenticated ? '已持久化' : '未登录' }}</span>
             </div>
@@ -1341,8 +1574,8 @@ async function dropQueue(targetIndex: number) {
         </div>
         <div class="source-toggle" :class="{ 'is-qqmusic': musicSource === 'qqmusic' }" role="tablist" aria-label="选择音乐源">
           <span class="source-toggle-thumb" aria-hidden="true" />
-          <button role="tab" :aria-selected="musicSource === 'netease'" @click="selectMusicSource('netease')">网易云</button>
-          <button role="tab" :aria-selected="musicSource === 'qqmusic'" @click="selectMusicSource('qqmusic')">QQ音乐</button>
+          <button role="tab" :aria-selected="musicSource === 'netease'" @click="selectMusicSource('netease')"><img class="provider-logo is-netease" :src="providerIcon('netease')" alt="" />网易云</button>
+          <button role="tab" :aria-selected="musicSource === 'qqmusic'" @click="selectMusicSource('qqmusic')"><img class="provider-logo is-qqmusic" :src="providerIcon('qqmusic')" alt="" />QQ音乐</button>
         </div>
         <div class="search-box">
           <Search :size="19" /><input ref="searchInput" v-model="query" :placeholder="`在${selectedProviderName}搜索歌曲、艺术家或专辑`" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
@@ -1356,7 +1589,7 @@ async function dropQueue(targetIndex: number) {
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
           <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">
             <div class="discover-heading">
-              <span class="discover-title"><Radio :size="15" />{{ selectedProviderName }}热搜</span>
+              <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热搜</span>
               <small>点击关键词直接搜索</small>
             </div>
             <div v-if="hotSearches.length" class="hot-search-grid">
@@ -1366,7 +1599,7 @@ async function dropQueue(targetIndex: number) {
               </button>
             </div>
             <div class="discover-heading chart-heading">
-              <span class="discover-title"><ListMusic :size="15" />{{ selectedProviderName }}热歌榜</span>
+              <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热歌榜</span>
               <small>向下滚动继续浏览</small>
             </div>
           </section>
@@ -1390,7 +1623,7 @@ async function dropQueue(targetIndex: number) {
           <div v-else class="search-results-end">{{ searchMode === 'discover' ? '已显示全部热歌' : '已显示全部结果' }}</div>
         </div>
         <div v-if="musicSource === 'netease'" class="playlist-import">
-          <div><strong>导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>
+          <div><strong><img class="provider-logo provider-inline-icon is-netease" :src="providerIcon('netease')" alt="" />导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>
           <div class="playlist-import-row"><input v-model="playlistInput" placeholder="music.163.com/playlist?id=..." /><button :disabled="searching || !playlistInput.trim()" @click="importPlaylist">导入</button></div>
         </div>
       </aside>

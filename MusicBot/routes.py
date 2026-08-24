@@ -212,6 +212,62 @@ def register_routes(app, bot, socketio=None):
         except Exception as e:
             logger.error(f"获取服务器列表异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/network/latency', methods=['GET'])
+    def get_network_latency():
+        """测量 MusicBot 服务器到 KOOK REST API 的实际往返延迟。"""
+        try:
+            import requests
+            from config import BOT_TOKEN
+
+            if not BOT_TOKEN:
+                return jsonify({
+                    'success': False,
+                    'online': False,
+                    'error': 'MUSIC_BOT_TOKEN 未配置',
+                }), 503
+
+            started_at = time.perf_counter()
+            response = requests.get(
+                'https://www.kookapp.cn/api/v3/user/me',
+                headers={
+                    'Authorization': f'Bot {BOT_TOKEN}',
+                    'Content-Type': 'application/json',
+                },
+                timeout=5,
+            )
+            kook_ms = round((time.perf_counter() - started_at) * 1000)
+
+            if response.status_code != 200:
+                return jsonify({
+                    'success': False,
+                    'online': False,
+                    'kook_ms': kook_ms,
+                    'error': f'KOOK API 请求失败（HTTP {response.status_code}）',
+                }), 502
+
+            payload = response.json()
+            if payload.get('code') != 0:
+                return jsonify({
+                    'success': False,
+                    'online': False,
+                    'kook_ms': kook_ms,
+                    'error': payload.get('message', 'KOOK API 返回异常'),
+                }), 502
+
+            return jsonify({
+                'success': True,
+                'online': True,
+                'kook_ms': kook_ms,
+                'measured_at': time.time(),
+            })
+        except Exception as e:
+            logger.warning(f"KOOK 网络延迟探测失败: {e}")
+            return jsonify({
+                'success': False,
+                'online': False,
+                'error': f'无法连接 KOOK API：{e}',
+            }), 502
     
     @app.route('/api/channels', methods=['GET'])
     def get_channels():

@@ -1,4 +1,5 @@
 .env
+.DS_Store
 Cookie/cookie.txt
 Cookie/cookies.json
 Cookie/qr.png
