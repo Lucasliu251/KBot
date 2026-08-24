@@ -209,12 +209,13 @@ def get_cache_key(file_path, ss_value=0):
 
 
 def get_audio_identity(music_info):
-    """使用歌曲 ID 生成稳定标识，避免网易云临时 URL 更新后缓存失效。"""
+    """使用音源和歌曲 ID 生成稳定标识，避免临时 URL 更新后缓存失效。"""
     extra = music_info.get('extra', {}) if isinstance(music_info, dict) else {}
     song_id = extra.get('song_id') if isinstance(extra, dict) else None
+    provider = extra.get('provider', 'netease') if isinstance(extra, dict) else 'netease'
     file_path = music_info.get('file', '') if isinstance(music_info, dict) else str(music_info)
     if song_id:
-        return f'song:{song_id}'
+        return f'{provider}:song:{song_id}'
     if file_path.startswith('PLAYLIST_SONG:'):
         parts = file_path.split(':', 3)
         if len(parts) > 1:
@@ -272,22 +273,44 @@ class PCMVolumeRamp:
 
 
 def resolve_audio_source(music_info):
-    """把歌单标记解析为临时播放 URL，并复用已解析结果。"""
+    """把音源标记解析为临时播放 URL，并在过期前复用。"""
     file_path = music_info.get('file', '')
-    if not file_path.startswith('PLAYLIST_SONG:'):
+    is_netease_playlist = file_path.startswith('PLAYLIST_SONG:')
+    is_provider_song = file_path.startswith('MUSIC_SOURCE:')
+    if not is_netease_playlist and not is_provider_song:
         return file_path
-    resolved = music_info.get('resolved_file', '')
-    if resolved:
+
+    extra = music_info.get('extra', {}) if isinstance(music_info, dict) else {}
+    resolved = music_info.get('resolved_file', '') or extra.get('_resolved_url', '')
+    expires_at = float(extra.get('_resolved_expires_at', 0) or 0)
+    if resolved and (expires_at <= 0 or expires_at > time.time() + 60):
         return resolved
-    parts = file_path.split(':', 3)
-    if len(parts) < 2:
-        return ''
+
     try:
-        try:
-            from ..utils import get_music_url
-        except ImportError:
-            from utils import get_music_url
-        resolved = get_music_url(parts[1])
+        if is_provider_song:
+            parts = file_path.split(':', 2)
+            if len(parts) != 3:
+                return ''
+            provider, song_id = parts[1], parts[2]
+            if provider != 'qqmusic':
+                return ''
+            try:
+                from .. import qqmusic_service
+            except ImportError:
+                import qqmusic_service
+            source = qqmusic_service.resolve_song_url(song_id)
+            resolved = source.get('url', '')
+            extra['_resolved_url'] = resolved
+            extra['_resolved_expires_at'] = time.time() + max(0, int(source.get('expires_in', 0)))
+        else:
+            parts = file_path.split(':', 3)
+            if len(parts) < 2:
+                return ''
+            try:
+                from ..utils import get_music_url
+            except ImportError:
+                from utils import get_music_url
+            resolved = get_music_url(parts[1])
         if resolved:
             music_info['resolved_file'] = resolved
         return resolved
@@ -498,8 +521,8 @@ class Player:
         guild_volume.setdefault(self.guild_id, 0.4)
         guild_play_mode.setdefault(self.guild_id, 'order')
         play_history.setdefault(self.guild_id, [])
-        # 检查是否是歌单歌曲标记，如果是则跳过文件存在检查
-        if not music.startswith("PLAYLIST_SONG:"):
+        # 延迟解析的网易云歌单/QQ 音乐标记不对应本地文件。
+        if not music.startswith(("PLAYLIST_SONG:", "MUSIC_SOURCE:")):
             if 'http' not in music:
                 if not os.path.exists(music):
                     raise ValueError('文件不存在')

@@ -30,6 +30,22 @@ export async function postJson<T>(path: string, body: Record<string, unknown>): 
   return data
 }
 
+export async function postAdminJson<T>(path: string, body: Record<string, unknown>, token: string): Promise<ApiResult<T>> {
+  const response = await fetch(apiUrl(path), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Music-Settings-Token': token,
+    },
+    body: JSON.stringify(body),
+  })
+  const data = (await response.json().catch(() => ({}))) as ApiResult<T>
+  if (!response.ok || data.success === false) {
+    throw new Error(data.error || `请求失败（HTTP ${response.status}）`)
+  }
+  return data
+}
+
 export function assetUrl(filename: string) {
   const configured = window.MUSIC_CONSOLE_ASSET_BASE?.replace(/\/$/, '')
   if (configured) return `${configured}/${filename}`

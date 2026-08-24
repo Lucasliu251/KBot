@@ -56,3 +56,5 @@ NETEASE_HOT_PLAYLIST_ID = os.environ.get("NETEASE_HOT_PLAYLIST_ID", "3778678")
 
 # Web 控制台密钥
 SECRET_KEY = os.environ.get("SECRET_KEY", "kook_web_music_secret_key")
+# 音乐账号设置后台的管理密钥；未单独配置时沿用 Flask SECRET_KEY。
+MUSIC_SETTINGS_TOKEN = os.environ.get("MUSIC_SETTINGS_TOKEN", "").strip() or SECRET_KEY

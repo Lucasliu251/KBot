@@ -2,25 +2,166 @@ import requests
 import logging
 import json
 import os
+import threading
+import time
+from pathlib import Path
 from config import MUSIC_API_BASE, BACKUP_MUSIC_API, NETEASE_HOT_PLAYLIST_ID
 
 logger = logging.getLogger(__name__)
 
-COOKIE_TXT_PATH = os.path.join(os.path.dirname(__file__), "Cookie", "cookie.txt")
+COOKIE_DIR = Path(__file__).resolve().parent / "Cookie"
+COOKIE_TXT_PATH = COOKIE_DIR / "cookie.txt"
+COOKIE_JSON_PATH = COOKIE_DIR / "cookies.json"
+_cookie_lock = threading.RLock()
 
 
 class MusicAPIError(RuntimeError):
     """网易云兼容 API 主备服务均不可用。"""
 
 
+def parse_cookie_header(cookie_header):
+    """Parse a browser Cookie header without ever returning it to the client."""
+    cookies = {}
+    for part in str(cookie_header or '').split(';'):
+        item = part.strip()
+        if not item or '=' not in item:
+            continue
+        key, value = item.split('=', 1)
+        key = key.strip()
+        if key:
+            cookies[key] = value.strip()
+    return cookies
+
+
 def load_cookie_header():
+    environment_cookie = os.environ.get("NETEASE_COOKIE", "").strip()
+    if environment_cookie:
+        return environment_cookie
     try:
-        if os.path.exists(COOKIE_TXT_PATH):
-            with open(COOKIE_TXT_PATH, "r", encoding="utf-8") as f:
-                return f.read().strip()
+        if COOKIE_TXT_PATH.exists():
+            return COOKIE_TXT_PATH.read_text(encoding="utf-8").strip()
     except Exception:
         pass
     return ""
+
+
+def save_cookie_header(cookie_header):
+    """Validate and atomically persist a NetEase Cookie with owner-only access."""
+    if os.environ.get("NETEASE_COOKIE", "").strip():
+        raise MusicAPIError('网易云 Cookie 来自环境变量，请修改 NETEASE_COOKIE 后重启服务')
+    raw_cookie = str(cookie_header or '').strip()
+    if not raw_cookie or len(raw_cookie) > 65536 or '\n' in raw_cookie or '\r' in raw_cookie:
+        raise ValueError('Cookie 内容为空或格式无效')
+    cookies = parse_cookie_header(raw_cookie)
+    if not cookies:
+        raise ValueError('没有识别到有效的 Cookie 键值')
+
+    COOKIE_DIR.mkdir(parents=True, exist_ok=True)
+    text_tmp = COOKIE_TXT_PATH.with_suffix('.tmp')
+    json_tmp = COOKIE_JSON_PATH.with_suffix('.tmp')
+    normalized = '; '.join(f'{key}={value}' for key, value in cookies.items())
+    with _cookie_lock:
+        text_tmp.write_text(normalized, encoding='utf-8')
+        json_tmp.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.chmod(text_tmp, 0o600)
+        os.chmod(json_tmp, 0o600)
+        os.replace(text_tmp, COOKIE_TXT_PATH)
+        os.replace(json_tmp, COOKIE_JSON_PATH)
+    return netease_auth_status()
+
+
+def clear_cookie_header():
+    """Remove a locally persisted NetEase Cookie; environment credentials are immutable."""
+    if os.environ.get("NETEASE_COOKIE", "").strip():
+        return False
+    with _cookie_lock:
+        for path in (COOKIE_TXT_PATH, COOKIE_JSON_PATH):
+            path.unlink(missing_ok=True)
+    return True
+
+
+def netease_auth_status():
+    """Return a secret-free summary suitable for the settings UI."""
+    cookie_header = load_cookie_header()
+    cookies = parse_cookie_header(cookie_header)
+    source = 'environment' if os.environ.get("NETEASE_COOKIE", "").strip() else ('local' if cookies else 'none')
+    updated_at = int(COOKIE_TXT_PATH.stat().st_mtime) if source == 'local' and COOKIE_TXT_PATH.exists() else 0
+    return {
+        'available': True,
+        'authenticated': bool(cookies.get('MUSIC_U') or cookies.get('MUSIC_A')),
+        'source': source,
+        'cookie_count': len(cookies),
+        'updated_at': updated_at,
+    }
+
+
+def create_netease_login_qrcode():
+    """Create a NetEase app-login QR image through the configured compatible API."""
+    last_error = None
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            timestamp = int(time.time() * 1000)
+            key_response = requests.get(
+                f"{api_base}/login/qr/key",
+                params={'timestamp': timestamp},
+                timeout=12,
+            )
+            key_response.raise_for_status()
+            key_data = key_response.json()
+            key = str((key_data.get('data') or {}).get('unikey') or '').strip()
+            if key_data.get('code') != 200 or not key:
+                raise MusicAPIError(key_data.get('message') or '网易云未返回登录 key')
+            image_response = requests.get(
+                f"{api_base}/login/qr/create",
+                params={'key': key, 'qrimg': 'true', 'type': 1, 'timestamp': timestamp},
+                timeout=12,
+            )
+            image_response.raise_for_status()
+            image_data = image_response.json()
+            payload = image_data.get('data') or {}
+            image = str(payload.get('qrimg') or '').strip()
+            if image_data.get('code') != 200 or not image.startswith('data:image'):
+                raise MusicAPIError(image_data.get('message') or '网易云未返回二维码图片')
+            return {'key': key, 'image': image}
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"网易云登录二维码接口失败 ({api_base}): {exc}")
+    raise MusicAPIError(f'网易云登录二维码生成失败：{last_error or "上游服务不可用"}')
+
+
+def check_netease_login_qrcode(key):
+    """Poll a NetEase QR and persist the returned Cookie once login succeeds."""
+    login_key = str(key or '').strip()
+    if not login_key:
+        raise ValueError('网易云登录 key 无效')
+    last_error = None
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        try:
+            response = requests.get(
+                f"{api_base}/login/qr/check",
+                params={'key': login_key, 'timestamp': int(time.time() * 1000)},
+                timeout=12,
+            )
+            response.raise_for_status()
+            data = response.json()
+            code = int(data.get('code') or 0)
+            status_map = {800: 'timeout', 801: 'scan', 802: 'confirm', 803: 'done'}
+            status = status_map.get(code, 'error')
+            result = {'status': status, 'message': data.get('message') or data.get('msg') or ''}
+            if code == 803:
+                cookie_header = str(data.get('cookie') or (data.get('data') or {}).get('cookie') or '').strip()
+                if not cookie_header and response.cookies:
+                    cookie_header = '; '.join(f'{name}={value}' for name, value in response.cookies.items())
+                if not cookie_header:
+                    raise MusicAPIError('扫码成功，但上游没有返回可保存的 Cookie')
+                result['auth'] = save_cookie_header(cookie_header)
+            return result
+        except MusicAPIError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.warning(f"网易云登录状态接口失败 ({api_base}): {exc}")
+    raise MusicAPIError(f'网易云登录状态检查失败：{last_error or "上游服务不可用"}')
 
 
 def build_headers(extra: dict | None = None):
@@ -307,6 +448,7 @@ def format_playlist_data(play_list_data):
                     'album': extra_data.get('album', ''),
                     'cover': extra_data.get('cover', ''),
                     'duration': now_playing.get('duration', 0),
+                    'provider': extra_data.get('provider', 'netease'),
                     'playing': True,
                     'position': now_playing.get('ss', 0),
                     'start_time': now_playing.get('start', 0)
@@ -321,6 +463,7 @@ def format_playlist_data(play_list_data):
                 'album': extra_data.get('album', ''),
                 'cover': extra_data.get('cover', ''),
                 'duration': now_playing.get('duration', extra_data.get('duration', 0)),
+                'provider': extra_data.get('provider', 'netease'),
                 'playing': True,
                 'position': now_playing.get('ss', 0),
                 'start_time': now_playing.get('start', 0)
@@ -347,6 +490,7 @@ def format_playlist_data(play_list_data):
                     'album': extra_data.get('album', ''),
                     'cover': extra_data.get('cover', ''),
                     'duration': extra_data.get('duration', 0),
+                    'provider': extra_data.get('provider', 'netease'),
                     'queue_index': queue_index,
                     'playing': False
                 })
@@ -360,6 +504,7 @@ def format_playlist_data(play_list_data):
                 'album': extra_data.get('album', ''),
                 'cover': extra_data.get('cover', ''),
                 'duration': extra_data.get('duration', 0),
+                'provider': extra_data.get('provider', 'netease'),
                 'queue_index': queue_index,
                 'playing': False
             })

@@ -1,9 +1,12 @@
 from flask import render_template, request, jsonify, redirect, url_for, Blueprint, abort
 import logging
 import asyncio
+import functools
+import hmac
 import json
 import time
 import kookvoice
+from config import MUSIC_SETTINGS_TOKEN
 from utils import (
     search_music,
     search_music_page,
@@ -15,9 +18,19 @@ from utils import (
     format_playlist_data,
     get_song_detail,
     get_song_lyrics,
+    netease_auth_status,
+    save_cookie_header,
+    clear_cookie_header,
+    create_netease_login_qrcode,
+    check_netease_login_qrcode,
     MusicAPIError,
 )
 import threading
+
+try:
+    from . import qqmusic_service as qqmusic
+except ImportError:
+    import qqmusic_service as qqmusic
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +83,39 @@ def run_async(coro):
 
 def register_routes(app, bot, socketio=None):
     """注册所有路由"""
+
+    def music_settings_required(view):
+        """Protect credential-changing endpoints without exposing account secrets."""
+        @functools.wraps(view)
+        def wrapped(*args, **kwargs):
+            supplied = str(request.headers.get('X-Music-Settings-Token', ''))
+            expected = str(MUSIC_SETTINGS_TOKEN or '')
+            if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+                return jsonify({
+                    'success': False,
+                    'error': '管理密钥不正确，请检查 MUSIC_SETTINGS_TOKEN',
+                }), 403
+            return view(*args, **kwargs)
+        return wrapped
+
+    def requested_provider(payload=None):
+        """统一解析音源参数，缺省时保持网易云行为。"""
+        raw = (payload or {}).get('provider') if isinstance(payload, dict) else None
+        provider = str(raw or request.args.get('provider', 'netease')).strip().lower()
+        if provider not in ('netease', 'qqmusic'):
+            raise ValueError('不支持的音乐源')
+        return provider
+
+    def qqmusic_error_response(exc):
+        if isinstance(exc, qqmusic.QQMusicUnavailable):
+            status = 503
+        elif isinstance(exc, qqmusic.QQMusicAuthRequired):
+            status = 401
+        elif isinstance(exc, qqmusic.QQMusicPermissionError):
+            status = 403
+        else:
+            status = 502
+        return jsonify({'success': False, 'error': str(exc)}), status
 
     def render_console(channel_id=''):
         return render_template('dashboard.html', initial_channel_id=str(channel_id or ''))
@@ -353,9 +399,15 @@ def register_routes(app, bot, socketio=None):
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': '分页参数无效'}), 400
         try:
-            songs, total = search_music_page(keyword, limit=limit, offset=offset)
+            provider = requested_provider()
+            songs, total = (
+                qqmusic.search_music_page(keyword, limit=limit, offset=offset)
+                if provider == 'qqmusic'
+                else search_music_page(keyword, limit=limit, offset=offset)
+            )
             return jsonify({
                 'success': True,
+                'provider': provider,
                 'songs': songs,
                 'pagination': {
                     'offset': offset,
@@ -364,6 +416,9 @@ def register_routes(app, bot, socketio=None):
                     'has_more': offset + len(songs) < total,
                 },
             })
+        except qqmusic.QQMusicError as e:
+            logger.error(f"QQ 音乐搜索服务不可用: {e}")
+            return qqmusic_error_response(e)
         except MusicAPIError as e:
             logger.error(f"搜索音乐服务不可用: {e}")
             return jsonify({'success': False, 'error': str(e)}), 502
@@ -373,18 +428,24 @@ def register_routes(app, bot, socketio=None):
 
     @app.route('/api/discover', methods=['GET'])
     def discover():
-        """搜索框为空时返回网易云热搜词与分页热歌榜。"""
+        """搜索框为空时返回当前音源的热搜词与分页热歌榜。"""
         try:
             limit = max(1, min(20, int(request.args.get('limit', 8))))
             offset = max(0, int(request.args.get('offset', 0)))
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': '分页参数无效'}), 400
         try:
-            songs, has_more = get_hot_playlist_tracks(limit=limit, offset=offset)
+            provider = requested_provider()
+            if provider == 'qqmusic':
+                hot_searches, songs, has_more = qqmusic.discover(limit=limit, offset=offset)
+            else:
+                songs, has_more = get_hot_playlist_tracks(limit=limit, offset=offset)
+                hot_searches = get_hot_searches(limit=12) if offset == 0 else []
             return jsonify({
                 'success': True,
+                'provider': provider,
                 # 后续分页不重复传热搜，减少响应体和上游请求。
-                'hot_searches': get_hot_searches(limit=12) if offset == 0 else [],
+                'hot_searches': hot_searches,
                 'songs': songs,
                 'pagination': {
                     'offset': offset,
@@ -392,6 +453,9 @@ def register_routes(app, bot, socketio=None):
                     'has_more': has_more,
                 },
             })
+        except qqmusic.QQMusicError as e:
+            logger.error(f"QQ 音乐发现页服务不可用: {e}")
+            return qqmusic_error_response(e)
         except MusicAPIError as e:
             logger.error(f"网易云发现页服务不可用: {e}")
             return jsonify({'success': False, 'error': str(e)}), 502
@@ -406,6 +470,24 @@ def register_routes(app, bot, socketio=None):
         if not song_id:
             return jsonify({'success': False, 'error': '缺少id参数'})
         try:
+            provider = requested_provider()
+            if provider == 'qqmusic':
+                normalized = qqmusic.get_song_detail(song_id)
+                album = normalized.get('al', {})
+                artists = normalized.get('ar', [])
+                return jsonify({
+                    'success': True,
+                    'provider': provider,
+                    'song': {
+                        'id': str(normalized.get('id', song_id)),
+                        'name': normalized.get('name', ''),
+                        'artist': ' / '.join(artist.get('name', '') for artist in artists if artist.get('name')),
+                        'album': album.get('name', ''),
+                        'cover': album.get('picUrl', ''),
+                        'duration': (normalized.get('dt', 0) or 0) / 1000,
+                        'provider': provider,
+                    },
+                })
             detail = get_song_detail(song_id)
             album = detail.get('al', {}) if detail else {}
             artists = detail.get('ar', []) if detail else []
@@ -418,20 +500,27 @@ def register_routes(app, bot, socketio=None):
                     'album': album.get('name', ''),
                     'cover': album.get('picUrl', ''),
                     'duration': (detail.get('dt', 0) or 0) / 1000,
+                    'provider': provider,
                 },
             })
+        except qqmusic.QQMusicError as e:
+            return qqmusic_error_response(e)
         except Exception as e:
             logger.error(f"获取歌曲详情异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/song/lyrics', methods=['GET'])
     def song_lyrics():
-        """返回网易云 LRC 原文，时间轴解析由前端完成。"""
+        """返回当前音源的 LRC 原文，时间轴解析由前端完成。"""
         song_id = request.args.get('id')
         if not song_id:
             return jsonify({'success': False, 'error': '缺少id参数'})
         try:
-            return jsonify({'success': True, 'lyric': get_song_lyrics(song_id)})
+            provider = requested_provider()
+            lyric = qqmusic.get_song_lyrics(song_id) if provider == 'qqmusic' else get_song_lyrics(song_id)
+            return jsonify({'success': True, 'provider': provider, 'lyric': lyric})
+        except qqmusic.QQMusicError as e:
+            return qqmusic_error_response(e)
         except Exception as e:
             logger.error(f"获取歌词异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -455,29 +544,149 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '缺少必要参数'})
         
         try:
-            # 获取音乐URL
-            url = get_music_url(song_id)
-            if not url:
-                return jsonify({'success': False, 'error': '无法获取音乐URL'})
-            
-            # 播放音乐 - 提供必要的参数
+            provider = requested_provider(data)
+            resolved_url = ''
+            resolved_expires_at = 0
+            if provider == 'qqmusic':
+                resolved = qqmusic.resolve_song_url(song_id)
+                resolved_url = resolved['url']
+                resolved_expires_at = time.time() + max(0, int(resolved.get('expires_in', 0)))
+                normalized = resolved.get('song', {})
+                album_data = normalized.get('al', {})
+                artists = normalized.get('ar', [])
+                song_name = song_name or normalized.get('name', '')
+                artist_name = artist_name or ' / '.join(
+                    artist.get('name', '') for artist in artists if artist.get('name')
+                )
+                album_name = album_name or album_data.get('name', '')
+                cover_url = cover_url or album_data.get('picUrl', '')
+                duration = (normalized.get('dt', 0) or 0) / 1000
+                source = f'MUSIC_SOURCE:qqmusic:{song_id}'
+            else:
+                resolved_url = get_music_url(song_id)
+                if not resolved_url:
+                    return jsonify({'success': False, 'error': '无法获取音乐URL'})
+                detail = get_song_detail(song_id) if not (album_name and cover_url) else {}
+                album_data = detail.get('al', {}) if detail else {}
+                duration = (detail.get('dt', 0) or 0) / 1000 if detail else 0
+                source = resolved_url
+
             from config import BOT_TOKEN
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
-            detail = get_song_detail(song_id) if not (album_name and cover_url) else {}
-            album_data = detail.get('al', {}) if detail else {}
-            player.add_music(url, {
+            player.add_music(source, {
                 'song_id': str(song_id),
                 'title': song_name,
                 'artist': artist_name,
                 'album': album_name or album_data.get('name', ''),
                 'cover': cover_url or album_data.get('picUrl', ''),
-                'duration': (detail.get('dt', 0) or 0) / 1000 if detail else 0,
+                'duration': duration,
+                'provider': provider,
+                '_resolved_url': resolved_url if provider == 'qqmusic' else '',
+                '_resolved_expires_at': resolved_expires_at,
             })
             
-            return jsonify({'success': True})
+            return jsonify({'success': True, 'provider': provider})
+        except qqmusic.QQMusicError as e:
+            logger.error(f"播放 QQ 音乐异常: {e}")
+            return qqmusic_error_response(e)
         except Exception as e:
             logger.error(f"播放音乐异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/music/providers', methods=['GET'])
+    def music_providers():
+        """返回不包含 Cookie/密钥的音源登录状态。"""
+        return jsonify({
+            'success': True,
+            'default': 'netease',
+            'providers': {
+                'netease': netease_auth_status(),
+                'qqmusic': qqmusic.auth_status(),
+            },
+        })
+
+    @app.route('/api/music/settings/unlock', methods=['POST'])
+    @music_settings_required
+    def music_settings_unlock():
+        return jsonify({'success': True})
+
+    @app.route('/api/netease/login/qrcode', methods=['POST'])
+    @music_settings_required
+    def netease_login_qrcode():
+        try:
+            result = create_netease_login_qrcode()
+            return jsonify({'success': True, **result})
+        except (MusicAPIError, ValueError) as e:
+            return jsonify({'success': False, 'error': str(e)}), 502
+
+    @app.route('/api/netease/login/status', methods=['POST'])
+    @music_settings_required
+    def netease_login_status():
+        try:
+            data = request.get_json(silent=True) or {}
+            result = check_netease_login_qrcode(data.get('key', ''))
+            return jsonify({'success': True, **result})
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        except MusicAPIError as e:
+            return jsonify({'success': False, 'error': str(e)}), 502
+
+    @app.route('/api/netease/cookie', methods=['POST'])
+    @music_settings_required
+    def netease_cookie_update():
+        data = request.get_json(silent=True) or {}
+        try:
+            auth = save_cookie_header(data.get('cookie', ''))
+            return jsonify({'success': True, 'auth': auth})
+        except ValueError as e:
+            return jsonify({'success': False, 'error': str(e)}), 400
+        except MusicAPIError as e:
+            return jsonify({'success': False, 'error': str(e)}), 409
+
+    @app.route('/api/netease/logout', methods=['POST'])
+    @music_settings_required
+    def netease_logout():
+        if not clear_cookie_header():
+            return jsonify({
+                'success': False,
+                'error': '网易云 Cookie 来自环境变量，请修改 NETEASE_COOKIE 后重启服务',
+            }), 409
+        return jsonify({'success': True, 'auth': netease_auth_status()})
+
+    @app.route('/api/qqmusic/login/qrcode', methods=['POST'])
+    @music_settings_required
+    def qqmusic_login_qrcode():
+        data = request.get_json(silent=True) or {}
+        try:
+            result = qqmusic.create_login_qrcode(str(data.get('login_type', 'qq')).lower())
+            return jsonify({'success': True, **result})
+        except qqmusic.QQMusicError as e:
+            return qqmusic_error_response(e)
+
+    @app.route('/api/qqmusic/login/status', methods=['POST'])
+    @music_settings_required
+    def qqmusic_login_status():
+        data = request.get_json(silent=True) or {}
+        identifier = str(data.get('identifier', '')).strip()
+        login_type = str(data.get('login_type', 'qq')).strip().lower()
+        try:
+            result = qqmusic.check_login_qrcode(identifier, login_type)
+            return jsonify({'success': True, **result})
+        except qqmusic.QQMusicError as e:
+            return qqmusic_error_response(e)
+
+    @app.route('/api/qqmusic/logout', methods=['POST'])
+    @music_settings_required
+    def qqmusic_logout():
+        try:
+            if not qqmusic.clear_credential():
+                return jsonify({
+                    'success': False,
+                    'error': '当前 QQ 音乐账号来自环境变量，请从 .env 删除后重启服务',
+                }), 409
+            return jsonify({'success': True, 'auth': qqmusic.auth_status()})
+        except qqmusic.QQMusicError as e:
+            return qqmusic_error_response(e)
     
     @app.route('/api/playlist', methods=['POST'])
     def add_playlist():

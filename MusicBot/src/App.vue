@@ -6,20 +6,25 @@ import {
   Clock3,
   GripVertical,
   Headphones,
+  KeyRound,
   ListMusic,
   LoaderCircle,
   Minus,
   Music2,
+  LogOut,
   Pause,
   Play,
   Plus,
   Radio,
+  QrCode,
   RefreshCw,
   Repeat1,
   Repeat2,
   RotateCcw,
   Search,
   Server,
+  Settings,
+  ShieldCheck,
   Shuffle,
   SkipBack,
   SkipForward,
@@ -30,9 +35,10 @@ import {
   X,
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { assetUrl, getJson, postJson } from './api'
+import { assetUrl, getJson, postAdminJson, postJson } from './api'
 
 type PlayMode = 'order' | 'repeat-one' | 'shuffle'
+type MusicProvider = 'netease' | 'qqmusic'
 type Track = {
   id: string
   name: string
@@ -43,6 +49,7 @@ type Track = {
   position?: number
   playing?: boolean
   queue_index?: number
+  provider?: MusicProvider
 }
 type Guild = { id: string; name: string }
 type Channel = { id: string; name: string }
@@ -52,6 +59,7 @@ type SearchTrack = {
   ar?: Array<{ name: string }>
   al?: { name?: string; picUrl?: string }
   dt?: number
+  provider?: MusicProvider
 }
 type HotSearch = {
   keyword: string
@@ -61,6 +69,17 @@ type HotSearch = {
 }
 type SearchMode = 'discover' | 'search'
 type LyricLine = { time: number; text: string }
+type MusicAuthStatus = {
+  available: boolean
+  authenticated: boolean
+  account?: string
+  expired?: boolean
+  error?: string
+  source?: 'environment' | 'local' | 'none'
+  login_source?: 'environment' | 'local'
+  cookie_count?: number
+  updated_at?: number
+}
 
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
 const MODE_META = {
@@ -80,6 +99,8 @@ const playMode = ref<PlayMode>('order')
 const lyricOffset = ref(0)
 const syncOpen = ref(false)
 const searchOpen = ref(false)
+const settingsOpen = ref(false)
+const musicSource = ref<MusicProvider>('netease')
 const channelSwitcherOpen = ref(false)
 const searchMode = ref<SearchMode>('discover')
 const searching = ref(false)
@@ -92,6 +113,22 @@ const searchResults = ref<SearchTrack[]>([])
 const hotSearches = ref<HotSearch[]>([])
 const discoveryError = ref('')
 const playlistInput = ref('')
+const neteaseAuth = ref<MusicAuthStatus>({ available: true, authenticated: false, source: 'none' })
+const qqAuth = ref<MusicAuthStatus>({ available: true, authenticated: false })
+const qqAuthLoading = ref(false)
+const qqLoginQr = ref('')
+const qqLoginIdentifier = ref('')
+const qqLoginType = ref<'qq' | 'wx'>('qq')
+const qqLoginState = ref('')
+const neteaseAuthLoading = ref(false)
+const neteaseLoginQr = ref('')
+const neteaseLoginKey = ref('')
+const neteaseLoginState = ref('')
+const neteaseCookieInput = ref('')
+const settingsToken = ref(sessionStorage.getItem('musicSettingsToken') ?? '')
+const settingsUnlocked = ref(Boolean(settingsToken.value))
+const settingsUnlocking = ref(false)
+const settingsError = ref('')
 const guilds = ref<Guild[]>([])
 const channels = ref<Channel[]>([])
 const savedGuildId = localStorage.getItem('currentGuildId') ?? ''
@@ -118,6 +155,8 @@ let pollTimer: number | undefined
 let progressTimer: number | undefined
 let toastTimer: number | undefined
 let volumeTimer: number | undefined
+let qqLoginTimer: number | undefined
+let neteaseLoginTimer: number | undefined
 let playlistRequestVersion = 0
 let lyricRequestVersion = 0
 let searchRequestVersion = 0
@@ -136,6 +175,9 @@ const guildName = computed(() => guilds.value.find((guild) => guild.id === guild
 const modeIcon = computed(() => MODE_META[playMode.value].icon)
 const rangeProgressStyle = computed(() => ({ '--range-progress': `${progress.value}%` }))
 const volumeProgressStyle = computed(() => ({ '--range-progress': `${volume.value}%` }))
+const currentProvider = computed<MusicProvider>(() => current.value?.provider || 'netease')
+const currentProviderLabel = computed(() => currentProvider.value === 'qqmusic' ? 'QQ MUSIC' : 'NETEASE')
+const selectedProviderName = computed(() => musicSource.value === 'qqmusic' ? 'QQ音乐' : '网易云')
 
 function formatTime(seconds = 0) {
   if (!Number.isFinite(seconds) || seconds < 0) return '00:00'
@@ -165,6 +207,228 @@ function coverFallback(event: Event) {
   if (!image.src.endsWith('/album-placeholder.png')) image.src = FALLBACK_COVER
 }
 
+function stopQQLoginPoll() {
+  if (qqLoginTimer) window.clearInterval(qqLoginTimer)
+  qqLoginTimer = undefined
+}
+
+function stopNeteaseLoginPoll() {
+  if (neteaseLoginTimer) window.clearInterval(neteaseLoginTimer)
+  neteaseLoginTimer = undefined
+}
+
+function settingsFailure(error: unknown, fallback: string) {
+  const message = error instanceof Error ? error.message : fallback
+  if (message.includes('HTTP 404')) return '登录接口未加载，请停止旧进程后重新运行 npm run dev'
+  if (message.includes('管理密钥')) {
+    settingsUnlocked.value = false
+    sessionStorage.removeItem('musicSettingsToken')
+  }
+  return message
+}
+
+async function loadMusicProviders() {
+  qqAuthLoading.value = true
+  neteaseAuthLoading.value = true
+  try {
+    const data = await getJson<{
+      providers?: { netease?: MusicAuthStatus; qqmusic?: MusicAuthStatus }
+    }>('/api/music/providers')
+    neteaseAuth.value = data.providers?.netease ?? { available: true, authenticated: false, source: 'none' }
+    qqAuth.value = data.providers?.qqmusic ?? { available: false, authenticated: false, error: 'QQ 音乐组件不可用' }
+  } catch (error) {
+    neteaseAuth.value = { available: false, authenticated: false, error: error instanceof Error ? error.message : '无法读取网易云状态' }
+    qqAuth.value = { available: false, authenticated: false, error: error instanceof Error ? error.message : '无法读取 QQ 音乐状态' }
+  } finally {
+    qqAuthLoading.value = false
+    neteaseAuthLoading.value = false
+  }
+}
+
+async function unlockMusicSettings() {
+  const token = settingsToken.value.trim()
+  if (!token || settingsUnlocking.value) return
+  settingsUnlocking.value = true
+  settingsError.value = ''
+  try {
+    await postAdminJson('/api/music/settings/unlock', {}, token)
+    settingsToken.value = token
+    sessionStorage.setItem('musicSettingsToken', token)
+    settingsUnlocked.value = true
+    await loadMusicProviders()
+    notify('音乐后台已解锁')
+  } catch (error) {
+    settingsUnlocked.value = false
+    settingsError.value = settingsFailure(error, '无法解锁音乐后台')
+  } finally {
+    settingsUnlocking.value = false
+  }
+}
+
+function lockMusicSettings() {
+  stopQQLoginPoll()
+  stopNeteaseLoginPoll()
+  settingsUnlocked.value = false
+  settingsToken.value = ''
+  settingsError.value = ''
+  sessionStorage.removeItem('musicSettingsToken')
+}
+
+async function pollNeteaseLogin() {
+  if (!neteaseLoginKey.value || !settingsUnlocked.value) return
+  try {
+    const data = await postAdminJson<{
+      status: 'scan' | 'confirm' | 'done' | 'timeout' | 'error'
+      message?: string
+      auth?: MusicAuthStatus
+    }>('/api/netease/login/status', { key: neteaseLoginKey.value }, settingsToken.value)
+    if (data.status === 'done') {
+      stopNeteaseLoginPoll()
+      neteaseLoginState.value = '登录成功，Cookie 已持久化'
+      if (data.auth) neteaseAuth.value = data.auth
+      else await loadMusicProviders()
+      neteaseLoginQr.value = ''
+      neteaseLoginKey.value = ''
+      notify('网易云音乐账号已连接')
+    } else if (data.status === 'confirm') {
+      neteaseLoginState.value = '已扫码，请在网易云 App 中确认'
+    } else if (data.status === 'scan') {
+      neteaseLoginState.value = '等待网易云音乐 App 扫码'
+    } else {
+      stopNeteaseLoginPoll()
+      neteaseLoginState.value = data.status === 'timeout' ? '二维码已过期，请刷新' : (data.message || '登录状态异常')
+    }
+  } catch (error) {
+    stopNeteaseLoginPoll()
+    neteaseLoginState.value = settingsFailure(error, '网易云登录状态检查失败')
+  }
+}
+
+async function startNeteaseLogin() {
+  if (neteaseAuthLoading.value || !settingsUnlocked.value) return
+  stopNeteaseLoginPoll()
+  neteaseAuthLoading.value = true
+  neteaseLoginQr.value = ''
+  neteaseLoginKey.value = ''
+  neteaseLoginState.value = '正在生成二维码'
+  try {
+    const data = await postAdminJson<{ key: string; image: string }>('/api/netease/login/qrcode', {}, settingsToken.value)
+    neteaseLoginKey.value = data.key
+    neteaseLoginQr.value = data.image
+    neteaseLoginState.value = '请使用网易云音乐 App 扫码'
+    neteaseLoginTimer = window.setInterval(() => { void pollNeteaseLogin() }, 1800)
+  } catch (error) {
+    neteaseLoginState.value = settingsFailure(error, '网易云二维码生成失败')
+  } finally {
+    neteaseAuthLoading.value = false
+  }
+}
+
+async function saveNeteaseCookie() {
+  const cookie = neteaseCookieInput.value.trim()
+  if (!cookie || neteaseAuthLoading.value || !settingsUnlocked.value) return
+  neteaseAuthLoading.value = true
+  try {
+    const data = await postAdminJson<{ auth?: MusicAuthStatus }>('/api/netease/cookie', { cookie }, settingsToken.value)
+    if (data.auth) neteaseAuth.value = data.auth
+    neteaseCookieInput.value = ''
+    notify('网易云 Cookie 已安全保存')
+  } catch (error) {
+    notify(settingsFailure(error, '网易云 Cookie 保存失败'))
+  } finally {
+    neteaseAuthLoading.value = false
+  }
+}
+
+async function logoutNetease() {
+  try {
+    await postAdminJson('/api/netease/logout', {}, settingsToken.value)
+    stopNeteaseLoginPoll()
+    neteaseLoginQr.value = ''
+    neteaseLoginState.value = ''
+    await loadMusicProviders()
+    notify('已删除网易云本地登录信息')
+  } catch (error) {
+    notify(settingsFailure(error, '网易云登录信息删除失败'))
+  }
+}
+
+async function pollQQLogin() {
+  if (!qqLoginIdentifier.value) return
+  try {
+    const data = await postAdminJson<{
+      status: 'scan' | 'conf' | 'done' | 'timeout' | 'refuse'
+      auth?: MusicAuthStatus
+    }>('/api/qqmusic/login/status', { identifier: qqLoginIdentifier.value, login_type: qqLoginType.value }, settingsToken.value)
+    if (data.status === 'done') {
+      stopQQLoginPoll()
+      qqLoginState.value = '登录成功'
+      if (data.auth) qqAuth.value = data.auth
+      else await loadMusicProviders()
+      qqLoginQr.value = ''
+      qqLoginIdentifier.value = ''
+      notify('QQ 音乐会员账号已连接')
+    } else if (data.status === 'conf') {
+      qqLoginState.value = '已扫码，请在手机上确认'
+    } else if (data.status === 'scan') {
+      qqLoginState.value = '等待扫码'
+    } else {
+      stopQQLoginPoll()
+      qqLoginState.value = data.status === 'refuse' ? '已取消登录' : '二维码已过期'
+    }
+  } catch (error) {
+    stopQQLoginPoll()
+    qqLoginState.value = settingsFailure(error, '登录状态检查失败')
+  }
+}
+
+async function startQQLogin(loginType: 'qq' | 'wx') {
+  if (qqAuthLoading.value) return
+  stopQQLoginPoll()
+  qqAuthLoading.value = true
+  qqLoginQr.value = ''
+  qqLoginIdentifier.value = ''
+  qqLoginType.value = loginType
+  qqLoginState.value = '正在生成二维码'
+  try {
+    const data = await postAdminJson<{ identifier: string; image: string; login_type: 'qq' | 'wx' }>('/api/qqmusic/login/qrcode', { login_type: loginType }, settingsToken.value)
+    qqLoginIdentifier.value = data.identifier
+    qqLoginQr.value = data.image
+    qqLoginState.value = loginType === 'wx' ? '请使用微信扫码' : '请使用手机 QQ 扫码'
+    qqLoginTimer = window.setInterval(() => { void pollQQLogin() }, 1600)
+  } catch (error) {
+    qqLoginState.value = settingsFailure(error, '二维码生成失败')
+  } finally {
+    qqAuthLoading.value = false
+  }
+}
+
+async function logoutQQMusic() {
+  try {
+    await postAdminJson('/api/qqmusic/logout', {}, settingsToken.value)
+    stopQQLoginPoll()
+    qqLoginQr.value = ''
+    qqLoginState.value = ''
+    await loadMusicProviders()
+    notify('已退出 QQ 音乐账号')
+  } catch (error) {
+    notify(settingsFailure(error, 'QQ 音乐退出失败'))
+  }
+}
+
+async function selectMusicSource(provider: MusicProvider) {
+  if (musicSource.value === provider) return
+  musicSource.value = provider
+  searchRequestVersion += 1
+  searchResults.value = []
+  hotSearches.value = []
+  searchHasMore.value = false
+  discoveryError.value = ''
+  if (!searchOpen.value) return
+  if (query.value.trim()) await runSearch()
+  else await loadDiscovery()
+}
+
 function syncPlaybackPosition(nextPosition: number, force = false) {
   const normalized = Math.max(0, Number(nextPosition) || 0)
   const drift = normalized - position.value
@@ -183,11 +447,12 @@ async function loadPlaylist(selectedGuild = guildId.value) {
     if (requestVersion !== playlistRequestVersion) return
     if (data.success === false) throw new Error(data.error)
     const playlist = (data.playlist ?? []).map((track) => ({ ...track, id: String(track.id), duration: Number(track.duration || 0) }))
-    const previousTrackId = current.value?.id
+    const previousTrackId = current.value ? `${current.value.provider || 'netease'}:${current.value.id}` : ''
     const incomingCurrent = playlist.find((track) => track.playing)
     tracks.value = playlist
     if (incomingCurrent) {
-      syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingCurrent.id)
+      const incomingTrackId = `${incomingCurrent.provider || 'netease'}:${incomingCurrent.id}`
+      syncPlaybackPosition(Number(incomingCurrent.position || 0), previousTrackId !== incomingTrackId)
     } else {
       position.value = 0
       isPlaying.value = false
@@ -338,6 +603,8 @@ onBeforeUnmount(() => {
   if (progressTimer) window.clearInterval(progressTimer)
   if (toastTimer) window.clearTimeout(toastTimer)
   if (volumeTimer) window.clearTimeout(volumeTimer)
+  stopQQLoginPoll()
+  stopNeteaseLoginPoll()
   window.removeEventListener('popstate', handlePopState)
   window.removeEventListener('pointerup', finishPointerDrag)
   document.body.classList.remove('is-queue-dragging')
@@ -362,8 +629,25 @@ watch(searchOpen, async (open) => {
   window.setTimeout(() => searchInput.value?.focus(), 80)
 })
 
-watch(() => current.value?.id, async (id) => {
-  if (!id) {
+watch(settingsOpen, async (open) => {
+  if (!open) {
+    stopQQLoginPoll()
+    stopNeteaseLoginPoll()
+    return
+  }
+  await loadMusicProviders()
+  if (!settingsUnlocked.value) return
+  if (qqLoginIdentifier.value && !qqLoginTimer) {
+    qqLoginTimer = window.setInterval(() => { void pollQQLogin() }, 1600)
+  }
+  if (neteaseLoginKey.value && !neteaseLoginTimer) {
+    neteaseLoginTimer = window.setInterval(() => { void pollNeteaseLogin() }, 1800)
+  }
+})
+
+watch(() => current.value ? `${current.value.provider || 'netease'}:${current.value.id}` : '', async (trackKey) => {
+  const playingTrack = current.value
+  if (!trackKey || !playingTrack) {
     lyricTargetId = ''
     lyricsTrackId.value = ''
     lyricRequestVersion += 1
@@ -371,12 +655,12 @@ watch(() => current.value?.id, async (id) => {
     lyricState.value = bootstrapping.value ? 'loading' : 'empty'
     return
   }
-  if (id === lyricTargetId) return
-  lyricTargetId = id
+  if (trackKey === lyricTargetId) return
+  lyricTargetId = trackKey
   const requestVersion = ++lyricRequestVersion
 
-  lyricsTrackId.value = id
-  const cachedLyrics = lyricCache.get(id)
+  lyricsTrackId.value = trackKey
+  const cachedLyrics = lyricCache.get(trackKey)
   if (cachedLyrics) {
     lyrics.value = cachedLyrics
     lyricState.value = 'ready'
@@ -385,11 +669,13 @@ watch(() => current.value?.id, async (id) => {
     lyricState.value = 'loading'
   }
 
-  const detailPromise = getJson<{ song?: { album?: string; cover?: string; duration?: number } }>(`/api/song/detail?id=${encodeURIComponent(id)}`)
+  const provider = playingTrack.provider || 'netease'
+  const id = playingTrack.id
+  const detailPromise = getJson<{ song?: { album?: string; cover?: string; duration?: number } }>(`/api/song/detail?id=${encodeURIComponent(id)}&provider=${provider}`)
   const lyricPromise = (async () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const response = await getJson<{ lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}`)
+        const response = await getJson<{ lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}&provider=${provider}`)
         const parsed = parseLyrics(response.lyric ?? '')
         if (parsed.length || attempt === 1) return parsed
       } catch {
@@ -401,12 +687,12 @@ watch(() => current.value?.id, async (id) => {
   })()
 
   const [detailResult, lyricResult] = await Promise.allSettled([detailPromise, lyricPromise])
-  if (requestVersion !== lyricRequestVersion || lyricTargetId !== id) return
+  if (requestVersion !== lyricRequestVersion || lyricTargetId !== trackKey) return
 
   if (detailResult.status === 'fulfilled') {
     const detail = detailResult.value
     if (detail.song) {
-      tracks.value = tracks.value.map((track) => track.id === id
+      tracks.value = tracks.value.map((track) => track.id === id && (track.provider || 'netease') === provider
         ? { ...track, album: detail.song?.album || track.album, cover: detail.song?.cover || track.cover, duration: detail.song?.duration || track.duration }
         : track)
     }
@@ -414,7 +700,7 @@ watch(() => current.value?.id, async (id) => {
 
   const parsedLyrics = lyricResult.status === 'fulfilled' ? lyricResult.value : []
   if (parsedLyrics.length) {
-    lyricCache.set(id, parsedLyrics)
+    lyricCache.set(trackKey, parsedLyrics)
     lyrics.value = parsedLyrics
     lyricState.value = 'ready'
   } else if (!cachedLyrics) {
@@ -601,18 +887,19 @@ async function loadDiscovery() {
   if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
   try {
     const limit = getSearchPageSize()
+    const provider = musicSource.value
     const data = await getJson<{
       hot_searches?: HotSearch[]
       songs: SearchTrack[]
       pagination?: { has_more?: boolean }
-    }>(`/api/discover?limit=${limit}&offset=0`)
+    }>(`/api/discover?provider=${provider}&limit=${limit}&offset=0`)
     if (requestVersion !== searchRequestVersion) return
     hotSearches.value = data.hot_searches ?? []
     searchResults.value = data.songs ?? []
     searchHasMore.value = Boolean(data.pagination?.has_more)
   } catch (error) {
     if (requestVersion !== searchRequestVersion) return
-    discoveryError.value = error instanceof Error ? error.message : '网易云发现页暂时不可用'
+    discoveryError.value = error instanceof Error ? error.message : `${selectedProviderName.value}发现页暂时不可用`
     searchResults.value = []
     searchHasMore.value = false
   } finally {
@@ -648,10 +935,11 @@ async function runSearch() {
   if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
   try {
     const limit = getSearchPageSize()
+    const provider = musicSource.value
     const data = await getJson<{
       songs: SearchTrack[]
       pagination?: { has_more?: boolean }
-    }>(`/api/search?keyword=${encodeURIComponent(keyword)}&limit=${limit}&offset=0`)
+    }>(`/api/search?provider=${provider}&keyword=${encodeURIComponent(keyword)}&limit=${limit}&offset=0`)
     if (requestVersion !== searchRequestVersion) return
     searchResults.value = data.songs ?? []
     searchHasMore.value = Boolean(data.pagination?.has_more)
@@ -673,8 +961,8 @@ async function loadMoreSearchResults() {
   const offset = searchResults.value.length
   const limit = getSearchPageSize()
   const endpoint = searchMode.value === 'discover'
-    ? `/api/discover?limit=${limit}&offset=${offset}`
-    : `/api/search?keyword=${encodeURIComponent(activeSearchKeyword.value)}&limit=${limit}&offset=${offset}`
+    ? `/api/discover?provider=${musicSource.value}&limit=${limit}&offset=${offset}`
+    : `/api/search?provider=${musicSource.value}&keyword=${encodeURIComponent(activeSearchKeyword.value)}&limit=${limit}&offset=${offset}`
   loadingMoreSearch.value = true
   try {
     const data = await getJson<{
@@ -707,6 +995,7 @@ async function addSong(song: SearchTrack) {
     return
   }
   try {
+    const provider = song.provider || musicSource.value
     await postJson('/api/play', {
       guild_id: guildId.value,
       channel_id: channelId.value,
@@ -715,6 +1004,7 @@ async function addSong(song: SearchTrack) {
       artist_name: song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家',
       album_name: song.al?.name || '',
       cover_url: song.al?.picUrl || '',
+      provider,
     })
     notify(`《${song.name}》已加入队列`)
     await loadPlaylist()
@@ -846,6 +1136,7 @@ async function dropQueue(targetIndex: number) {
         </button>
         <button class="icon-button" aria-label="搜索音乐" title="搜索音乐" @click="searchOpen = true"><Search :size="19" /></button>
         <button class="icon-button" aria-label="刷新页面状态" title="刷新页面状态" @click="refreshAll"><RefreshCw :size="19" :class="{ 'spin-once': refreshing }" /></button>
+        <button class="icon-button" aria-label="音乐后台设置" title="音乐后台设置" @click="settingsOpen = true"><Settings :size="19" /></button>
       </div>
     </header>
 
@@ -861,7 +1152,7 @@ async function dropQueue(targetIndex: number) {
           <p>{{ current?.album || '互联网垃圾桶音乐控制台' }}</p>
         </div>
         <div class="source-row">
-          <span class="netease-dot"><Music2 :size="13" /></span><span class="source-name">NETEASE</span>
+          <span class="source-dot" :class="`is-${currentProvider}`"><Music2 :size="13" /></span><span class="source-name">{{ currentProviderLabel }}</span>
         </div>
         <div class="slider-block progress-block">
           <input
@@ -959,6 +1250,88 @@ async function dropQueue(targetIndex: number) {
       </section>
     </section>
 
+    <template v-if="settingsOpen">
+      <button class="settings-scrim" aria-label="关闭音乐后台" @click="settingsOpen = false" />
+      <aside class="settings-drawer" aria-label="音乐服务后台">
+        <div class="settings-drawer-head">
+          <div><span class="eyebrow">MUSIC ADMIN</span><h2>音乐服务后台</h2><p>账号凭证仅保存在运行 MusicBot 的服务器</p></div>
+          <button class="icon-button" title="关闭" @click="settingsOpen = false"><X :size="19" /></button>
+        </div>
+
+        <section v-if="!settingsUnlocked" class="settings-lock-card">
+          <span class="settings-lock-icon"><ShieldCheck :size="25" /></span>
+          <div><h3>验证管理身份</h3><p>请输入服务器 `.env` 中的 `MUSIC_SETTINGS_TOKEN`；未配置时使用 `SECRET_KEY`。</p></div>
+          <label class="settings-secret-input">
+            <KeyRound :size="17" />
+            <input v-model="settingsToken" type="password" autocomplete="current-password" placeholder="管理密钥" @keydown.enter="unlockMusicSettings" />
+            <button :disabled="settingsUnlocking || !settingsToken.trim()" @click="unlockMusicSettings"><LoaderCircle v-if="settingsUnlocking" :size="16" class="continuous-spin" /><template v-else>解锁</template></button>
+          </label>
+          <p v-if="settingsError" class="settings-error">{{ settingsError }}</p>
+        </section>
+
+        <div v-else class="settings-content">
+          <div class="settings-security-note">
+            <ShieldCheck :size="17" /><span>管理密钥只保留到当前浏览器会话；Cookie 和登录凭证不会返回到网页。</span>
+            <button @click="lockMusicSettings">锁定</button>
+          </div>
+
+          <section class="provider-settings-card is-netease">
+            <div class="provider-settings-head">
+              <span class="provider-settings-icon"><Music2 :size="19" /></span>
+              <div><h3>网易云音乐</h3><p>扫码自动获取 Cookie，也可以手动替换</p></div>
+              <span class="provider-status" :class="{ 'is-online': neteaseAuth.authenticated }">{{ neteaseAuthLoading ? '读取中' : neteaseAuth.authenticated ? '已持久化' : '未登录' }}</span>
+            </div>
+            <div class="provider-credential-summary">
+              <strong>{{ neteaseAuth.authenticated ? '会员登录态可用' : '当前使用匿名接口' }}</strong>
+              <span v-if="neteaseAuth.authenticated">{{ neteaseAuth.source === 'environment' ? '来自环境变量' : `本地 Cookie · ${neteaseAuth.cookie_count || 0} 项` }}</span>
+              <span v-else>{{ neteaseAuth.error || '建议使用网易云音乐 App 扫码，成功后自动保存' }}</span>
+            </div>
+            <div v-if="neteaseLoginQr" class="provider-login-flow">
+              <img :src="neteaseLoginQr" alt="网易云音乐登录二维码" />
+              <div><strong>{{ neteaseLoginState }}</strong><span>二维码只用于本次登录，Cookie 成功保存后自动消失</span></div>
+              <button @click="startNeteaseLogin">刷新二维码</button>
+            </div>
+            <p v-else-if="neteaseLoginState" class="provider-login-message">{{ neteaseLoginState }}</p>
+            <div class="provider-settings-actions">
+              <button class="provider-primary-action" :disabled="neteaseAuthLoading" @click="startNeteaseLogin"><QrCode :size="16" />{{ neteaseAuth.authenticated ? '重新扫码' : '网易云扫码' }}</button>
+              <button v-if="neteaseAuth.authenticated" class="provider-danger-action" @click="logoutNetease"><LogOut :size="15" />删除登录</button>
+            </div>
+            <details class="manual-credential">
+              <summary>高级：手动粘贴或替换 Cookie</summary>
+              <p>在已登录的 music.163.com 请求中复制完整 Cookie 请求头。保存后输入框会立即清空，后台不会把现有 Cookie 回传到浏览器。</p>
+              <textarea v-model="neteaseCookieInput" autocomplete="off" spellcheck="false" placeholder="MUSIC_U=...; __csrf=..." />
+              <button :disabled="neteaseAuthLoading || !neteaseCookieInput.trim()" @click="saveNeteaseCookie">保存并替换</button>
+            </details>
+          </section>
+
+          <section class="provider-settings-card is-qqmusic">
+            <div class="provider-settings-head">
+              <span class="provider-settings-icon"><Music2 :size="19" /></span>
+              <div><h3>QQ音乐</h3><p>扫码保存可刷新的会员凭证</p></div>
+              <span class="provider-status" :class="{ 'is-online': qqAuth.authenticated }">{{ qqAuthLoading ? '读取中' : qqAuth.authenticated ? '已持久化' : '未登录' }}</span>
+            </div>
+            <div class="provider-credential-summary">
+              <strong>{{ qqAuth.authenticated ? 'QQ音乐会员登录态可用' : '搜索可用，完整播放需要登录' }}</strong>
+              <span v-if="qqAuth.authenticated">{{ qqAuth.account || '账号已连接' }} · {{ qqAuth.login_source === 'environment' ? '来自环境变量' : '本地受限凭证文件' }}</span>
+              <span v-else>{{ qqAuth.error || '支持手机 QQ 或微信扫码，过期前会自动刷新凭证' }}</span>
+            </div>
+            <div v-if="qqLoginQr" class="provider-login-flow">
+              <img :src="qqLoginQr" alt="QQ 音乐登录二维码" />
+              <div><strong>{{ qqLoginState }}</strong><span>登录成功后会自动获得会员完整播放权限</span></div>
+              <button @click="startQQLogin(qqLoginType)">刷新二维码</button>
+            </div>
+            <p v-else-if="qqLoginState" class="provider-login-message">{{ qqLoginState }}</p>
+            <div class="provider-settings-actions">
+              <button class="provider-primary-action" :disabled="qqAuthLoading || !qqAuth.available" @click="startQQLogin('qq')"><QrCode :size="16" />手机 QQ</button>
+              <button class="provider-secondary-action" :disabled="qqAuthLoading || !qqAuth.available" @click="startQQLogin('wx')">微信扫码</button>
+              <button v-if="qqAuth.authenticated" class="provider-danger-action" @click="logoutQQMusic"><LogOut :size="15" />删除登录</button>
+            </div>
+            <div class="credential-lifetime-note">凭证默认写入 <code>data/qqmusic</code>，服务重启后仍然有效；容器部署请挂载持久卷。</div>
+          </section>
+        </div>
+      </aside>
+    </template>
+
     <template v-if="searchOpen">
       <button class="search-scrim" aria-label="关闭搜索" @click="searchOpen = false" />
       <aside class="search-drawer" aria-label="音乐搜索菜单">
@@ -966,8 +1339,13 @@ async function dropQueue(targetIndex: number) {
           <div><span class="eyebrow">MUSIC LIBRARY</span><h2>搜索音乐</h2></div>
           <button class="icon-button" title="关闭" @click="searchOpen = false"><X :size="19" /></button>
         </div>
+        <div class="source-toggle" :class="{ 'is-qqmusic': musicSource === 'qqmusic' }" role="tablist" aria-label="选择音乐源">
+          <span class="source-toggle-thumb" aria-hidden="true" />
+          <button role="tab" :aria-selected="musicSource === 'netease'" @click="selectMusicSource('netease')">网易云</button>
+          <button role="tab" :aria-selected="musicSource === 'qqmusic'" @click="selectMusicSource('qqmusic')">QQ音乐</button>
+        </div>
         <div class="search-box">
-          <Search :size="19" /><input ref="searchInput" v-model="query" placeholder="歌曲、艺术家或专辑" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
+          <Search :size="19" /><input ref="searchInput" v-model="query" :placeholder="`在${selectedProviderName}搜索歌曲、艺术家或专辑`" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
           <button :disabled="searching || !query.trim()" @click="runSearch"><LoaderCircle v-if="searching" :size="17" class="continuous-spin" /><template v-else>搜索</template></button>
         </div>
         <div class="connection-picker">
@@ -978,7 +1356,7 @@ async function dropQueue(targetIndex: number) {
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
           <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">
             <div class="discover-heading">
-              <span class="discover-title"><Radio :size="15" />网易云热搜</span>
+              <span class="discover-title"><Radio :size="15" />{{ selectedProviderName }}热搜</span>
               <small>点击关键词直接搜索</small>
             </div>
             <div v-if="hotSearches.length" class="hot-search-grid">
@@ -988,16 +1366,16 @@ async function dropQueue(targetIndex: number) {
               </button>
             </div>
             <div class="discover-heading chart-heading">
-              <span class="discover-title"><ListMusic :size="15" />网易云热歌榜</span>
+              <span class="discover-title"><ListMusic :size="15" />{{ selectedProviderName }}热歌榜</span>
               <small>向下滚动继续浏览</small>
             </div>
           </section>
-          <button v-for="song in searchResults" :key="`${searchMode}-${song.id}`" class="search-result" @click="addSong(song)">
+          <button v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" @click="addSong(song)">
             <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
             <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家' }} · {{ song.al?.name || '未知专辑' }}</span></span>
             <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span><CirclePlus :size="20" />
           </button>
-          <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载网易云热榜</strong><span>看看大家此刻都在听什么</span></div>
+          <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载{{ selectedProviderName }}热榜</strong><span>看看大家此刻都在听什么</span></div>
           <div v-else-if="!searchResults.length" class="search-placeholder">
             <Radio v-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
             <strong>{{ searchMode === 'discover' ? '热榜暂时没有响应' : '没有找到匹配的歌曲' }}</strong>
@@ -1011,7 +1389,7 @@ async function dropQueue(targetIndex: number) {
           </div>
           <div v-else class="search-results-end">{{ searchMode === 'discover' ? '已显示全部热歌' : '已显示全部结果' }}</div>
         </div>
-        <div class="playlist-import">
+        <div v-if="musicSource === 'netease'" class="playlist-import">
           <div><strong>导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>
           <div class="playlist-import-row"><input v-model="playlistInput" placeholder="music.163.com/playlist?id=..." /><button :disabled="searching || !playlistInput.trim()" @click="importPlaylist">导入</button></div>
         </div>
