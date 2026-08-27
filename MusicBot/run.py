@@ -5,11 +5,16 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
+DEBUG_LOG_PATH = Path(__file__).resolve().with_name('debug.log')
+
 # 配置基础日志
 logging.basicConfig(
     level=logging.INFO,  # 保持INFO级别，显示正常信息
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(DEBUG_LOG_PATH, encoding='utf-8'),
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -21,7 +26,11 @@ try:
     logger.info("正在加载环境变量...")
     # 始终读取 MusicBot 自己的 .env，并覆盖父进程残留的旧机器人配置。
     load_dotenv(dotenv_path=Path(__file__).with_name('.env'), override=True)
-    
+
+    logger.info("正在启动本地网易云 API...")
+    from local_netease_service import local_netease_service
+    local_netease_service.start()
+
     logger.info("正在初始化应用...")
     from app import create_app
     app = create_app()

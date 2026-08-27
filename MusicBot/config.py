@@ -47,17 +47,32 @@ def resolve_media_binary(env_name: str, command: str, linux_default: str) -> str
 FFMPEG_PATH = resolve_media_binary("FFMPEG_PATH", "ffmpeg", "/usr/bin/ffmpeg")
 FFPROBE_PATH = resolve_media_binary("FFPROBE_PATH", "ffprobe", "/usr/bin/ffprobe")
 
-# 网易云兼容音乐 API
-MUSIC_API_BASE = os.environ.get(
-    "MUSIC_API_BASE",
-    "https://1304404172-f3na0r58ws.ap-beijing.tencentscf.com",
+# MusicBot 内置的 api-enhanced 仅监听本机；不通过 Nginx 暴露。
+NETEASE_API_HOST = os.environ.get("NETEASE_API_HOST", "127.0.0.1").strip() or "127.0.0.1"
+NETEASE_API_PORT = int(os.environ.get("NETEASE_API_PORT", "8005"))
+if not 1 <= NETEASE_API_PORT <= 65535:
+    raise ValueError("NETEASE_API_PORT 必须在 1 到 65535 之间")
+netease_api_url_host = f"[{NETEASE_API_HOST}]" if ':' in NETEASE_API_HOST else NETEASE_API_HOST
+LOCAL_NETEASE_API_BASE = f"http://{netease_api_url_host}:{NETEASE_API_PORT}"
+NETEASE_API_MANAGED = os.environ.get("NETEASE_API_MANAGED", "True").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
 )
 
-# 备用 API 地址
-BACKUP_MUSIC_API = os.environ.get(
-    "BACKUP_MUSIC_API",
-    "https://api.music.liuzhijin.cn",
+# 受管模式下始终强制走本机地址，旧 .env 里的公共 URL 不再参与运行。
+# 只有显式关闭 NETEASE_API_MANAGED 后，才允许高级部署指定自有外部实例。
+configured_music_api = os.environ.get("MUSIC_API_BASE", "").strip().rstrip("/")
+MUSIC_API_BASE = (
+    LOCAL_NETEASE_API_BASE
+    if NETEASE_API_MANAGED
+    else configured_music_api or LOCAL_NETEASE_API_BASE
 )
+
+# 默认不再连接任何公共备用实例。高级部署可显式指定另一个自有地址。
+configured_backup_api = os.environ.get("BACKUP_MUSIC_API", "").strip().rstrip("/")
+BACKUP_MUSIC_API = "" if NETEASE_API_MANAGED else configured_backup_api
 
 # 网易云热歌榜。保留环境变量覆盖，方便兼容 API 更换榜单来源。
 NETEASE_HOT_PLAYLIST_ID = os.environ.get("NETEASE_HOT_PLAYLIST_ID", "3778678")

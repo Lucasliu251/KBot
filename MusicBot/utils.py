@@ -19,6 +19,16 @@ class MusicAPIError(RuntimeError):
     """网易云兼容 API 主备服务均不可用。"""
 
 
+def configured_api_bases():
+    """返回去重后的已配置 API；默认只有本机 api-enhanced。"""
+    result = []
+    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+        normalized = str(api_base or '').strip().rstrip('/')
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
 def parse_cookie_header(cookie_header):
     """Parse a browser Cookie header without ever returning it to the client."""
     cookies = {}
@@ -98,7 +108,7 @@ def netease_auth_status():
 def create_netease_login_qrcode():
     """Create a NetEase app-login QR image through the configured compatible API."""
     last_error = None
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             timestamp = int(time.time() * 1000)
             key_response = requests.get(
@@ -135,7 +145,7 @@ def check_netease_login_qrcode(key):
     if not login_key:
         raise ValueError('网易云登录 key 无效')
     last_error = None
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             response = requests.get(
                 f"{api_base}/login/qr/check",
@@ -180,10 +190,8 @@ def search_music_page(keyword, limit=8, offset=0):
     """按页搜索歌曲，避免一次把全部结果发送给客户端。"""
     limit = max(1, min(50, int(limit)))
     offset = max(0, int(offset))
-    for api_base, endpoint in (
-        (MUSIC_API_BASE, 'cloudsearch'),
-        (BACKUP_MUSIC_API, 'search'),
-    ):
+    for api_index, api_base in enumerate(configured_api_bases()):
+        endpoint = 'cloudsearch' if api_index == 0 else 'search'
         try:
             res = requests.get(
                 f"{api_base}/{endpoint}",
@@ -214,7 +222,7 @@ def search_music(keyword):
 def get_hot_searches(limit=12):
     """获取网易云实时热搜词；失败时返回空列表，不影响热歌榜展示。"""
     limit = max(1, min(20, int(limit)))
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             res = requests.get(
                 f"{api_base}/search/hot/detail",
@@ -247,7 +255,7 @@ def get_hot_playlist_tracks(limit=8, offset=0):
     """分页获取网易云热歌榜，返回歌曲列表和是否可能还有下一页。"""
     limit = max(1, min(50, int(limit)))
     offset = max(0, int(offset))
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             res = requests.get(
                 f"{api_base}/playlist/track/all",
@@ -271,27 +279,27 @@ def get_hot_playlist_tracks(limit=8, offset=0):
 
 # 获取音乐URL
 def get_music_url(song_id):
-    try:
-        res = requests.get(f"{MUSIC_API_BASE}/song/url?id={song_id}", headers=build_headers(), timeout=12)
-        data = res.json()
-        url = data.get('data', [{}])[0].get('url', '')
-        return url
-    except Exception as e:
-        logger.error(f"获取音乐URL异常: {e}")
+    for api_base in configured_api_bases():
         try:
-            # 尝试使用备用API
-            res = requests.get(f"{BACKUP_MUSIC_API}/song/url?id={song_id}", headers=build_headers(), timeout=12)
+            res = requests.get(
+                f"{api_base}/song/url",
+                params={'id': song_id},
+                headers=build_headers(),
+                timeout=12,
+            )
+            res.raise_for_status()
             data = res.json()
             url = data.get('data', [{}])[0].get('url', '')
-            return url
-        except Exception as e2:
-            logger.error(f"备用API获取音乐URL异常: {e2}")
-            return ''
+            if url:
+                return url
+        except Exception as exc:
+            logger.warning(f"获取音乐URL失败 ({api_base}): {exc}")
+    return ''
 
 
 def get_song_detail(song_id):
     """获取单曲的专辑、封面和时长信息。"""
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             res = requests.get(
                 f"{api_base}/song/detail?ids={song_id}",
@@ -308,7 +316,7 @@ def get_song_detail(song_id):
 
 def get_song_lyrics(song_id):
     """获取 LRC 歌词，优先原歌词，接口失败时返回空字符串。"""
-    for api_base in (MUSIC_API_BASE, BACKUP_MUSIC_API):
+    for api_base in configured_api_bases():
         try:
             res = requests.get(
                 f"{api_base}/lyric?id={song_id}",
@@ -324,20 +332,22 @@ def get_song_lyrics(song_id):
 
 # 获取歌单
 def get_playlist(playlist_id):
-    try:
-        res = requests.get(f"{MUSIC_API_BASE}/playlist/detail?id={playlist_id}", headers=build_headers())
-        data = res.json()
-        return data.get('playlist', {})
-    except Exception as e:
-        logger.error(f"获取歌单异常: {e}")
+    for api_base in configured_api_bases():
         try:
-            # 尝试使用备用API
-            res = requests.get(f"{BACKUP_MUSIC_API}/playlist/detail?id={playlist_id}", headers=build_headers())
+            res = requests.get(
+                f"{api_base}/playlist/detail",
+                params={'id': playlist_id},
+                headers=build_headers(),
+                timeout=12,
+            )
+            res.raise_for_status()
             data = res.json()
-            return data.get('playlist', {})
-        except Exception as e2:
-            logger.error(f"备用API获取歌单异常: {e2}")
-            return {}
+            playlist = data.get('playlist', {})
+            if playlist:
+                return playlist
+        except Exception as exc:
+            logger.warning(f"获取歌单失败 ({api_base}): {exc}")
+    return {}
 
 # 获取歌单中所有歌曲（支持分页）
 def get_playlist_all_tracks(playlist_id):

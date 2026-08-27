@@ -204,7 +204,7 @@ ensure_music_ready() {
   local env_file="$music_dir/.env"
   local venv_dir="$music_dir/venv"
   local venv_py="$venv_dir/bin/python"
-  local token
+  local token node_version_code
 
   if [[ ! -f "$env_file" ]]; then
     printf '缺少 %s，请先复制 MusicBot/.env.example 并填写 MUSIC_BOT_TOKEN。\n' "$env_file" >&2
@@ -223,6 +223,20 @@ ensure_music_ready() {
   if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
     printf '未检测到 ffmpeg / ffprobe，Music 无法解码音频。\n' >&2
     return 1
+  fi
+
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    printf '未检测到 Node.js / npm，无法启动 MusicBot 内置网易云 API。\n' >&2
+    return 1
+  fi
+  node_version_code="$(node -p "const v=process.versions.node.split('.').map(Number); v[0]*100+v[1]" 2>/dev/null || printf '0')"
+  if [[ ! "$node_version_code" =~ ^[0-9]+$ || "$node_version_code" -lt 2212 ]]; then
+    printf 'MusicBot 内置网易云 API 需要 Node.js 22.12 或更高版本，当前：%s。\n' "$(node --version 2>/dev/null || printf 'unknown')" >&2
+    return 1
+  fi
+  if [[ ! -f "$music_dir/node_modules/@neteasecloudmusicapienhanced/api/package.json" ]]; then
+    printf '缺少 MusicBot Node 依赖，正在执行 npm install...\n' >&2
+    (cd "$music_dir" && npm install --no-audit --no-fund) >&2 || return 1
   fi
 
   if [[ ! -x "$venv_py" ]]; then

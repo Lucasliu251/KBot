@@ -22,6 +22,7 @@
 ### 软件要求
 - Ubuntu 18.04 LTS 或更高版本
 - Python 3.7 或更高版本
+- Node.js 22.12 或更高版本（运行内置网易云 API）
 - FFmpeg (用于音频处理)
 
 ## 安装步骤
@@ -44,13 +45,19 @@ python3 --version
 pip3 --version
 ```
 
-### 3. 安装FFmpeg
+### 3. 安装 Node.js 22 和 FFmpeg
 
 ```bash
+# 使用 NodeSource 安装 Node.js 22
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install nodejs -y
+
 # 安装FFmpeg
 sudo apt install ffmpeg -y
 
 # 验证安装
+node --version
+npm --version
 ffmpeg -version
 ```
 
@@ -89,6 +96,8 @@ source venv/bin/activate
 # 确保在虚拟环境中
 pip install --upgrade pip
 pip install -r requirements.txt
+npm install
+npm run build
 ```
 
 ### 8. 配置环境变量
@@ -115,13 +124,16 @@ BOT_TOKEN=你的KOOK机器人Token
 FFMPEG_PATH=/usr/bin/ffmpeg
 FFPROBE_PATH=/usr/bin/ffprobe
 
-# 音乐API配置
-MUSIC_API_BASE=https://1304404172-f3na0r58ws.ap-beijing.tencentscf.com
+# 内置网易云API（仅监听服务器本机）
+NETEASE_API_HOST=127.0.0.1
+NETEASE_API_PORT=8005
+NETEASE_API_MANAGED=True
+MUSIC_API_BASE=http://127.0.0.1:8005
 
 # Web控制台配置
 SECRET_KEY=kook_web_music_secret_key
 HOST=0.0.0.0
-PORT=5000
+PORT=8004
 DEBUG=True
 ```
 
@@ -200,10 +212,10 @@ sudo systemctl status kook-music-bot
 
 项目启动后，在浏览器中访问：
 ```
-http://你的服务器IP:5000
+http://你的服务器IP:8004
 ```
 
-例如：`http://192.168.1.100:5000`
+例如：`http://192.168.1.100:8004`
 
 ## 配置说明
 
@@ -214,22 +226,23 @@ http://你的服务器IP:5000
 | BOT_TOKEN | KOOK机器人的Token | 需要配置 |
 | FFMPEG_PATH | FFmpeg可执行文件路径 | /usr/bin/ffmpeg |
 | FFPROBE_PATH | FFprobe可执行文件路径 | /usr/bin/ffprobe |
-| MUSIC_API_BASE | 音乐API基础URL | 已配置 |
+| NETEASE_API_PORT | 内置网易云API本机端口 | 8005 |
+| MUSIC_API_BASE | 网易云API基础URL | http://127.0.0.1:8005 |
 | SECRET_KEY | Web应用密钥 | 可自定义 |
 | HOST | 服务器监听地址 | 0.0.0.0 |
-| PORT | 服务器端口 | 5000 |
+| PORT | MusicBot服务器端口 | 8004 |
 | DEBUG | 调试模式 | True |
 
 ### 防火墙配置
 
-如果使用防火墙，需要开放5000端口：
+如果直接访问 MusicBot，需要开放 8004；内置网易云端口 8005 只监听本机，禁止开放：
 
 ```bash
 # UFW防火墙
-sudo ufw allow 5000
+sudo ufw allow 8004
 
 # 或者iptables
-sudo iptables -A INPUT -p tcp --dport 5000 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8004 -j ACCEPT
 ```
 
 ## 常见问题解决
@@ -262,7 +275,7 @@ ffmpeg -version
 
 ```bash
 # 查看端口占用
-sudo netstat -tlnp | grep :5000
+sudo netstat -tlnp | grep -E ':(8004|8005)'
 
 # 杀死占用进程
 sudo kill -9 进程ID
@@ -344,7 +357,7 @@ server {
     server_name 你的域名或IP;
 
     location / {
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://127.0.0.1:8004;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -376,6 +389,8 @@ git pull
 # 更新依赖
 source venv/bin/activate
 pip install -r requirements.txt
+npm install
+npm run build
 
 # 重启服务
 sudo systemctl start kook-music-bot
@@ -395,8 +410,9 @@ sudo apt update && sudo apt upgrade -y
 如果遇到问题，请检查：
 1. 系统日志：`sudo journalctl -u kook-music-bot`
 2. 应用日志：`tail -f app.log`
-3. 网络连接：`curl http://localhost:5000`
-4. 进程状态：`ps aux | grep python3`
+3. MusicBot：`curl http://localhost:8004`
+4. 内置网易云：`curl http://127.0.0.1:8005/inner/version`
+5. 进程状态：`ps aux | grep -E 'python3|netease_api_server'`
 
 ---
 

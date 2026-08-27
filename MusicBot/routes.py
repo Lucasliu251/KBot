@@ -1131,6 +1131,17 @@ def register_routes(app, bot, socketio=None):
             process = psutil.Process()
             process_memory = process.memory_info()
             process_cpu = process.cpu_percent()
+            child_processes = process.children(recursive=True)
+            child_memory = []
+            child_cpu = 0.0
+            for child in child_processes:
+                try:
+                    child_memory.append(child.memory_info())
+                    child_cpu += child.cpu_percent()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            process_memory_rss = process_memory.rss + sum(item.rss for item in child_memory)
+            process_memory_vms = process_memory.vms + sum(item.vms for item in child_memory)
             
             # 获取网络信息
             network = psutil.net_io_counters()
@@ -1179,9 +1190,11 @@ def register_routes(app, bot, socketio=None):
                 },
                 'process': {
                     'pid': process.pid,
-                    'memory_rss': process_memory.rss,
-                    'memory_vms': process_memory.vms,
-                    'cpu_percent': process_cpu,
+                    # 包含由 run.py 管理的本地网易云 Node 子进程。
+                    'memory_rss': process_memory_rss,
+                    'memory_vms': process_memory_vms,
+                    'cpu_percent': process_cpu + child_cpu,
+                    'child_count': len(child_memory),
                     'create_time': process.create_time(),
                     'uptime': time.time() - process.create_time()
                 },

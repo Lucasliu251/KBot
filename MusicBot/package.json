@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@lucide/vue": "latest",
+    "@neteasecloudmusicapienhanced/api": "4.40.1",
     "vue": "latest"
   },
   "devDependencies": {

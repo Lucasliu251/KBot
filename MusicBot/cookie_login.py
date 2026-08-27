@@ -6,11 +6,15 @@ import webbrowser
 from typing import Dict, Any
 
 import requests
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"), override=True)
+from config import MUSIC_API_BASE
 
 
 API_BASE = os.environ.get(
     "NETEASE_API_BASE",
-    "https://1304404172-f3na0r58ws.ap-beijing.tencentscf.com"
+    MUSIC_API_BASE,
 )
 COOKIE_DIR = os.path.join(os.path.dirname(__file__), "Cookie")
 COOKIE_JSON_PATH = os.path.join(COOKIE_DIR, "cookies.json")
@@ -194,5 +198,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
