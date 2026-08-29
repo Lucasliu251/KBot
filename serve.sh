@@ -9,6 +9,7 @@
 # - 2026-08-22: start/stop/restart/status 输出结构化入口信息，读 config/serve.ini (Author: KBot)
 # - 2026-08-23: 启动/停止时回收同组残留进程，避免双开重复发卡片 (Author: KBot)
 # - 2026-08-24: music 并入默认启动组，替代 MusicBot/serve.sh；兼容 MUSIC_BOT_TOKEN (Author: KBot)
+# - 2026-08-29: 启动检查补上 QQ 音乐 Python 依赖，避免只装到 Flask 就跳过 pip (Author: KBot)
 
 set -u
 
@@ -197,7 +198,8 @@ workdir_for() {
   fi
 }
 
-# 启动 music 前检查 Token、FFmpeg、独立 venv，以及 Vue 控制台构建产物。
+# 启动 music 前检查 Token、FFmpeg、Node 网易云组件、独立 venv，以及 Vue 控制台构建产物。
+# Python 检查包含 QQ 音乐 vendored SDK 运行时，避免旧 venv 只装了 Flask 就跳过 pip。
 # 标准输出必须保持干净：start_one 只用 stdout 回传 PID。
 ensure_music_ready() {
   local music_dir="$ROOT/MusicBot"
@@ -243,7 +245,7 @@ ensure_music_ready() {
     printf '正在创建 MusicBot 虚拟环境...\n' >&2
     python3 -m venv "$venv_dir" >&2 || return 1
   fi
-  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio" >/dev/null 2>&1; then
+  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio, anyio, cryptography, jsonpath_ng, niquests, orjson, pydantic, paho.mqtt" >/dev/null 2>&1; then
     printf '正在安装 MusicBot Python 依赖...\n' >&2
     "$venv_dir/bin/pip" install -r "$music_dir/requirements.txt" >&2 || return 1
   fi
