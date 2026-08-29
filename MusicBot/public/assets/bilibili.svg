@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Bilibili">
+  <rect x="7" y="15" width="50" height="39" rx="12" fill="#fb7299"/>
+  <path d="M22 15 16 8M42 15l6-7" fill="none" stroke="#fb7299" stroke-width="5" stroke-linecap="round"/>
+  <path d="M25 29v9M39 29v9" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+  <path d="M23 44c5 4 13 4 18 0" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+</svg>

@@ -245,7 +245,7 @@ ensure_music_ready() {
     printf '正在创建 MusicBot 虚拟环境...\n' >&2
     python3 -m venv "$venv_dir" >&2 || return 1
   fi
-  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio, anyio, cryptography, jsonpath_ng, niquests, orjson, pydantic, paho.mqtt" >/dev/null 2>&1; then
+  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio, anyio, cryptography, jsonpath_ng, niquests, orjson, pydantic, paho.mqtt, yt_dlp" >/dev/null 2>&1; then
     printf '正在安装 MusicBot Python 依赖...\n' >&2
     "$venv_dir/bin/pip" install -r "$music_dir/requirements.txt" >&2 || return 1
   fi

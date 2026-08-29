@@ -377,16 +377,33 @@ def resolve_audio_source(music_info):
             if len(parts) != 3:
                 return ''
             provider, song_id = parts[1], parts[2]
-            if provider != 'qqmusic':
+            if provider == 'qqmusic':
+                try:
+                    from .. import qqmusic_service
+                except ImportError:
+                    import qqmusic_service
+                source = qqmusic_service.resolve_song_url(song_id)
+                resolved = source.get('url', '')
+                extra['_resolved_url'] = resolved
+                extra['_resolved_expires_at'] = time.time() + max(0, int(source.get('expires_in', 0)))
+            elif provider == 'bilibili':
+                try:
+                    from .. import bilibili_service
+                except ImportError:
+                    import bilibili_service
+                source = bilibili_service.resolve_audio(song_id)
+                resolved = source.get('url', '')
+                extra['_resolved_url'] = resolved
+                extra['_resolved_expires_at'] = float(source.get('expires_at', 0) or 0)
+                http_headers = source.get('headers') or {}
+                extra['header'] = ''.join(
+                    f'{key}: {value}\r\n' for key, value in http_headers.items()
+                )
+                extra['user_agent'] = http_headers.get('User-Agent', '')
+                extra['referer'] = http_headers.get('Referer', '')
+                extra['duration'] = float(source.get('duration', 0) or extra.get('duration', 0) or 0)
+            else:
                 return ''
-            try:
-                from .. import qqmusic_service
-            except ImportError:
-                import qqmusic_service
-            source = qqmusic_service.resolve_song_url(song_id)
-            resolved = source.get('url', '')
-            extra['_resolved_url'] = resolved
-            extra['_resolved_expires_at'] = time.time() + max(0, int(source.get('expires_in', 0)))
         else:
             parts = file_path.split(':', 3)
             if len(parts) < 2:
@@ -408,12 +425,27 @@ def resolve_audio_source(music_info):
         return ''
 
 
+def build_ffmpeg_input_options(extra_data):
+    """把来源所需的请求头/Cookie组装为 FFmpeg 输入参数。"""
+    extra_data = extra_data or {}
+    full_command = str(extra_data.get('extra_command', '') or '')
+    for name, value in (
+        ('headers', extra_data.get('header')),
+        ('cookies', extra_data.get('cookies')),
+        ('user_agent', extra_data.get('user_agent')),
+        ('referer', extra_data.get('referer')),
+    ):
+        if value:
+            full_command += f' -{name} "{value}"'
+    return full_command
+
+
 def decode_audio_prefix(file_path, ss_value=0, extra_command='', cancel_event=None):
     """同步预解码最多 preload_seconds 秒 PCM，并标记是否已经读完整首。"""
     command = (
         f'{ffmpeg_bin} -loglevel error -nostats -reconnect 1 -reconnect_streamed 1 '
-        f'-reconnect_delay_max 2 -timeout 30000000 -ss {ss_value} -i "{file_path}" '
-        f'{extra_command} -acodec pcm_s16le -ac {PCM_CHANNELS} '
+        f'-reconnect_delay_max 2 -timeout 30000000 {extra_command} '
+        f'-ss {ss_value} -i "{file_path}" -acodec pcm_s16le -ac {PCM_CHANNELS} '
         f'-ar {PCM_SAMPLE_RATE} -f s16le -y -'
     )
     process = subprocess.Popen(
@@ -506,7 +538,7 @@ def schedule_next_preload(guild_id):
             if not file_path:
                 return
             extra = next_song.get('extra', {}) if isinstance(next_song, dict) else {}
-            extra_command = extra.get('extra_command', '') if isinstance(extra, dict) else ''
+            extra_command = build_ffmpeg_input_options(extra)
             cached = decode_audio_prefix(
                 file_path,
                 next_song.get('ss', 0),
@@ -1002,18 +1034,7 @@ class PlayHandler(threading.Thread):
                                 continue
 
                             extra_data = music_info.get('extra') or {}
-                            extra_command = extra_data.get('extra_command', '')
-                            if extra_data:
-
-                                def pack_command(full_command, name, value):
-                                    if value:
-                                        full_command += f' -{name} "{value}"'
-                                    return full_command
-
-                                extra_command = pack_command(extra_command, 'headers', extra_data.get('header'))
-                                extra_command = pack_command(extra_command, 'cookies', extra_data.get('cookies'))
-                                extra_command = pack_command(extra_command, 'user_agent', extra_data.get('user_agent'))
-                                extra_command = pack_command(extra_command, 'referer', extra_data.get('referer'))
+                            extra_command = build_ffmpeg_input_options(extra_data)
 
                             ss_value = music_info.get('ss', 0)
 
@@ -1087,7 +1108,7 @@ class PlayHandler(threading.Thread):
                                 command2 = (
                                     f'{ffmpeg_bin} -loglevel warning -nostats -reconnect 1 '
                                     f'-reconnect_streamed 1 -reconnect_delay_max 2 -timeout 30000000 '
-                                    f'-ss {start_position} -i "{decoder_file}" {extra_command} '
+                                    f'{extra_command} -ss {start_position} -i "{decoder_file}" '
                                     f'-acodec pcm_s16le '
                                     f'-ac {PCM_CHANNELS} -ar {PCM_SAMPLE_RATE} -f s16le -y -'
                                 )

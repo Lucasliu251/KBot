@@ -33,6 +33,11 @@ try:
 except ImportError:
     import qqmusic_service as qqmusic
 
+try:
+    from . import bilibili_service as bilibili
+except ImportError:
+    import bilibili_service as bilibili
+
 logger = logging.getLogger(__name__)
 LOG_DIRECTORY = Path(__file__).resolve().parent
 
@@ -104,7 +109,7 @@ def register_routes(app, bot, socketio=None):
         """统一解析音源参数，缺省时保持网易云行为。"""
         raw = (payload or {}).get('provider') if isinstance(payload, dict) else None
         provider = str(raw or request.args.get('provider', 'netease')).strip().lower()
-        if provider not in ('netease', 'qqmusic'):
+        if provider not in ('netease', 'bilibili', 'qqmusic'):
             raise ValueError('不支持的音乐源')
         return provider
 
@@ -115,6 +120,15 @@ def register_routes(app, bot, socketio=None):
             status = 401
         elif isinstance(exc, qqmusic.QQMusicPermissionError):
             status = 403
+        else:
+            status = 502
+        return jsonify({'success': False, 'error': str(exc)}), status
+
+    def bilibili_error_response(exc):
+        if isinstance(exc, bilibili.BilibiliInvalidInput):
+            status = 400
+        elif isinstance(exc, bilibili.BilibiliDurationExceeded):
+            status = 422
         else:
             status = 502
         return jsonify({'success': False, 'error': str(exc)}), status
@@ -458,11 +472,12 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '分页参数无效'}), 400
         try:
             provider = requested_provider()
-            songs, total = (
-                qqmusic.search_music_page(keyword, limit=limit, offset=offset)
-                if provider == 'qqmusic'
-                else search_music_page(keyword, limit=limit, offset=offset)
-            )
+            if provider == 'bilibili':
+                songs, total = bilibili.search_media(keyword, limit=limit, offset=offset)
+            elif provider == 'qqmusic':
+                songs, total = qqmusic.search_music_page(keyword, limit=limit, offset=offset)
+            else:
+                songs, total = search_music_page(keyword, limit=limit, offset=offset)
             return jsonify({
                 'success': True,
                 'provider': provider,
@@ -477,6 +492,9 @@ def register_routes(app, bot, socketio=None):
         except qqmusic.QQMusicError as e:
             logger.error(f"QQ 音乐搜索服务不可用: {e}")
             return qqmusic_error_response(e)
+        except bilibili.BilibiliError as e:
+            logger.error(f"Bilibili 搜索服务不可用: {e}")
+            return bilibili_error_response(e)
         except MusicAPIError as e:
             logger.error(f"搜索音乐服务不可用: {e}")
             return jsonify({'success': False, 'error': str(e)}), 502
@@ -494,7 +512,10 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '分页参数无效'}), 400
         try:
             provider = requested_provider()
-            if provider == 'qqmusic':
+            if provider == 'bilibili':
+                # 第一版不伪造 B站音乐榜；空搜索页只展示使用引导。
+                hot_searches, songs, has_more = [], [], False
+            elif provider == 'qqmusic':
                 hot_searches, songs, has_more = qqmusic.discover(limit=limit, offset=offset)
             else:
                 songs, has_more = get_hot_playlist_tracks(limit=limit, offset=offset)
@@ -514,6 +535,9 @@ def register_routes(app, bot, socketio=None):
         except qqmusic.QQMusicError as e:
             logger.error(f"QQ 音乐发现页服务不可用: {e}")
             return qqmusic_error_response(e)
+        except bilibili.BilibiliError as e:
+            logger.error(f"Bilibili 发现页服务不可用: {e}")
+            return bilibili_error_response(e)
         except MusicAPIError as e:
             logger.error(f"网易云发现页服务不可用: {e}")
             return jsonify({'success': False, 'error': str(e)}), 502
@@ -529,6 +553,23 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '缺少id参数'})
         try:
             provider = requested_provider()
+            if provider == 'bilibili':
+                normalized = bilibili.get_detail(song_id)
+                album = normalized.get('al', {})
+                artists = normalized.get('ar', [])
+                return jsonify({
+                    'success': True,
+                    'provider': provider,
+                    'song': {
+                        'id': str(normalized.get('id', song_id)),
+                        'name': normalized.get('name', ''),
+                        'artist': ' / '.join(artist.get('name', '') for artist in artists if artist.get('name')),
+                        'album': album.get('name', ''),
+                        'cover': album.get('picUrl', ''),
+                        'duration': (normalized.get('dt', 0) or 0) / 1000,
+                        'provider': provider,
+                    },
+                })
             if provider == 'qqmusic':
                 normalized = qqmusic.get_song_detail(song_id)
                 album = normalized.get('al', {})
@@ -563,6 +604,8 @@ def register_routes(app, bot, socketio=None):
             })
         except qqmusic.QQMusicError as e:
             return qqmusic_error_response(e)
+        except bilibili.BilibiliError as e:
+            return bilibili_error_response(e)
         except Exception as e:
             logger.error(f"获取歌曲详情异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -575,11 +618,13 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': '缺少id参数'})
         try:
             provider = requested_provider()
-            lyric_data = (
-                qqmusic.get_song_lyrics_data(song_id)
-                if provider == 'qqmusic'
-                else get_song_lyrics_data(song_id)
-            )
+            if provider == 'bilibili':
+                # B站视频不做任何跨平台歌词匹配或搜索。
+                lyric_data = {'lyric': '', 'translated_lyric': '', 'romanized_lyric': ''}
+            elif provider == 'qqmusic':
+                lyric_data = qqmusic.get_song_lyrics_data(song_id)
+            else:
+                lyric_data = get_song_lyrics_data(song_id)
             return jsonify({
                 'success': True,
                 'provider': provider,
@@ -588,6 +633,8 @@ def register_routes(app, bot, socketio=None):
             })
         except qqmusic.QQMusicError as e:
             return qqmusic_error_response(e)
+        except bilibili.BilibiliError as e:
+            return bilibili_error_response(e)
         except Exception as e:
             logger.error(f"获取歌词异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -618,7 +665,18 @@ def register_routes(app, bot, socketio=None):
             provider = requested_provider(data)
             resolved_url = ''
             resolved_expires_at = 0
-            if provider == 'qqmusic':
+            if provider == 'bilibili':
+                resolved = bilibili.resolve_audio(str(song_id))
+                resolved_url = resolved['url']
+                resolved_expires_at = float(resolved.get('expires_at', 0) or 0)
+                song_name = song_name or resolved.get('title', '')
+                artist_name = artist_name or resolved.get('artist', '')
+                album_name = album_name or 'Bilibili 视频'
+                cover_url = cover_url or resolved.get('cover', '')
+                duration = float(resolved.get('duration', 0) or 0) or duration
+                album_data = {'name': album_name, 'picUrl': cover_url}
+                source = f'MUSIC_SOURCE:bilibili:{song_id}'
+            elif provider == 'qqmusic':
                 resolved = qqmusic.resolve_song_url(song_id)
                 resolved_url = resolved['url']
                 resolved_expires_at = time.time() + max(0, int(resolved.get('expires_in', 0)))
@@ -646,7 +704,7 @@ def register_routes(app, bot, socketio=None):
 
             from config import BOT_TOKEN
             player = kookvoice.Player(guild_id, channel_id, BOT_TOKEN)
-            player.add_music(source, {
+            extra_data = {
                 'song_id': str(song_id),
                 'title': song_name,
                 'artist': artist_name,
@@ -656,14 +714,26 @@ def register_routes(app, bot, socketio=None):
                 'provider': provider,
                 '_resolved_url': resolved_url,
                 '_resolved_expires_at': (
-                    resolved_expires_at if provider == 'qqmusic' else time.time() + 240
+                    resolved_expires_at if provider in ('bilibili', 'qqmusic') else time.time() + 240
                 ),
-            })
+            }
+            if provider == 'bilibili':
+                http_headers = resolved.get('headers') or {}
+                extra_data['header'] = ''.join(
+                    f'{key}: {value}\r\n' for key, value in http_headers.items()
+                )
+                extra_data['user_agent'] = http_headers.get('User-Agent', '')
+                extra_data['referer'] = http_headers.get('Referer', '')
+                extra_data['webpage_url'] = resolved.get('webpage_url', '')
+            player.add_music(source, extra_data)
             
             return jsonify({'success': True, 'provider': provider})
         except qqmusic.QQMusicError as e:
             logger.error(f"播放 QQ 音乐异常: {e}")
             return qqmusic_error_response(e)
+        except bilibili.BilibiliError as e:
+            logger.error(f"播放 Bilibili 音频异常: {e}")
+            return bilibili_error_response(e)
         except Exception as e:
             logger.error(f"播放音乐异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
@@ -676,6 +746,7 @@ def register_routes(app, bot, socketio=None):
             'default': 'netease',
             'providers': {
                 'netease': netease_auth_status(),
+                'bilibili': bilibili.auth_status(),
                 'qqmusic': qqmusic.auth_status(),
             },
         })

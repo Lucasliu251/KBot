@@ -46,7 +46,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { assetUrl, getJson, postAdminJson, postJson } from './api'
 
 type PlayMode = 'order' | 'repeat-one' | 'shuffle'
-type MusicProvider = 'netease' | 'qqmusic'
+type MusicProvider = 'netease' | 'bilibili' | 'qqmusic'
 type Track = {
   id: string
   name: string
@@ -68,6 +68,12 @@ type SearchTrack = {
   al?: { name?: string; picUrl?: string }
   dt?: number
   provider?: MusicProvider
+  playable?: boolean
+  restriction?: string
+  bvid?: string
+  page?: number
+  part_count?: number
+  webpage_url?: string
 }
 type HotSearch = {
   keyword: string
@@ -121,6 +127,7 @@ type BotLatency = {
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
 const PROVIDER_META = {
   netease: { label: 'NETEASE', name: '网易云', icon: assetUrl('netease.png') },
+  bilibili: { label: 'BILIBILI', name: 'Bilibili', icon: assetUrl('bilibili.svg') },
   qqmusic: { label: 'QQ MUSIC', name: 'QQ音乐', icon: assetUrl('QQ.png') },
 } as const
 const MODE_META = {
@@ -239,6 +246,9 @@ const currentProvider = computed<MusicProvider>(() => current.value?.provider ||
 const currentProviderLabel = computed(() => PROVIDER_META[currentProvider.value].label)
 const selectedProviderName = computed(() => PROVIDER_META[musicSource.value].name)
 const selectedProviderIcon = computed(() => PROVIDER_META[musicSource.value].icon)
+const searchPlaceholder = computed(() => musicSource.value === 'bilibili'
+  ? '搜索B站视频，或粘贴 BV / AV / bilibili 链接'
+  : `在${selectedProviderName.value}搜索歌曲、艺术家或专辑`)
 const neteaseLocalEngineReady = computed(() => (
   neteaseAuth.value.engine?.mode === 'local'
   && neteaseAuth.value.engine?.managed === true
@@ -915,7 +925,7 @@ watch(() => current.value ? `${current.value.provider || 'netease'}:${current.va
   const provider = playingTrack.provider || 'netease'
   const id = playingTrack.id
   const detailPromise = getJson<{ song?: { album?: string; cover?: string; duration?: number } }>(`/api/song/detail?id=${encodeURIComponent(id)}&provider=${provider}`)
-  const lyricPromise = (async () => {
+  const lyricPromise = provider === 'bilibili' ? Promise.resolve([] as LyricLine[]) : (async () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         const response = await getJson<{ lyric?: string; translated_lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}&provider=${provider}`)
@@ -1154,6 +1164,10 @@ async function loadDiscovery() {
   loadingMoreSearch.value = false
   discovering.value = true
   if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
+  if (musicSource.value === 'bilibili') {
+    discovering.value = false
+    return
+  }
   try {
     const limit = getSearchPageSize()
     const provider = musicSource.value
@@ -1278,6 +1292,10 @@ function handleSearchScroll(event: Event) {
 }
 
 async function addSong(song: SearchTrack) {
+  if (song.playable === false) {
+    notify(song.restriction || '该视频无法加入播放队列')
+    return
+  }
   if (!guildId.value || !channelId.value) {
     notify('请先选择并连接语音频道')
     return
@@ -1723,13 +1741,14 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
           <div><span class="eyebrow">MUSIC LIBRARY</span><h2>搜索音乐</h2></div>
           <button class="icon-button" title="关闭" @click="searchOpen = false"><X :size="19" /></button>
         </div>
-        <div class="source-toggle" :class="{ 'is-qqmusic': musicSource === 'qqmusic' }" role="tablist" aria-label="选择音乐源">
+        <div class="source-toggle" :class="{ 'is-bilibili': musicSource === 'bilibili', 'is-qqmusic': musicSource === 'qqmusic' }" role="tablist" aria-label="选择音乐源">
           <span class="source-toggle-thumb" aria-hidden="true" />
           <button role="tab" :aria-selected="musicSource === 'netease'" @click="selectMusicSource('netease')"><img class="provider-logo is-netease" :src="providerIcon('netease')" alt="" />网易云</button>
+          <button role="tab" :aria-selected="musicSource === 'bilibili'" @click="selectMusicSource('bilibili')"><img class="provider-logo is-bilibili" :src="providerIcon('bilibili')" alt="" />Bilibili</button>
           <button role="tab" :aria-selected="musicSource === 'qqmusic'" @click="selectMusicSource('qqmusic')"><img class="provider-logo is-qqmusic" :src="providerIcon('qqmusic')" alt="" />QQ音乐</button>
         </div>
         <div class="search-box">
-          <Search :size="19" /><input ref="searchInput" v-model="query" :placeholder="`在${selectedProviderName}搜索歌曲、艺术家或专辑`" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
+          <Search :size="19" /><input ref="searchInput" v-model="query" :placeholder="searchPlaceholder" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
           <button :disabled="searching || !query.trim()" @click="runSearch"><LoaderCircle v-if="searching" :size="17" class="continuous-spin" /><template v-else>搜索</template></button>
         </div>
         <div class="connection-picker">
@@ -1754,17 +1773,17 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
               <small>向下滚动继续浏览</small>
             </div>
           </section>
-          <button v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" @click="addSong(song)">
+          <button v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" :class="{ 'is-unavailable': song.playable === false }" :disabled="song.playable === false" :title="song.playable === false ? song.restriction : `加入《${song.name}》`" @click="addSong(song)">
             <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.ar?.map((artist) => artist.name).join(' / ') || '未知艺术家' }} · {{ song.al?.name || '未知专辑' }}</span></span>
+            <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.playable === false ? song.restriction : `${song.ar?.map((artist) => artist.name).join(' / ') || (musicSource === 'bilibili' ? '未知UP主' : '未知艺术家')} · ${song.al?.name || (musicSource === 'bilibili' ? 'Bilibili 视频' : '未知专辑')}` }}</span></span>
             <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span><CirclePlus :size="20" />
           </button>
           <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载{{ selectedProviderName }}热榜</strong><span>看看大家此刻都在听什么</span></div>
           <div v-else-if="!searchResults.length" class="search-placeholder">
-            <Radio v-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
-            <strong>{{ searchMode === 'discover' ? '热榜暂时没有响应' : '没有找到匹配的歌曲' }}</strong>
-            <span>{{ searchMode === 'discover' ? (discoveryError || '稍后再试，或直接搜索想听的歌') : '换一个歌曲名、艺术家或专辑试试' }}</span>
-            <button v-if="searchMode === 'discover'" class="discovery-retry" @click="loadDiscovery">重新加载</button>
+            <Search v-if="musicSource === 'bilibili'" :size="28" /><Radio v-else-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
+            <strong>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '搜索或粘贴B站视频链接' : searchMode === 'discover' ? '热榜暂时没有响应' : musicSource === 'bilibili' ? '没有找到匹配的B站视频' : '没有找到匹配的歌曲' }}</strong>
+            <span>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '支持关键词、BV号、AV号、b23.tv和完整视频链接' : searchMode === 'discover' ? (discoveryError || '稍后再试，或直接搜索想听的歌') : musicSource === 'bilibili' ? '换一个关键词，或直接粘贴视频链接试试' : '换一个歌曲名、艺术家或专辑试试' }}</span>
+            <button v-if="searchMode === 'discover' && musicSource !== 'bilibili'" class="discovery-retry" @click="loadDiscovery">重新加载</button>
           </div>
           <div v-else-if="searchHasMore" class="search-load-more">
             <LoaderCircle v-if="loadingMoreSearch" :size="16" class="continuous-spin" />
