@@ -318,17 +318,36 @@ def get_song_detail(song_id: str) -> dict[str, Any]:
     return run_async(_song_detail(str(song_id)))
 
 
-async def _song_lyrics(song_id: str) -> str:
+async def _song_lyrics_data(song_id: str) -> dict[str, str]:
     _ensure_available()
     credential = await _refresh_if_needed(load_credential())
     DEVICE_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with Client(credential=credential, device_path=str(DEVICE_PATH)) as client:
-        result = await client.lyric.get_lyric(song_id, qrc=False)
-    return result.lyric or ""
+        try:
+            result = await client.lyric.get_lyric(song_id, qrc=False, trans=True)
+        except Exception as exc:
+            # 个别歌曲的翻译 CGI 会返回 24001；翻译属于增强能力，不能因此
+            # 连原文歌词也丢失，所以自动回退到普通歌词请求。
+            logger.info("QQ 音乐翻译歌词不可用，回退原文: %s", exc)
+            result = await client.lyric.get_lyric(song_id, qrc=False, trans=False)
+    return {
+        'lyric': result.lyric or '',
+        'translated_lyric': result.trans or '',
+        'romanized_lyric': result.roma or '',
+    }
+
+
+def get_song_lyrics_data(song_id: str) -> dict[str, str]:
+    try:
+        return run_async(_song_lyrics_data(str(song_id)))
+    except QQMusicError:
+        raise
+    except Exception as exc:
+        raise QQMusicError(f"QQ 音乐歌词请求失败：{exc}") from exc
 
 
 def get_song_lyrics(song_id: str) -> str:
-    return run_async(_song_lyrics(str(song_id)))
+    return get_song_lyrics_data(song_id)['lyric']
 
 
 def _quality_order() -> list[Any]:

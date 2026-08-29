@@ -5,7 +5,12 @@ import os
 import threading
 import time
 from pathlib import Path
-from config import MUSIC_API_BASE, BACKUP_MUSIC_API, NETEASE_HOT_PLAYLIST_ID
+from config import (
+    BACKUP_MUSIC_API,
+    MUSIC_API_BASE,
+    NETEASE_API_MANAGED,
+    NETEASE_HOT_PLAYLIST_ID,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +107,36 @@ def netease_auth_status():
         'source': source,
         'cookie_count': len(cookies),
         'updated_at': updated_at,
+        'engine': netease_engine_status(),
     }
+
+
+def netease_engine_status():
+    """返回可直接展示给后台页面的网易云解析引擎状态，不包含凭证。"""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(MUSIC_API_BASE)
+    hostname = (parsed.hostname or '').lower()
+    local = hostname in {'127.0.0.1', 'localhost', '::1'}
+    status = {
+        'mode': 'local' if local else 'external',
+        'managed': NETEASE_API_MANAGED and local and not bool(BACKUP_MUSIC_API),
+        'reachable': False,
+        'endpoint': parsed.netloc or MUSIC_API_BASE,
+        'version': '',
+        'error': '',
+    }
+    try:
+        response = requests.get(f"{MUSIC_API_BASE}/inner/version", timeout=2)
+        response.raise_for_status()
+        payload = response.json()
+        if int(payload.get('code', 0)) != 200:
+            raise MusicAPIError(payload.get('message') or '版本接口返回异常')
+        status['version'] = str((payload.get('data') or {}).get('version') or '')
+        status['reachable'] = bool(status['version'])
+    except Exception as exc:
+        status['error'] = str(exc)
+    return status
 
 
 def create_netease_login_qrcode():
@@ -314,8 +348,8 @@ def get_song_detail(song_id):
     return {}
 
 
-def get_song_lyrics(song_id):
-    """获取 LRC 歌词，优先原歌词，接口失败时返回空字符串。"""
+def get_song_lyrics_data(song_id):
+    """获取原文、逐句翻译和罗马音 LRC；缺失字段返回空字符串。"""
     for api_base in configured_api_bases():
         try:
             res = requests.get(
@@ -323,12 +357,23 @@ def get_song_lyrics(song_id):
                 headers=build_headers(),
                 timeout=10,
             )
-            lyric = res.json().get('lrc', {}).get('lyric', '')
+            res.raise_for_status()
+            payload = res.json()
+            lyric = (payload.get('lrc') or {}).get('lyric', '')
             if lyric:
-                return lyric
+                return {
+                    'lyric': lyric,
+                    'translated_lyric': (payload.get('tlyric') or {}).get('lyric', ''),
+                    'romanized_lyric': (payload.get('romalrc') or {}).get('lyric', ''),
+                }
         except Exception as exc:
             logger.warning(f"获取歌词失败 ({api_base}): {exc}")
-    return ''
+    return {'lyric': '', 'translated_lyric': '', 'romanized_lyric': ''}
+
+
+def get_song_lyrics(song_id):
+    """兼容旧调用方，只返回原文 LRC。"""
+    return get_song_lyrics_data(song_id)['lyric']
 
 # 获取歌单
 def get_playlist(playlist_id):

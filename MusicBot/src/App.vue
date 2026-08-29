@@ -11,6 +11,7 @@ import {
   GripVertical,
   Headphones,
   KeyRound,
+  Languages,
   ListMusic,
   LoaderCircle,
   MemoryStick,
@@ -75,7 +76,7 @@ type HotSearch = {
   icon_type?: number
 }
 type SearchMode = 'discover' | 'search'
-type LyricLine = { time: number; text: string }
+type LyricLine = { time: number; text: string; translation?: string }
 type MusicAuthStatus = {
   available: boolean
   authenticated: boolean
@@ -86,6 +87,14 @@ type MusicAuthStatus = {
   login_source?: 'environment' | 'local'
   cookie_count?: number
   updated_at?: number
+  engine?: {
+    mode: 'local' | 'external'
+    managed: boolean
+    reachable: boolean
+    endpoint: string
+    version?: string
+    error?: string
+  }
 }
 type SystemStatusResponse = {
   system: {
@@ -129,6 +138,7 @@ const volume = ref(40)
 const isPlaying = ref(false)
 const playMode = ref<PlayMode>('order')
 const lyricOffset = ref(0)
+const showTranslation = ref(false)
 const syncOpen = ref(false)
 const searchOpen = ref(false)
 const settingsOpen = ref(false)
@@ -229,6 +239,11 @@ const currentProvider = computed<MusicProvider>(() => current.value?.provider ||
 const currentProviderLabel = computed(() => PROVIDER_META[currentProvider.value].label)
 const selectedProviderName = computed(() => PROVIDER_META[musicSource.value].name)
 const selectedProviderIcon = computed(() => PROVIDER_META[musicSource.value].icon)
+const neteaseLocalEngineReady = computed(() => (
+  neteaseAuth.value.engine?.mode === 'local'
+  && neteaseAuth.value.engine?.managed === true
+  && neteaseAuth.value.engine?.reachable === true
+))
 
 function providerIcon(provider: MusicProvider) {
   return PROVIDER_META[provider].icon
@@ -365,6 +380,36 @@ function parseLyrics(raw = ''): LyricLine[] {
       return tags.map((tag) => ({ time: Number(tag[1]) * 60 + Number(tag[2]) + Number(`0.${tag[3] ?? 0}`), text }))
     })
     .sort((a, b) => a.time - b.time)
+}
+
+function mergeTranslatedLyrics(raw = '', translatedRaw = ''): LyricLine[] {
+  const originalLines = parseLyrics(raw)
+  const translatedLines = parseLyrics(translatedRaw)
+  if (!translatedLines.length) return originalLines
+
+  let translatedIndex = 0
+  return originalLines.map((line) => {
+    while (
+      translatedIndex + 1 < translatedLines.length
+      && translatedLines[translatedIndex + 1].time <= line.time
+    ) translatedIndex += 1
+
+    const candidates = [
+      translatedLines[translatedIndex - 1],
+      translatedLines[translatedIndex],
+      translatedLines[translatedIndex + 1],
+    ].filter((item): item is LyricLine => Boolean(item))
+    const nearest = candidates.sort(
+      (left, right) => Math.abs(left.time - line.time) - Math.abs(right.time - line.time),
+    )[0]
+    const translation = nearest && Math.abs(nearest.time - line.time) <= 0.75
+      ? nearest.text.trim()
+      : ''
+    return {
+      ...line,
+      translation: translation && translation !== line.text.trim() ? translation : undefined,
+    }
+  })
 }
 
 function notify(message: string) {
@@ -873,8 +918,11 @@ watch(() => current.value ? `${current.value.provider || 'netease'}:${current.va
   const lyricPromise = (async () => {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
-        const response = await getJson<{ lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}&provider=${provider}`)
-        const parsed = parseLyrics(response.lyric ?? '')
+        const response = await getJson<{ lyric?: string; translated_lyric?: string }>(`/api/song/lyrics?id=${encodeURIComponent(id)}&provider=${provider}`)
+        const parsed = mergeTranslatedLyrics(
+          response.lyric ?? '',
+          response.translated_lyric ?? '',
+        )
         if (parsed.length || attempt === 1) return parsed
       } catch {
         if (attempt === 1) return []
@@ -920,6 +968,7 @@ const lyricItems = computed(() => lyrics.value.map((line, index) => ({
   offset: index - activeLyricIndex.value,
   distance: Math.abs(index - activeLyricIndex.value),
 })))
+const hasTranslation = computed(() => lyrics.value.some((line) => Boolean(line.translation)))
 
 async function togglePlayback() {
   if (preparingPlayback.value) {
@@ -1471,19 +1520,22 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
       <section class="panel lyrics-panel">
         <div class="panel-heading lyrics-heading">
           <div><span class="eyebrow">NOW PLAYING</span><h3>实时歌词</h3></div>
-          <div class="sync-control">
-            <button class="subtle-button" title="调整歌词同步" @click="syncOpen = !syncOpen"><Clock3 :size="16" /><span>同步</span></button>
-            <div v-if="syncOpen" class="sync-popover">
-              <div class="popover-label"><span>歌词时差</span><strong>{{ lyricOffset > 0 ? '+' : '' }}{{ lyricOffset.toFixed(1) }}s</strong></div>
-              <div class="sync-buttons">
-                <button title="歌词提前 0.5 秒" @click="lyricOffset = Number((lyricOffset - 0.5).toFixed(1))"><Minus :size="16" /></button>
-                <button title="重置同步" @click="lyricOffset = 0"><RotateCcw :size="15" /></button>
-                <button title="歌词延后 0.5 秒" @click="lyricOffset = Number((lyricOffset + 0.5).toFixed(1))"><Plus :size="16" /></button>
+          <div class="lyrics-actions">
+            <button class="translation-toggle" :class="{ 'is-active': showTranslation && hasTranslation }" :disabled="!hasTranslation" :aria-pressed="showTranslation && hasTranslation" :title="hasTranslation ? (showTranslation ? '隐藏歌词翻译' : '显示歌词翻译') : '当前歌曲没有可用翻译'" @click="showTranslation = !showTranslation"><Languages :size="16" /><span>译</span></button>
+            <div class="sync-control">
+              <button class="subtle-button" title="调整歌词同步" @click="syncOpen = !syncOpen"><Clock3 :size="16" /><span>同步</span></button>
+              <div v-if="syncOpen" class="sync-popover">
+                <div class="popover-label"><span>歌词时差</span><strong>{{ lyricOffset > 0 ? '+' : '' }}{{ lyricOffset.toFixed(1) }}s</strong></div>
+                <div class="sync-buttons">
+                  <button title="歌词提前 0.5 秒" @click="lyricOffset = Number((lyricOffset - 0.5).toFixed(1))"><Minus :size="16" /></button>
+                  <button title="重置同步" @click="lyricOffset = 0"><RotateCcw :size="15" /></button>
+                  <button title="歌词延后 0.5 秒" @click="lyricOffset = Number((lyricOffset + 0.5).toFixed(1))"><Plus :size="16" /></button>
+                </div>
               </div>
             </div>
           </div>
         </div>
-        <div class="lyrics-stage" aria-live="polite">
+        <div class="lyrics-stage" :class="{ 'has-translation': showTranslation && hasTranslation }" aria-live="polite">
           <div v-if="lyricState === 'loading'" class="lyric-status">
             <LoaderCircle :size="22" class="continuous-spin" />
             <span>正在同步歌词</span>
@@ -1500,7 +1552,8 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
               :class="{ 'is-current': item.index === activeLyricIndex, 'is-hidden': item.distance > 8 }"
               :style="{ '--offset': String(item.offset), '--distance': String(item.distance) }"
             >
-              {{ item.line.text }}
+              <span class="lyric-original">{{ item.line.text }}</span>
+              <span v-if="showTranslation && item.line.translation" class="lyric-translation">{{ item.line.translation }}</span>
             </div>
           </div>
         </div>
@@ -1534,6 +1587,15 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
         <div class="settings-drawer-head">
           <div><span class="eyebrow">MUSIC ADMIN</span><h2>音乐服务后台</h2><p>账号凭证仅保存在运行 MusicBot 的服务器</p></div>
           <button class="icon-button" title="关闭" @click="settingsOpen = false"><X :size="19" /></button>
+        </div>
+
+        <div class="provider-engine-state settings-engine-state" :class="{ 'is-local-online': neteaseLocalEngineReady, 'is-engine-error': !neteaseLocalEngineReady }">
+          <i aria-hidden="true" />
+          <div>
+            <strong>{{ neteaseAuthLoading ? '正在检测网易云解析引擎' : neteaseLocalEngineReady ? `本项目本地解析引擎${neteaseAuth.engine?.version ? ` v${neteaseAuth.engine.version}` : ''}` : neteaseAuth.engine?.mode === 'local' ? '本地外置解析引擎' : '外部解析引擎' }}</strong>
+            <span>{{ neteaseAuth.engine?.endpoint || '等待后端返回引擎地址' }}{{ neteaseLocalEngineReady ? ' · 由 MusicBot 管理且仅本机可访问' : ' · 当前不是本项目内置引擎' }}</span>
+          </div>
+          <em>{{ neteaseAuthLoading ? '检测中' : neteaseLocalEngineReady ? '本项目在线' : '异常' }}</em>
         </div>
 
         <section v-if="!settingsUnlocked" class="settings-lock-card">

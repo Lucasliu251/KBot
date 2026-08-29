@@ -217,9 +217,12 @@ class LocalNeteaseService:
         process.terminate()
         try:
             process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
             process.kill()
-            process.wait(timeout=1)
+            try:
+                process.wait(timeout=1)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                pass
         logger.info("本地网易云 API 已停止")
 
 

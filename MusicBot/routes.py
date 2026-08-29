@@ -18,7 +18,7 @@ from utils import (
     get_playlist_urls,
     format_playlist_data,
     get_song_detail,
-    get_song_lyrics,
+    get_song_lyrics_data,
     netease_auth_status,
     save_cookie_header,
     clear_cookie_header,
@@ -569,14 +569,23 @@ def register_routes(app, bot, socketio=None):
 
     @app.route('/api/song/lyrics', methods=['GET'])
     def song_lyrics():
-        """返回当前音源的 LRC 原文，时间轴解析由前端完成。"""
+        """返回当前音源的原文及逐句翻译 LRC，时间轴合并由前端完成。"""
         song_id = request.args.get('id')
         if not song_id:
             return jsonify({'success': False, 'error': '缺少id参数'})
         try:
             provider = requested_provider()
-            lyric = qqmusic.get_song_lyrics(song_id) if provider == 'qqmusic' else get_song_lyrics(song_id)
-            return jsonify({'success': True, 'provider': provider, 'lyric': lyric})
+            lyric_data = (
+                qqmusic.get_song_lyrics_data(song_id)
+                if provider == 'qqmusic'
+                else get_song_lyrics_data(song_id)
+            )
+            return jsonify({
+                'success': True,
+                'provider': provider,
+                **lyric_data,
+                'has_translation': bool(lyric_data.get('translated_lyric')),
+            })
         except qqmusic.QQMusicError as e:
             return qqmusic_error_response(e)
         except Exception as e:
