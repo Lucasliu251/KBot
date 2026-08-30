@@ -44,7 +44,12 @@ BILIBILI_EXTRACT_TIMEOUT=30
 BILIBILI_COOKIE_FILE=
 
 # Web控制台配置
-SECRET_KEY=kook_web_music_secret_key
+SECRET_KEY=change_this_to_a_random_string
+MUSIC_SETTINGS_TOKEN=change_this_to_another_random_string
+KOOK_OAUTH_CLIENT_ID=
+KOOK_OAUTH_CLIENT_SECRET=
+KOOK_OAUTH_REDIRECT_URI=https://your-domain.example/Music/api/auth/kook/callback
+MUSIC_SESSION_COOKIE_SECURE=False
 HOST=0.0.0.0
 PORT=8004
 DEBUG=False

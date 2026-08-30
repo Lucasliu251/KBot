@@ -13,7 +13,9 @@ import {
   KeyRound,
   Languages,
   ListMusic,
+  LogIn,
   LoaderCircle,
+  Megaphone,
   MemoryStick,
   Minus,
   Music2,
@@ -37,6 +39,7 @@ import {
   SkipForward,
   Terminal,
   Trash2,
+  UsersRound,
   Volume2,
   Wifi,
   WifiOff,
@@ -82,6 +85,29 @@ type HotSearch = {
   icon_type?: number
 }
 type SearchMode = 'discover' | 'search'
+type DiscoveryView = 'community' | 'platform'
+type RecommendationSort = 'latest' | 'popular'
+type RecommendationUser = {
+  user_id: string
+  username: string
+  nickname: string
+  avatar: string
+  note?: string
+  updated_at: number
+}
+type RecommendationTrack = Track & {
+  recommendation_count: number
+  latest_at: number
+  viewer_recommended: boolean
+  note?: string
+  recommenders: RecommendationUser[]
+}
+type RecommendationAuthUser = {
+  id: string
+  username: string
+  nickname: string
+  avatar: string
+}
 type LyricLine = { time: number; text: string; translation?: string }
 type MusicAuthStatus = {
   available: boolean
@@ -152,6 +178,19 @@ const settingsOpen = ref(false)
 const musicSource = ref<MusicProvider>('netease')
 const channelSwitcherOpen = ref(false)
 const searchMode = ref<SearchMode>('discover')
+const discoveryView = ref<DiscoveryView>('community')
+const recommendationSort = ref<RecommendationSort>('popular')
+const communityAutoFallback = ref(false)
+const recommendationSortAutoFallback = ref(false)
+const recommendations = ref<RecommendationTrack[]>([])
+const recommendationLoading = ref(false)
+const recommendationError = ref('')
+const recommendationTotal = ref(0)
+const recommendationAuthUser = ref<RecommendationAuthUser | null>(null)
+const recommendationAuthConfigured = ref(false)
+const recommendationAuthLoading = ref(false)
+const recommendationBusyKey = ref('')
+const recommendedKeys = ref<Set<string>>(new Set())
 const searching = ref(false)
 const discovering = ref(false)
 const loadingMoreSearch = ref(false)
@@ -257,6 +296,52 @@ const neteaseLocalEngineReady = computed(() => (
 
 function providerIcon(provider: MusicProvider) {
   return PROVIDER_META[provider].icon
+}
+
+function recommendationKey(track: Pick<Track, 'id' | 'provider'> | SearchTrack) {
+  return `${track.provider || 'netease'}:${String(track.id)}`
+}
+
+function recommendationPayload(track: Track | SearchTrack | RecommendationTrack) {
+  const isSearchTrack = 'ar' in track || 'al' in track || 'dt' in track
+  const searchTrack = track as SearchTrack
+  const playerTrack = track as Track
+  return {
+    id: String(track.id),
+    provider: isSearchTrack ? searchTrack.provider || musicSource.value : playerTrack.provider || 'netease',
+    name: track.name,
+    artist: isSearchTrack
+      ? searchTrack.ar?.map((artist) => artist.name).join(' / ') || ''
+      : playerTrack.artist || '',
+    album: isSearchTrack ? searchTrack.al?.name || '' : playerTrack.album || '',
+    cover: isSearchTrack ? searchTrack.al?.picUrl || '' : playerTrack.cover || '',
+    duration: isSearchTrack ? Number(searchTrack.dt || 0) / 1000 : Number(playerTrack.duration || 0),
+  }
+}
+
+function recommendationAsSearchTrack(track: RecommendationTrack): SearchTrack {
+  return {
+    id: track.id,
+    provider: track.provider,
+    name: track.name,
+    ar: [{ name: track.artist || (track.provider === 'bilibili' ? '未知UP主' : '未知艺术家') }],
+    al: { name: track.album || '', picUrl: track.cover || '' },
+    dt: Number(track.duration || 0) * 1000,
+    playable: true,
+  }
+}
+
+function isRecommended(track: Pick<Track, 'id' | 'provider'> | SearchTrack) {
+  return recommendedKeys.value.has(recommendationKey(track))
+}
+
+function formatRelativeTime(timestamp = 0) {
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - timestamp))
+  if (elapsed < 60) return '刚刚'
+  if (elapsed < 3600) return `${Math.floor(elapsed / 60)} 分钟前`
+  if (elapsed < 86400) return `${Math.floor(elapsed / 3600)} 小时前`
+  if (elapsed < 604800) return `${Math.floor(elapsed / 86400)} 天前`
+  return new Date(timestamp * 1000).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
 }
 
 function formatTime(seconds = 0) {
@@ -426,6 +511,211 @@ function notify(message: string) {
   toast.value = message
   if (toastTimer) window.clearTimeout(toastTimer)
   toastTimer = window.setTimeout(() => { toast.value = '' }, 2400)
+}
+
+async function loadRecommendationAuth() {
+  recommendationAuthLoading.value = true
+  try {
+    const data = await getJson<{
+      configured: boolean
+      authenticated: boolean
+      user?: RecommendationAuthUser
+    }>('/api/auth/kook/status')
+    recommendationAuthConfigured.value = Boolean(data.configured)
+    recommendationAuthUser.value = data.authenticated && data.user ? data.user : null
+  } catch {
+    recommendationAuthConfigured.value = false
+    recommendationAuthUser.value = null
+  } finally {
+    recommendationAuthLoading.value = false
+  }
+}
+
+function oauthReturnPath() {
+  const url = new URL(window.location.href)
+  url.searchParams.delete('oauth')
+  url.searchParams.delete('message')
+  return `${url.pathname}${url.search}`
+}
+
+async function beginRecommendationLogin(track?: ReturnType<typeof recommendationPayload>) {
+  if (!recommendationAuthConfigured.value) {
+    notify('推荐登录尚未配置，请联系管理员配置 KOOK OAuth')
+    return
+  }
+  if (track && guildId.value) {
+    sessionStorage.setItem('pendingMusicRecommendation', JSON.stringify({ guild_id: guildId.value, track }))
+  }
+  recommendationAuthLoading.value = true
+  try {
+    const returnTo = oauthReturnPath()
+    const data = await getJson<{ authorization_url: string }>(`/api/auth/kook/url?return_to=${encodeURIComponent(returnTo)}`)
+    window.location.assign(data.authorization_url)
+  } catch (error) {
+    recommendationAuthLoading.value = false
+    notify(error instanceof Error ? error.message : '无法打开 KOOK 登录')
+  }
+}
+
+async function logoutRecommendationUser() {
+  try {
+    await postJson('/api/auth/kook/logout', {})
+    recommendationAuthUser.value = null
+    recommendedKeys.value = new Set()
+    await loadRecommendationBoard()
+    notify('已退出推荐身份')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '退出失败')
+  }
+}
+
+async function loadRecommendationBoard() {
+  if (!guildId.value) {
+    recommendations.value = []
+    recommendationTotal.value = 0
+    return
+  }
+  recommendationLoading.value = true
+  recommendationError.value = ''
+  try {
+    const fetchBoard = (sort: RecommendationSort) => getJson<{
+      items: RecommendationTrack[]
+      total: number
+    }>(`/api/recommendations?guild_id=${encodeURIComponent(guildId.value)}&sort=${sort}&limit=50&offset=0`)
+
+    let effectiveSort = recommendationSort.value
+    let data = await fetchBoard(effectiveSort)
+    let items = data.items ?? []
+    const allCountsEqual = () => (
+      items.length > 1
+      && items.every((track) => track.recommendation_count === items[0].recommendation_count)
+    )
+
+    if (effectiveSort === 'popular' && allCountsEqual()) {
+      effectiveSort = 'latest'
+      recommendationSortAutoFallback.value = true
+      data = await fetchBoard(effectiveSort)
+      items = data.items ?? []
+    } else if (effectiveSort === 'latest' && recommendationSortAutoFallback.value && !allCountsEqual()) {
+      effectiveSort = 'popular'
+      recommendationSortAutoFallback.value = false
+      data = await fetchBoard(effectiveSort)
+      items = data.items ?? []
+    }
+
+    recommendationSort.value = effectiveSort
+    recommendations.value = items
+    recommendationTotal.value = Number(data.total || 0)
+    recommendedKeys.value = new Set(
+      recommendations.value.filter((track) => track.viewer_recommended).map(recommendationKey),
+    )
+    if (recommendationTotal.value === 0 && discoveryView.value === 'community') {
+      communityAutoFallback.value = true
+      discoveryView.value = 'platform'
+    } else if (recommendationTotal.value > 0 && communityAutoFallback.value) {
+      communityAutoFallback.value = false
+      discoveryView.value = 'community'
+    }
+  } catch (error) {
+    recommendations.value = []
+    recommendationTotal.value = 0
+    recommendationError.value = error instanceof Error ? error.message : '大家推荐暂时不可用'
+  } finally {
+    recommendationLoading.value = false
+  }
+}
+
+async function setRecommendation(
+  track: Track | SearchTrack | RecommendationTrack | ReturnType<typeof recommendationPayload>,
+  active: boolean,
+) {
+  const payload = 'artist' in track && 'cover' in track && !('ar' in track)
+    ? {
+        id: String(track.id),
+        provider: track.provider || 'netease',
+        name: track.name,
+        artist: track.artist || '',
+        album: track.album || '',
+        cover: track.cover || '',
+        duration: Number(track.duration || 0),
+      }
+    : recommendationPayload(track as Track | SearchTrack | RecommendationTrack)
+  if (!guildId.value) {
+    notify('请先选择 KOOK 服务器')
+    return
+  }
+  if (!recommendationAuthUser.value) {
+    if (active) await beginRecommendationLogin(payload)
+    else notify('请先使用 KOOK 登录')
+    return
+  }
+  const key = `${payload.provider}:${payload.id}`
+  if (recommendationBusyKey.value === key) return
+  recommendationBusyKey.value = key
+  try {
+    const data = await postJson<{ active: boolean; recommendation_count: number; key: string }>('/api/recommendations/toggle', {
+      guild_id: guildId.value,
+      track: payload,
+      active,
+    })
+    const nextKeys = new Set(recommendedKeys.value)
+    if (data.active) nextKeys.add(data.key)
+    else nextKeys.delete(data.key)
+    recommendedKeys.value = nextKeys
+    notify(data.active ? `已向大家推荐《${payload.name}》` : `已撤回《${payload.name}》的推荐`)
+    await loadRecommendationBoard()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '推荐操作失败')
+  } finally {
+    recommendationBusyKey.value = ''
+  }
+}
+
+async function toggleRecommendation(track: Track | SearchTrack | RecommendationTrack) {
+  await setRecommendation(track, !isRecommended(track))
+}
+
+async function selectDiscoveryView(view: DiscoveryView) {
+  if (discoveryView.value === view) return
+  communityAutoFallback.value = false
+  discoveryView.value = view
+  if (!query.value.trim()) await loadDiscovery()
+}
+
+async function selectRecommendationSort(sort: RecommendationSort) {
+  if (recommendationSort.value === sort) return
+  recommendationSortAutoFallback.value = false
+  recommendationSort.value = sort
+  await loadRecommendationBoard()
+}
+
+async function finishRecommendationLoginReturn() {
+  const url = new URL(window.location.href)
+  const outcome = url.searchParams.get('oauth')
+  if (!outcome) return
+  const message = url.searchParams.get('message') || ''
+  url.searchParams.delete('oauth')
+  url.searchParams.delete('message')
+  window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
+  if (outcome !== 'success') {
+    sessionStorage.removeItem('pendingMusicRecommendation')
+    notify(message || 'KOOK 登录没有完成')
+    return
+  }
+  await loadRecommendationAuth()
+  const rawPending = sessionStorage.getItem('pendingMusicRecommendation')
+  sessionStorage.removeItem('pendingMusicRecommendation')
+  if (rawPending && recommendationAuthUser.value) {
+    try {
+      const pending = JSON.parse(rawPending) as { guild_id: string; track: ReturnType<typeof recommendationPayload> }
+      if (pending.guild_id === guildId.value) await setRecommendation(pending.track, true)
+      else notify('登录成功，请在原服务器重新推荐歌曲')
+    } catch {
+      notify('KOOK 登录成功')
+    }
+  } else {
+    notify('KOOK 登录成功')
+  }
 }
 
 function coverFallback(event: Event) {
@@ -756,6 +1046,9 @@ async function selectGuild(id: string, preferredChannelId = '') {
   const name = guilds.value.find((guild) => guild.id === id)?.name
   if (name) localStorage.setItem('currentGuildName', name)
   await Promise.all([loadChannels(preferredChannelId), loadPlaylist(id), loadPlayerState(id)])
+  if (searchOpen.value && !query.value.trim() && discoveryView.value === 'community') {
+    await loadRecommendationBoard()
+  }
 }
 
 function consoleBasePath() {
@@ -764,7 +1057,14 @@ function consoleBasePath() {
 }
 
 function updateChannelRoute(id: string, replace = false) {
-  const target = id ? `${consoleBasePath()}/${encodeURIComponent(id)}` : consoleBasePath()
+  const oauthQuery = new URLSearchParams()
+  const currentQuery = new URLSearchParams(window.location.search)
+  for (const key of ['oauth', 'message']) {
+    const value = currentQuery.get(key)
+    if (value) oauthQuery.set(key, value)
+  }
+  const suffix = oauthQuery.size ? `?${oauthQuery.toString()}` : ''
+  const target = `${id ? `${consoleBasePath()}/${encodeURIComponent(id)}` : consoleBasePath()}${suffix}`
   window.history[replace ? 'replaceState' : 'pushState']({ channelId: id }, '', target)
 }
 
@@ -795,12 +1095,6 @@ async function handleGuildSelection(event: Event) {
   localStorage.removeItem('currentChannelId')
   updateChannelRoute('')
   await selectGuild(id)
-}
-
-async function handleChannelSelection(event: Event) {
-  const id = (event.target as HTMLSelectElement).value
-  const channel = channels.value.find((item) => item.id === id)
-  if (channel) await chooseChannel(channel)
 }
 
 async function handlePopState() {
@@ -835,6 +1129,9 @@ onMounted(async () => {
     bootstrapping.value = false
     if (!current.value) lyricState.value = 'empty'
   }
+  await loadRecommendationAuth()
+  await finishRecommendationLoginReturn()
+  if (guildId.value) await loadRecommendationBoard()
   window.addEventListener('popstate', handlePopState)
   pollTimer = window.setInterval(() => { if (guildId.value) void loadPlaylist() }, 1000)
 })
@@ -1164,6 +1461,12 @@ async function loadDiscovery() {
   loadingMoreSearch.value = false
   discovering.value = true
   if (searchResultsBox.value) searchResultsBox.value.scrollTop = 0
+  if (discoveryView.value === 'community') {
+    discovering.value = false
+    await loadRecommendationBoard()
+    if (communityAutoFallback.value) await loadDiscovery()
+    return
+  }
   if (musicSource.value === 'bilibili') {
     discovering.value = false
     return
@@ -1258,6 +1561,7 @@ async function runSearch() {
 
 async function loadMoreSearchResults() {
   if (searching.value || discovering.value || loadingMoreSearch.value || !searchHasMore.value) return
+  if (searchMode.value === 'discover' && discoveryView.value === 'community') return
   if (searchMode.value === 'search' && !activeSearchKeyword.value) return
   const requestVersion = searchRequestVersion
   const offset = searchResults.value.length
@@ -1498,6 +1802,18 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
         </div>
         <div class="source-row">
           <span class="source-dot" :class="`is-${currentProvider}`"><img class="provider-logo" :class="`is-${currentProvider}`" :src="providerIcon(currentProvider)" :alt="`${currentProviderLabel} 图标`" /></span><span class="source-name">{{ currentProviderLabel }}</span>
+          <button
+            v-if="current"
+            class="current-recommend-button"
+            :class="{ 'is-active': isRecommended(current) }"
+            :disabled="recommendationBusyKey === recommendationKey(current)"
+            :title="isRecommended(current) ? '撤回我的推荐' : '推荐给这个服务器的所有人'"
+            @click="toggleRecommendation(current)"
+          >
+            <LoaderCircle v-if="recommendationBusyKey === recommendationKey(current)" :size="13" class="continuous-spin" />
+            <Megaphone v-else :size="13" />
+            <span>{{ isRecommended(current) ? '已推荐' : '推荐' }}</span>
+          </button>
         </div>
         <div class="slider-block progress-block">
           <input
@@ -1586,12 +1902,12 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
           <article v-if="current" class="queue-card is-current">
             <span class="queue-playing-bars" aria-label="正在播放"><i /><i /><i /></span><span class="queue-number">NOW</span>
             <img :src="current.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <div class="queue-track-meta"><strong>{{ current.name }}</strong><span>{{ current.artist }}</span></div><div class="queue-actions"><span class="queue-duration">{{ formatTime(current.duration) }}</span></div>
+            <div class="queue-track-meta"><strong>{{ current.name }}</strong><span>{{ current.artist }}</span></div><div class="queue-actions"><button class="queue-recommend" :class="{ 'is-active': isRecommended(current) }" :disabled="recommendationBusyKey === recommendationKey(current)" :title="isRecommended(current) ? '撤回我的推荐' : '推荐给大家'" @click.stop="toggleRecommendation(current)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(current)" :size="13" class="continuous-spin" /><Megaphone v-else :size="14" /></button><span class="queue-duration">{{ formatTime(current.duration) }}</span></div>
           </article>
           <article v-for="(track, index) in queuedTracks" :key="`${track.id}-${track.queue_index ?? index}`" class="queue-card" :class="{ 'is-dragging': dragIndex === index, 'is-drag-over': dragIndex !== null && dragTargetIndex === index && dragIndex !== index }" draggable="true" @dragstart="handleDragStart($event, index)" @dragend="cancelDrag" @dragenter.prevent="handleDragEnter(index)" @dragover.prevent @drop.prevent="dropQueue(index)" @pointerenter="handleDragEnter(index)">
             <GripVertical class="drag-handle" :size="17" aria-label="拖动调整顺序" @pointerdown="handlePointerDragStart($event, index)" /><span class="queue-number">{{ String(index + 1).padStart(2, '0') }}</span>
             <img :src="track.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <div class="queue-track-meta"><strong>{{ track.name }}</strong><span>{{ track.artist }}</span></div><div class="queue-actions"><button class="queue-remove" :disabled="removingQueueIndex !== null" :title="`从队列移除《${track.name}》`" :aria-label="`从队列移除《${track.name}》`" @pointerdown.stop @click.stop="removeQueuedTrack(track, index)"><LoaderCircle v-if="removingQueueIndex === index" :size="13" class="continuous-spin" /><X v-else :size="14" /></button><span class="queue-duration">{{ formatTime(track.duration) }}</span></div>
+            <div class="queue-track-meta"><strong>{{ track.name }}</strong><span>{{ track.artist }}</span></div><div class="queue-actions"><button class="queue-recommend" :class="{ 'is-active': isRecommended(track) }" :disabled="recommendationBusyKey === recommendationKey(track)" :title="isRecommended(track) ? '撤回我的推荐' : '推荐给大家'" @pointerdown.stop @click.stop="toggleRecommendation(track)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(track)" :size="13" class="continuous-spin" /><Megaphone v-else :size="14" /></button><button class="queue-remove" :disabled="removingQueueIndex !== null" :title="`从队列移除《${track.name}》`" :aria-label="`从队列移除《${track.name}》`" @pointerdown.stop @click.stop="removeQueuedTrack(track, index)"><LoaderCircle v-if="removingQueueIndex === index" :size="13" class="continuous-spin" /><X v-else :size="14" /></button><span class="queue-duration">{{ formatTime(track.duration) }}</span></div>
           </article>
           <div v-if="!current && !queuedTracks.length" class="empty-queue"><Music2 :size="30" /><strong>播放队列为空</strong><span>搜索一首歌，让声音填满这里</span></div>
         </div>
@@ -1751,46 +2067,82 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
           <Search :size="19" /><input ref="searchInput" v-model="query" :placeholder="searchPlaceholder" @input="handleSearchQueryInput" @keydown.enter="runSearch" />
           <button :disabled="searching || !query.trim()" @click="runSearch"><LoaderCircle v-if="searching" :size="17" class="continuous-spin" /><template v-else>搜索</template></button>
         </div>
-        <div class="connection-picker">
-          <label><span>服务器</span><span class="select-wrap"><select :value="guildId" @change="handleGuildSelection"><option v-if="!guilds.length" value="">暂无可用服务器</option><option v-for="guild in guilds" :key="guild.id" :value="guild.id">{{ guild.name }}</option></select><ChevronDown :size="15" /></span></label>
-          <label><span>语音频道</span><span class="select-wrap"><select :value="channelId" @change="handleChannelSelection"><option v-if="!channels.length" value="">暂无可用频道</option><option v-for="channel in channels" :key="channel.id" :value="channel.id">{{ channel.name }}</option></select><ChevronDown :size="15" /></span></label>
-          <button :class="connected ? 'disconnect-button' : 'connect-button'" :disabled="voiceControlPending" :aria-busy="voiceControlPending" @click="connectVoice">{{ voiceControlPending ? '处理中' : connected ? '断开' : '连接' }}</button>
-        </div>
+        <section v-if="!query.trim()" class="discovery-navigation" aria-label="发现音乐">
+          <div class="discovery-tabs" role="tablist" aria-label="发现内容">
+            <button role="tab" :aria-selected="discoveryView === 'community'" @click="selectDiscoveryView('community')"><UsersRound :size="15" />大家推荐<span v-if="recommendationTotal">{{ recommendationTotal }}</span></button>
+            <button role="tab" :aria-selected="discoveryView === 'platform'" @click="selectDiscoveryView('platform')"><ListMusic :size="15" />平台榜单</button>
+          </div>
+          <div v-if="discoveryView === 'community'" class="recommendation-toolbar">
+            <div class="recommendation-sort" aria-label="推荐排序">
+              <button :class="{ 'is-active': recommendationSort === 'latest' }" @click="selectRecommendationSort('latest')">最新</button>
+              <button :class="{ 'is-active': recommendationSort === 'popular' }" @click="selectRecommendationSort('popular')">人气</button>
+            </div>
+            <div class="recommendation-identity">
+              <template v-if="recommendationAuthUser">
+                <img v-if="recommendationAuthUser.avatar" :src="recommendationAuthUser.avatar" alt="" />
+                <span>{{ recommendationAuthUser.nickname || recommendationAuthUser.username }}</span>
+                <button title="退出推荐身份" @click="logoutRecommendationUser"><LogOut :size="13" /></button>
+              </template>
+              <button v-else :disabled="recommendationAuthLoading || !recommendationAuthConfigured" :title="recommendationAuthConfigured ? '使用 KOOK 身份登录' : '管理员尚未配置 KOOK OAuth'" @click="beginRecommendationLogin()"><LogIn :size="14" />{{ recommendationAuthLoading ? '读取中' : recommendationAuthConfigured ? 'KOOK 登录' : '推荐未配置' }}</button>
+            </div>
+          </div>
+        </section>
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
-          <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">
-            <div class="discover-heading">
-              <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热搜</span>
-              <small>点击关键词直接搜索</small>
-            </div>
-            <div v-if="hotSearches.length" class="hot-search-grid">
-              <button v-for="(item, index) in hotSearches" :key="item.keyword" class="hot-search-item" :class="{ 'is-top': index < 3 }" :title="item.content || `搜索 ${item.keyword}`" @click="runHotSearch(item.keyword)">
-                <span class="hot-search-rank">{{ String(index + 1).padStart(2, '0') }}</span>
-                <span class="hot-search-keyword">{{ item.keyword }}</span>
+          <template v-if="searchMode === 'discover' && discoveryView === 'community'">
+            <article v-for="track in recommendations" :key="`recommendation-${recommendationKey(track)}`" class="recommendation-card">
+              <button class="recommendation-main" :title="`播放《${track.name}》`" @click="addSong(recommendationAsSearchTrack(track))">
+                <span class="recommendation-cover"><img :src="track.cover || FALLBACK_COVER" alt="" @error="coverFallback" /><img class="recommendation-provider" :class="`is-${track.provider || 'netease'}`" :src="providerIcon(track.provider || 'netease')" alt="" /></span>
+                <span class="result-meta"><strong>{{ track.name }}</strong><span>{{ track.artist || (track.provider === 'bilibili' ? '未知UP主' : '未知艺术家') }} · {{ track.album || PROVIDER_META[track.provider || 'netease'].name }}</span><em v-if="track.note">“{{ track.note }}”</em></span>
               </button>
+              <div class="recommendation-social">
+                <span class="recommender-avatars"><img v-for="person in track.recommenders.slice(0, 3)" :key="person.user_id" :src="person.avatar || FALLBACK_COVER" :title="person.nickname || person.username" alt="" /></span>
+                <span>{{ track.recommenders[0]?.nickname || track.recommenders[0]?.username || 'KOOK 用户' }}<template v-if="track.recommendation_count > 1"> 等 {{ track.recommendation_count }} 人</template>推荐 · {{ formatRelativeTime(track.latest_at) }}</span>
+              </div>
+              <button class="recommend-control" :class="{ 'is-active': isRecommended(track) }" :disabled="recommendationBusyKey === recommendationKey(track)" :title="isRecommended(track) ? '撤回我的推荐' : '我也推荐'" @click="toggleRecommendation(track)">
+                <LoaderCircle v-if="recommendationBusyKey === recommendationKey(track)" :size="15" class="continuous-spin" /><Megaphone v-else :size="15" /><span>{{ isRecommended(track) ? '已推荐' : '推荐' }}</span>
+              </button>
+              <button class="recommendation-play" title="加入播放队列" @click="addSong(recommendationAsSearchTrack(track))"><CirclePlus :size="20" /></button>
+            </article>
+            <div v-if="recommendationLoading && !recommendations.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在读取大家推荐</strong><span>汇总这个服务器成员主动留下的好歌</span></div>
+            <div v-else-if="!recommendations.length" class="search-placeholder"><UsersRound :size="28" /><strong>还没有人推荐歌曲</strong><span>{{ recommendationError || '从当前播放或搜索结果点“推荐”，成为第一个分享的人' }}</span></div>
+            <div v-else class="search-results-end">{{ recommendationSort === 'latest' ? '按最近推荐时间排列' : '按推荐人数排列，同票时最近优先' }}</div>
+          </template>
+          <template v-else>
+            <section v-if="searchMode === 'discover' && (hotSearches.length || searchResults.length)" class="discover-section">
+              <div class="discover-heading">
+                <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热搜</span>
+                <small>点击关键词直接搜索</small>
+              </div>
+              <div v-if="hotSearches.length" class="hot-search-grid">
+                <button v-for="(item, index) in hotSearches" :key="item.keyword" class="hot-search-item" :class="{ 'is-top': index < 3 }" :title="item.content || `搜索 ${item.keyword}`" @click="runHotSearch(item.keyword)">
+                  <span class="hot-search-rank">{{ String(index + 1).padStart(2, '0') }}</span>
+                  <span class="hot-search-keyword">{{ item.keyword }}</span>
+                </button>
+              </div>
+              <div class="discover-heading chart-heading">
+                <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热歌榜</span>
+                <small>向下滚动继续浏览</small>
+              </div>
+            </section>
+            <article v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" :class="{ 'is-unavailable': song.playable === false }">
+              <button class="search-result-main" :disabled="song.playable === false" :title="song.playable === false ? song.restriction : `加入《${song.name}》`" @click="addSong(song)">
+                <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
+                <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.playable === false ? song.restriction : `${song.ar?.map((artist) => artist.name).join(' / ') || (musicSource === 'bilibili' ? '未知UP主' : '未知艺术家')} · ${song.al?.name || (musicSource === 'bilibili' ? 'Bilibili 视频' : '未知专辑')}` }}</span></span>
+              </button>
+              <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span>
+              <button class="recommend-control is-compact" :class="{ 'is-active': isRecommended(song) }" :disabled="song.playable === false || recommendationBusyKey === recommendationKey(song)" :title="isRecommended(song) ? '撤回我的推荐' : '推荐给大家'" @click="toggleRecommendation(song)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(song)" :size="15" class="continuous-spin" /><Megaphone v-else :size="15" /></button>
+              <button class="result-add" :disabled="song.playable === false" title="加入播放队列" @click="addSong(song)"><CirclePlus :size="20" /></button>
+            </article>
+            <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载{{ selectedProviderName }}热榜</strong><span>看看大家此刻都在听什么</span></div>
+            <div v-else-if="!searchResults.length" class="search-placeholder">
+              <Search v-if="musicSource === 'bilibili'" :size="28" /><Radio v-else-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
+              <strong>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '搜索或粘贴B站视频链接' : searchMode === 'discover' ? '热榜暂时没有响应' : musicSource === 'bilibili' ? '没有找到匹配的B站视频' : '没有找到匹配的歌曲' }}</strong>
+              <span>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '支持关键词、BV号、AV号、b23.tv和完整视频链接' : searchMode === 'discover' ? (discoveryError || '稍后再试，或直接搜索想听的歌') : musicSource === 'bilibili' ? '换一个关键词，或直接粘贴视频链接试试' : '换一个歌曲名、艺术家或专辑试试' }}</span>
+              <button v-if="searchMode === 'discover' && musicSource !== 'bilibili'" class="discovery-retry" @click="loadDiscovery">重新加载</button>
             </div>
-            <div class="discover-heading chart-heading">
-              <span class="discover-title"><img class="provider-logo provider-inline-icon" :class="`is-${musicSource}`" :src="selectedProviderIcon" alt="" />{{ selectedProviderName }}热歌榜</span>
-              <small>向下滚动继续浏览</small>
-            </div>
-          </section>
-          <button v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" :class="{ 'is-unavailable': song.playable === false }" :disabled="song.playable === false" :title="song.playable === false ? song.restriction : `加入《${song.name}》`" @click="addSong(song)">
-            <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
-            <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.playable === false ? song.restriction : `${song.ar?.map((artist) => artist.name).join(' / ') || (musicSource === 'bilibili' ? '未知UP主' : '未知艺术家')} · ${song.al?.name || (musicSource === 'bilibili' ? 'Bilibili 视频' : '未知专辑')}` }}</span></span>
-            <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span><CirclePlus :size="20" />
-          </button>
-          <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载{{ selectedProviderName }}热榜</strong><span>看看大家此刻都在听什么</span></div>
-          <div v-else-if="!searchResults.length" class="search-placeholder">
-            <Search v-if="musicSource === 'bilibili'" :size="28" /><Radio v-else-if="searchMode === 'discover'" :size="28" /><Search v-else :size="28" />
-            <strong>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '搜索或粘贴B站视频链接' : searchMode === 'discover' ? '热榜暂时没有响应' : musicSource === 'bilibili' ? '没有找到匹配的B站视频' : '没有找到匹配的歌曲' }}</strong>
-            <span>{{ musicSource === 'bilibili' && searchMode === 'discover' ? '支持关键词、BV号、AV号、b23.tv和完整视频链接' : searchMode === 'discover' ? (discoveryError || '稍后再试，或直接搜索想听的歌') : musicSource === 'bilibili' ? '换一个关键词，或直接粘贴视频链接试试' : '换一个歌曲名、艺术家或专辑试试' }}</span>
-            <button v-if="searchMode === 'discover' && musicSource !== 'bilibili'" class="discovery-retry" @click="loadDiscovery">重新加载</button>
-          </div>
-          <div v-else-if="searchHasMore" class="search-load-more">
-            <LoaderCircle v-if="loadingMoreSearch" :size="16" class="continuous-spin" />
-            <ChevronDown v-else :size="15" />
-            <span>{{ loadingMoreSearch ? '正在加载更多' : '向下滚动加载更多' }}</span>
-          </div>
-          <div v-else class="search-results-end">{{ searchMode === 'discover' ? '已显示全部热歌' : '已显示全部结果' }}</div>
+            <div v-else-if="searchHasMore" class="search-load-more"><LoaderCircle v-if="loadingMoreSearch" :size="16" class="continuous-spin" /><ChevronDown v-else :size="15" /><span>{{ loadingMoreSearch ? '正在加载更多' : '向下滚动加载更多' }}</span></div>
+            <div v-else class="search-results-end">{{ searchMode === 'discover' ? '已显示全部热歌' : '已显示全部结果' }}</div>
+          </template>
         </div>
         <div v-if="musicSource === 'netease'" class="playlist-import">
           <div><strong><img class="provider-logo provider-inline-icon is-netease" :src="providerIcon('netease')" alt="" />导入网易云歌单</strong><span>粘贴歌单链接或输入 ID</span></div>

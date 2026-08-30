@@ -81,3 +81,21 @@ NETEASE_HOT_PLAYLIST_ID = os.environ.get("NETEASE_HOT_PLAYLIST_ID", "3778678")
 SECRET_KEY = os.environ.get("SECRET_KEY", "kook_web_music_secret_key")
 # 音乐账号设置后台的管理密钥；未单独配置时沿用 Flask SECRET_KEY。
 MUSIC_SETTINGS_TOKEN = os.environ.get("MUSIC_SETTINGS_TOKEN", "").strip() or SECRET_KEY
+
+# KOOK OAuth：用于识别“谁推荐了歌曲”，不与机器人 Token 混用。
+KOOK_OAUTH_CLIENT_ID = os.environ.get("KOOK_OAUTH_CLIENT_ID", "").strip()
+KOOK_OAUTH_CLIENT_SECRET = os.environ.get("KOOK_OAUTH_CLIENT_SECRET", "").strip()
+KOOK_OAUTH_REDIRECT_URI = os.environ.get("KOOK_OAUTH_REDIRECT_URI", "").strip()
+KOOK_OAUTH_AUTHORIZE_URL = os.environ.get(
+    "KOOK_OAUTH_AUTHORIZE_URL",
+    "https://www.kookapp.cn/app/oauth2/authorize",
+).strip()
+KOOK_OAUTH_SCOPES = "get_user_info get_user_guilds"
+MUSIC_SESSION_COOKIE_SECURE = os.environ.get(
+    "MUSIC_SESSION_COOKIE_SECURE",
+    "False",
+).lower() in ("true", "1", "yes", "on")
+RECOMMENDATION_DB_PATH = os.environ.get(
+    "RECOMMENDATION_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "data", "recommendations.sqlite3"),
+)

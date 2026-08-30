@@ -10,10 +10,12 @@
 # - 2026-08-23: 启动/停止时回收同组残留进程，避免双开重复发卡片 (Author: KBot)
 # - 2026-08-24: music 并入默认启动组，替代 MusicBot/serve.sh；兼容 MUSIC_BOT_TOKEN (Author: KBot)
 # - 2026-08-29: 启动检查补上 QQ 音乐 Python 依赖，避免只装到 Flask 就跳过 pip (Author: KBot)
+# - 2026-08-30: music 启动自动同步锁定依赖并构建 Vue 控制台，实现一键准备与启动 (Author: KBot)
 
 set -u
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SERVE_SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+ROOT="$(cd -- "$(dirname -- "$SERVE_SCRIPT_SOURCE")" && pwd)"
 SERVE_INI="$ROOT/config/serve.ini"
 PID_FILE="$ROOT/.serve.pid"
 DEFAULT_GROUPS=(main music)
@@ -198,15 +200,22 @@ workdir_for() {
   fi
 }
 
-# 启动 music 前检查 Token、FFmpeg、Node 网易云组件、独立 venv，以及 Vue 控制台构建产物。
-# Python 检查包含 QQ 音乐 vendored SDK 运行时，避免旧 venv 只装了 Flask 就跳过 pip。
+# 计算依赖声明指纹；只用于判断是否需要重新安装，不承担安全校验。
+dependency_fingerprint() {
+  cksum "$@" 2>/dev/null | cksum | awk '{ print $1 ":" $2 }'
+}
+
+# 启动 music 前检查 Token/FFmpeg/Node，按声明变化同步独立依赖，并始终构建 Vue 控制台。
+# Python 检查包含 QQ 音乐 vendored SDK 运行时，避免旧 venv 只装了 Flask 就跳过安装。
 # 标准输出必须保持干净：start_one 只用 stdout 回传 PID。
 ensure_music_ready() {
   local music_dir="$ROOT/MusicBot"
   local env_file="$music_dir/.env"
   local venv_dir="$music_dir/venv"
   local venv_py="$venv_dir/bin/python"
-  local token node_version_code
+  local token node_version_code node_fingerprint python_fingerprint
+  local node_stamp="$music_dir/node_modules/.kbot-dependencies.cksum"
+  local python_stamp="$venv_dir/.kbot-requirements.cksum"
 
   if [[ ! -f "$env_file" ]]; then
     printf '缺少 %s，请先复制 MusicBot/.env.example 并填写 MUSIC_BOT_TOKEN。\n' "$env_file" >&2
@@ -236,24 +245,52 @@ ensure_music_ready() {
     printf 'MusicBot 内置网易云 API 需要 Node.js 22.12 或更高版本，当前：%s。\n' "$(node --version 2>/dev/null || printf 'unknown')" >&2
     return 1
   fi
-  if [[ ! -f "$music_dir/node_modules/@neteasecloudmusicapienhanced/api/package.json" ]]; then
-    printf '缺少 MusicBot Node 依赖，正在执行 npm install...\n' >&2
-    (cd "$music_dir" && npm install --no-audit --no-fund) >&2 || return 1
+  if [[ ! -f "$music_dir/package.json" || ! -f "$music_dir/package-lock.json" ]]; then
+    printf '缺少 MusicBot/package.json 或 package-lock.json，无法进行锁定安装。\n' >&2
+    return 1
+  fi
+  node_fingerprint="$(dependency_fingerprint "$music_dir/package.json" "$music_dir/package-lock.json")"
+  if [[ ! -f "$music_dir/node_modules/@neteasecloudmusicapienhanced/api/package.json"
+        || ! -f "$node_stamp"
+        || "$(cat "$node_stamp" 2>/dev/null || true)" != "$node_fingerprint" ]]; then
+    printf '正在同步 MusicBot Node 依赖（npm ci）...\n' >&2
+    (cd "$music_dir" && npm ci --include=dev --no-audit --no-fund) >&2 || return 1
+    node_fingerprint="$(dependency_fingerprint "$music_dir/package.json" "$music_dir/package-lock.json")"
+    printf '%s\n' "$node_fingerprint" >"$node_stamp"
+  else
+    printf 'MusicBot Node 依赖未变化，跳过安装。\n' >&2
   fi
 
   if [[ ! -x "$venv_py" ]]; then
     printf '正在创建 MusicBot 虚拟环境...\n' >&2
     python3 -m venv "$venv_dir" >&2 || return 1
   fi
-  if ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio, anyio, cryptography, jsonpath_ng, niquests, orjson, pydantic, paho.mqtt, yt_dlp" >/dev/null 2>&1; then
-    printf '正在安装 MusicBot Python 依赖...\n' >&2
-    "$venv_dir/bin/pip" install -r "$music_dir/requirements.txt" >&2 || return 1
-  fi
-
-  if [[ ! -f "$music_dir/static/music-console/assets/music-console.js" ]]; then
-    printf '缺少 Music 前端构建产物，请在 MusicBot 目录执行 npm install && npm run build。\n' >&2
+  if [[ ! -f "$music_dir/requirements.txt" ]]; then
+    printf '缺少 MusicBot/requirements.txt。\n' >&2
     return 1
   fi
+  python_fingerprint="$(dependency_fingerprint "$music_dir/requirements.txt")"
+  if [[ ! -f "$python_stamp"
+        || "$(cat "$python_stamp" 2>/dev/null || true)" != "$python_fingerprint" ]] \
+      || ! "$venv_py" -c "import flask, khl, dotenv, requests, psutil, flask_socketio, anyio, cryptography, jsonpath_ng, niquests, orjson, pydantic, paho.mqtt, yt_dlp" >/dev/null 2>&1; then
+    printf '正在同步 MusicBot Python 依赖...\n' >&2
+    "$venv_py" -m pip --version >/dev/null 2>&1 || "$venv_py" -m ensurepip --upgrade >&2 || return 1
+    "$venv_py" -m pip install --disable-pip-version-check -r "$music_dir/requirements.txt" >&2 || return 1
+    python_fingerprint="$(dependency_fingerprint "$music_dir/requirements.txt")"
+    printf '%s\n' "$python_fingerprint" >"$python_stamp"
+  else
+    printf 'MusicBot Python 依赖未变化，跳过安装。\n' >&2
+  fi
+
+  printf '正在构建 MusicBot Vue 控制台...\n' >&2
+  (cd "$music_dir" && npm run build) >&2 || return 1
+  if [[ ! -f "$music_dir/static/music-console/index.html"
+        || ! -f "$music_dir/static/music-console/assets/music-console.js"
+        || ! -f "$music_dir/static/music-console/assets/music-console.css" ]]; then
+    printf 'MusicBot 前端构建结束，但必要产物不完整。\n' >&2
+    return 1
+  fi
+  printf 'MusicBot 依赖与前端构建已就绪。\n' >&2
   return 0
 }
 
@@ -343,9 +380,9 @@ reap_stale_group() {
 
 # 启动一组。成功时把 PID 写到 stdout。
 start_one() {
-  local group="$1" process_id
+  local group="$1" prepared="${2:-0}" process_id
   programs_for "$group" >/dev/null || { printf '未知进程组：%s\n' "$group" >&2; return 2; }
-  if [[ "$group" == music ]]; then
+  if [[ "$group" == music && "$prepared" != 1 ]]; then
     ensure_music_ready || return 1
   fi
   if process_id="$(group_pid "$group")"; then
@@ -447,9 +484,9 @@ cmd_stop() {
   return "$result"
 }
 
-# restart：已停止 + 已启动 + 入口。无参数时重启 DEFAULT_GROUPS。
+# restart：Music 先准备依赖/构建，再停止旧进程并启动新进程；无参数时重启 DEFAULT_GROUPS。
 cmd_restart() {
-  local target="${1:-default}" result=0 item old_pid new_pid rc multi=0
+  local target="${1:-default}" result=0 item old_pid new_pid rc multi=0 prepared=0
   local items=()
   command -v "$PYTHON" >/dev/null || { printf '找不到 %s。\n' "$PYTHON" >&2; return 1; }
   command -v setsid >/dev/null || { printf '找不到 setsid。\n' >&2; return 1; }
@@ -461,6 +498,16 @@ cmd_restart() {
   fi
   for item in "${items[@]}"; do
     print_group_header "$item" "$multi"
+    prepared=0
+    if [[ "$item" == music ]]; then
+      printf '先准备 MusicBot 依赖与前端构建，成功后再切换进程...\n'
+      if ! ensure_music_ready; then
+        printf '准备失败，保留当前 MusicBot 进程。\n日志：%s\n' "$LOG" >&2
+        result=1
+        continue
+      fi
+      prepared=1
+    fi
     old_pid="$(stop_one "$item")"
     rc=$?
     if [[ "$rc" -eq 0 ]]; then
@@ -472,7 +519,7 @@ cmd_restart() {
       result=1
       continue
     fi
-    if new_pid="$(start_one "$item")"; then
+    if new_pid="$(start_one "$item" "$prepared")"; then
       printf '已启动 PID %s\n' "$new_pid"
       print_endpoints "$item"
     else

@@ -1,4 +1,4 @@
-from flask import render_template, request, jsonify, redirect, url_for, Blueprint, abort
+from flask import render_template, request, jsonify, redirect, url_for, Blueprint, abort, session
 import logging
 import asyncio
 import functools
@@ -27,6 +27,8 @@ from utils import (
     MusicAPIError,
 )
 import threading
+import secrets
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     from . import qqmusic_service as qqmusic
@@ -37,6 +39,12 @@ try:
     from . import bilibili_service as bilibili
 except ImportError:
     import bilibili_service as bilibili
+
+try:
+    from . import recommendation_auth, recommendation_service
+except ImportError:
+    import recommendation_auth
+    import recommendation_service
 
 logger = logging.getLogger(__name__)
 LOG_DIRECTORY = Path(__file__).resolve().parent
@@ -133,8 +141,126 @@ def register_routes(app, bot, socketio=None):
             status = 502
         return jsonify({'success': False, 'error': str(exc)}), status
 
+    def safe_return_to(value):
+        raw = str(value or '/').strip()
+        parsed = urlsplit(raw)
+        if parsed.scheme or parsed.netloc or not parsed.path.startswith('/') or parsed.path.startswith('//'):
+            return '/'
+        return urlunsplit(('', '', parsed.path, parsed.query, ''))
+
+    def append_query(url, **values):
+        parsed = urlsplit(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        query.update({key: str(value) for key, value in values.items()})
+        return urlunsplit(('', '', parsed.path, urlencode(query), ''))
+
+    def recommendation_user():
+        value = session.get('recommendation_user')
+        return value if isinstance(value, dict) and value.get('id') else None
+
     def render_console(channel_id=''):
         return render_template('dashboard.html', initial_channel_id=str(channel_id or ''))
+
+    @app.route('/api/auth/kook/status', methods=['GET'])
+    def kook_auth_status():
+        return jsonify({
+            'success': True,
+            'configured': recommendation_auth.oauth_configured(),
+            'authenticated': bool(recommendation_user()),
+            'user': recommendation_user(),
+        })
+
+    @app.route('/api/auth/kook/url', methods=['GET'])
+    def kook_auth_url():
+        try:
+            state = recommendation_auth.new_state()
+            return_to = safe_return_to(request.args.get('return_to') or '/')
+            session['kook_oauth_state'] = state
+            session['kook_oauth_return_to'] = return_to
+            session.permanent = True
+            return jsonify({
+                'success': True,
+                'authorization_url': recommendation_auth.authorization_url(state),
+            })
+        except recommendation_auth.KookOAuthError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 503
+
+    @app.route('/api/auth/kook/callback', methods=['GET'])
+    def kook_oauth_callback():
+        return_to = safe_return_to(session.pop('kook_oauth_return_to', '/'))
+        expected_state = str(session.pop('kook_oauth_state', '') or '')
+        supplied_state = str(request.args.get('state', '') or '')
+        code = str(request.args.get('code', '') or '')
+        error = str(request.args.get('error', '') or '')
+        if error:
+            return redirect(append_query(return_to, oauth='error', message=error))
+        if not expected_state or not supplied_state or not secrets.compare_digest(expected_state, supplied_state):
+            return redirect(append_query(return_to, oauth='error', message='OAuth state 校验失败'))
+        if not code:
+            return redirect(append_query(return_to, oauth='error', message='KOOK 未返回授权码'))
+        try:
+            token = recommendation_auth.exchange_code(code)
+            identity, guild_ids = recommendation_auth.fetch_identity(token)
+            recommendation_service.upsert_user(identity)
+            session['recommendation_user'] = identity
+            session['recommendation_guild_ids'] = guild_ids
+            session.permanent = True
+            return redirect(append_query(return_to, oauth='success'))
+        except Exception as exc:
+            logger.error('KOOK OAuth 登录失败: %s', exc)
+            return redirect(append_query(return_to, oauth='error', message='KOOK 登录失败'))
+
+    @app.route('/api/auth/kook/logout', methods=['POST'])
+    def kook_auth_logout():
+        session.pop('recommendation_user', None)
+        session.pop('recommendation_guild_ids', None)
+        return jsonify({'success': True})
+
+    @app.route('/api/recommendations', methods=['GET'])
+    def recommendation_board():
+        guild_id = str(request.args.get('guild_id', '') or '')
+        if not guild_id:
+            return jsonify({'success': False, 'error': '缺少 guild_id'}), 400
+        try:
+            limit = max(1, min(50, int(request.args.get('limit', 20))))
+            offset = max(0, int(request.args.get('offset', 0)))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '分页参数无效'}), 400
+        user = recommendation_user() or {}
+        result = recommendation_service.list_board(
+            guild_id,
+            viewer_user_id=str(user.get('id') or ''),
+            sort=str(request.args.get('sort', 'latest')),
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify({'success': True, **result})
+
+    @app.route('/api/recommendations/toggle', methods=['POST'])
+    def recommendation_toggle():
+        user = recommendation_user()
+        if not user:
+            return jsonify({
+                'success': False,
+                'error': '请先使用 KOOK 登录后推荐',
+                'login_required': True,
+            }), 401
+        data = request.json or {}
+        guild_id = str(data.get('guild_id', '') or '')
+        allowed_guilds = {str(item) for item in (session.get('recommendation_guild_ids') or [])}
+        if guild_id not in allowed_guilds:
+            return jsonify({'success': False, 'error': '你不在这个 KOOK 服务器中'}), 403
+        try:
+            result = recommendation_service.toggle(
+                guild_id,
+                user,
+                data.get('track') or {},
+                note=str(data.get('note', '') or ''),
+                active=data.get('active') if isinstance(data.get('active'), bool) else None,
+            )
+            return jsonify({'success': True, **result})
+        except recommendation_service.RecommendationError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
     
     @app.route('/')
     def index():

@@ -19,6 +19,7 @@ MusicBot/Cookie/cookie.txt
 MusicBot/Cookie/cookies.json
 MusicBot/data/qqmusic/
 MusicBot/data/bilibili/
+MusicBot/data/recommendations.sqlite3*
 MusicBot/venv/
 MusicBot/kook-music.pid
 MusicBot/*.log

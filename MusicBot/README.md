@@ -15,6 +15,11 @@ Bilibili 通过项目内嵌的 `yt-dlp` 与 B站 Web API 提供关键词、BV/AV
 完整链接和多P解析；只提取临时音频地址，不下载或持久化视频文件。单个视频或
 分P硬限制为 1 小时，直播暂不支持。B站不执行任何歌词搜索，统一显示无歌词提示。
 
+搜索抽屉默认显示“大家推荐”，服务器成员可用 KOOK 身份一键推荐或撤回任意
+音源的歌曲；同一用户对同一首歌只计一票。推荐卡按“最新”或推荐人数“人气”
+透明排序，原网易云 / QQ 音乐平台榜单保留在相邻页签。推荐记录保存在本机
+`data/recommendations.sqlite3`，不保存 KOOK OAuth AccessToken。
+
 ## 首次配置
 
 ```bash
@@ -34,9 +39,20 @@ MUSIC_API_BASE=http://127.0.0.1:8005
 MUSIC_PRELOAD_SECONDS=600
 MUSIC_STREAM_BUFFER_SECONDS=45
 MUSIC_STARTUP_BUFFER_SECONDS=8
+KOOK_OAUTH_CLIENT_ID=你的_KOOK_OAuth_Client_ID
+KOOK_OAUTH_CLIENT_SECRET=你的_KOOK_OAuth_Client_Secret
+KOOK_OAUTH_REDIRECT_URI=https://你的域名/Music/api/auth/kook/callback
+MUSIC_SESSION_COOKIE_SECURE=True
 ```
 
 机器人需要先被邀请进 KOOK 服务器，并拥有查看、加入目标语音频道的权限。服务器和语音频道会自动出现在网页选择器中，不需要把 ID 写进源码。
+
+“大家推荐”还需在 [KOOK 开发者中心](https://developer.kookapp.cn/) 为应用配置 OAuth2：
+将上面的回调地址加入允许列表，授权范围需要 `get_user_info` 和
+`get_user_guilds`。Client Secret 只放在服务器 `.env`，不要提交到 Git，也不要
+发送给浏览器。若 OAuth 尚未配置，用户仍可查看推荐榜和正常点歌，只是不能投票。
+生产环境必须使用 HTTPS、随机的 `SECRET_KEY`，并设置
+`MUSIC_SESSION_COOKIE_SECURE=True`。
 
 网易云组件使用锁定版本的
 [`@neteasecloudmusicapienhanced/api`](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)。
@@ -64,7 +80,15 @@ npm run dev:web
 - `/Music`：打开频道选择器。
 - `/Music/<频道ID>`：直接打开指定语音频道的控制台。
 
-生产部署前运行 `npm run build`，Flask 会从 `static/music-console` 加载构建产物。
+Flask 会从 `static/music-console` 加载生产构建产物。仓库根目录的 `serve.sh`
+会在每次启动或重启 music 时，按依赖声明变化自动同步 Node/Python 依赖，并始终执行
+`npm run build`，因此部署更新可直接运行：
+
+```bash
+./serve.sh restart music
+```
+
+也可以在 `MusicBot` 目录手动执行 `npm run build` 做独立构建检查。
 
 设置后台支持网易云扫码自动获取 Cookie、手动替换 Cookie，以及 QQ/微信扫码登录。
 修改凭证的接口受 `MUSIC_SETTINGS_TOKEN` 保护，管理密钥只保存在浏览器当前会话。

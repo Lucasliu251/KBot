@@ -8,6 +8,7 @@ import threading
 import requests
 import logging
 from pathlib import Path
+from datetime import timedelta
 from khl import Bot, Message
 
 # 修复相对导入
@@ -63,6 +64,12 @@ class PrefixMiddleware:
 # 初始化Flask应用
 app = Flask(__name__)
 app.config['SECRET_KEY'] = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=MUSIC_SESSION_COOKIE_SECURE,
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
 app.wsgi_app = PrefixMiddleware(app.wsgi_app)
 
 # 尝试导入SocketIO，如果不可用则提供备用方案

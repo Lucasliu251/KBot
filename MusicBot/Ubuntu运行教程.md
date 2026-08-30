@@ -118,7 +118,7 @@ nano .env
 
 ```env
 # KOOK机器人配置
-BOT_TOKEN=你的KOOK机器人Token
+MUSIC_BOT_TOKEN=你的KOOK机器人Token
 
 # FFMPEG配置 (Ubuntu系统路径)
 FFMPEG_PATH=/usr/bin/ffmpeg
@@ -131,14 +131,19 @@ NETEASE_API_MANAGED=True
 MUSIC_API_BASE=http://127.0.0.1:8005
 
 # Web控制台配置
-SECRET_KEY=kook_web_music_secret_key
+SECRET_KEY=请替换为随机长字符串
+MUSIC_SETTINGS_TOKEN=请替换为另一个随机长字符串
+KOOK_OAUTH_CLIENT_ID=你的KOOK OAuth Client ID
+KOOK_OAUTH_CLIENT_SECRET=你的KOOK OAuth Client Secret
+KOOK_OAUTH_REDIRECT_URI=https://你的域名/Music/api/auth/kook/callback
+MUSIC_SESSION_COOKIE_SECURE=True
 HOST=0.0.0.0
 PORT=8004
-DEBUG=True
+DEBUG=False
 ```
 
 **重要提示：**
-- 将 `BOT_TOKEN` 替换为您的实际KOOK机器人Token
+- 将 `MUSIC_BOT_TOKEN` 替换为您的实际KOOK机器人Token
 - FFMPEG路径在Ubuntu系统中通常是 `/usr/bin/ffmpeg`
 
 ### 9. 设置文件权限
@@ -223,12 +228,15 @@ http://你的服务器IP:8004
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| BOT_TOKEN | KOOK机器人的Token | 需要配置 |
+| MUSIC_BOT_TOKEN | MusicBot 独立使用的 KOOK 机器人 Token | 需要配置 |
 | FFMPEG_PATH | FFmpeg可执行文件路径 | /usr/bin/ffmpeg |
 | FFPROBE_PATH | FFprobe可执行文件路径 | /usr/bin/ffprobe |
 | NETEASE_API_PORT | 内置网易云API本机端口 | 8005 |
 | MUSIC_API_BASE | 网易云API基础URL | http://127.0.0.1:8005 |
 | SECRET_KEY | Web应用密钥 | 可自定义 |
+| KOOK_OAUTH_CLIENT_ID / SECRET | “大家推荐”的 KOOK OAuth 应用凭证 | 推荐功能需要 |
+| KOOK_OAUTH_REDIRECT_URI | KOOK OAuth 回调，需与开发者后台一致 | 推荐功能需要 |
+| MUSIC_SESSION_COOKIE_SECURE | 仅通过 HTTPS 发送登录会话 Cookie | 生产环境 True |
 | HOST | 服务器监听地址 | 0.0.0.0 |
 | PORT | MusicBot服务器端口 | 8004 |
 | DEBUG | 调试模式 | True |
