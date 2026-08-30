@@ -9,6 +9,7 @@ from .kookvoice import (
     guild_play_mode,
     play_history,
     audio_cache,
+    get_voice_transport_metrics,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     'guild_play_mode',
     'play_history',
     'audio_cache',
+    'get_voice_transport_metrics',
 ]

@@ -110,6 +110,7 @@ idle_disconnect_seconds = MUSIC_IDLE_DISCONNECT_SECONDS
 PCM_DECODER_READ_BYTES = PCM_BYTES_PER_SECOND // 2
 audio_cache = {}  # key -> {data, complete, duration, owner_guild, ...}
 preload_queue = {}  # guild_id -> {key, generation, running}
+guild_transport_metrics: Dict[str, Dict[str, Any]] = {}
 cache_lock = threading.RLock()
 cache_max_size = MUSIC_CACHE_MAX_SONGS
 cache_cleanup_interval = MUSIC_CACHE_TTL
@@ -120,7 +121,7 @@ song_play_count = {}  # 每个服务器的歌曲播放计数
 cleanup_threshold = 3  # 播放多少首歌曲后清理（可配置为2-4首）
 
 def cleanup_audio_cache():
-    """清理音频缓存，释放内存"""
+    """在歌曲切换点清理过期缓存；返回本次是否执行了周期维护。"""
     global audio_cache, last_cache_cleanup
     current_time = time.time()
     
@@ -151,12 +152,8 @@ def cleanup_audio_cache():
         
         last_cache_cleanup = current_time
         
-        # 强制垃圾回收
-        gc.collect()
-        
-        if log_enabled:
-            memory_info = psutil.Process().memory_info()
-            logger.info(f'内存使用情况: RSS={memory_info.rss / 1024 / 1024:.2f}MB, VMS={memory_info.vms / 1024 / 1024:.2f}MB')
+        return True
+    return False
 
 def smart_cleanup(guild_id):
     """智能清理：根据播放歌曲数量进行清理"""
@@ -200,9 +197,6 @@ def smart_cleanup(guild_id):
             for key, _ in removable[:excess_count]:
                 del audio_cache[key]
         
-        # 强制垃圾回收
-        gc.collect()
-        
         # 重置播放计数
         song_play_count[guild_id] = 0
         
@@ -216,6 +210,24 @@ def smart_cleanup(guild_id):
         return True
     
     return False
+
+
+def run_transition_maintenance(guild_id):
+    """只在一首歌曲结束后执行缓存维护与强制 GC，避免打断正在发送的 RTP。"""
+    cache_maintenance_due = cleanup_audio_cache()
+    smart_maintenance_due = smart_cleanup(guild_id)
+    if not cache_maintenance_due and not smart_maintenance_due:
+        return False
+    started_at = time.monotonic()
+    collected = gc.collect()
+    if log_enabled:
+        memory_info = psutil.Process().memory_info()
+        logger.info(
+            f'歌曲切换维护完成: GC={collected}, '
+            f'耗时={(time.monotonic() - started_at) * 1000:.1f}ms, '
+            f'RSS={memory_info.rss / 1024 / 1024:.2f}MB'
+        )
+    return True
 
 def get_cleanup_stats():
     """获取清理统计信息"""
@@ -293,6 +305,55 @@ class PCMVolumeRamp:
             if self.remaining == 0:
                 self.current = self.target
         return apply_pcm_gain(pcm_data, self.current)
+
+
+class PCMTransportPacer:
+    """用绝对截止时间维持长期 50fps；大于一帧的迟到只重同步、不突发追赶。"""
+
+    def __init__(self, frame_duration=PCM_FRAME_DURATION, clock=time.monotonic, sleeper=asyncio.sleep):
+        self.frame_duration = float(frame_duration)
+        self.clock = clock
+        self.sleeper = sleeper
+        self.deadline = self.clock()
+
+    async def wait(self):
+        now = self.clock()
+        lateness = max(0.0, now - self.deadline)
+        resynced = lateness > self.frame_duration
+        if resynced:
+            # 严重迟到时从当前帧重新起算，避免连续补发造成听感加速。
+            self.deadline = now
+        else:
+            delay = self.deadline - now
+            if delay > 0:
+                await self.sleeper(delay)
+                now = self.clock()
+                lateness = max(0.0, now - self.deadline)
+                if lateness > self.frame_duration:
+                    # 调度器本身严重过眠时也立刻重同步，下一帧不能紧贴当前帧突发。
+                    self.deadline = now
+                    resynced = True
+        self.deadline += self.frame_duration
+        return lateness, resynced
+
+
+def get_voice_transport_metrics(guild_id: str) -> Dict[str, Any]:
+    """返回当前语音连接的发送时钟快照，供监控接口读取。"""
+    metrics = guild_transport_metrics.get(str(guild_id)) or {}
+    if not metrics:
+        return {}
+    first_sent_at = float(metrics.get('first_sent_at') or 0)
+    last_sent_at = float(metrics.get('last_sent_at') or 0)
+    frames_sent = int(metrics.get('frames_sent') or 0)
+    elapsed = max(0.0, last_sent_at - first_sent_at)
+    snapshot = dict(metrics)
+    snapshot['actual_fps'] = (
+        (frames_sent - 1) / elapsed
+        if frames_sent > 1 and elapsed > 0
+        else 0.0
+    )
+    snapshot['target_fps'] = 1 / PCM_FRAME_DURATION
+    return snapshot
 
 
 class BufferedPCMDecoder:
@@ -585,7 +646,6 @@ def schedule_next_preload(guild_id):
                         f'下一首预加载完成: {cached["duration"]:.1f}s, '
                         f'{cached["size"] / 1024 / 1024:.1f}MiB, complete={cached["complete"]}'
                     )
-                cleanup_audio_cache()
         except Exception as exc:
             if log_enabled:
                 logger.error(f'下一首预加载失败: {exc}')
@@ -877,10 +937,14 @@ class PlayHandler(threading.Thread):
             [task1, task2],
             return_when=asyncio.FIRST_COMPLETED
         )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
 
         # 可选地取消未完成的任务
         for task in pending:
             task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         # 触发 task3 开始
         start_event.set()
@@ -896,9 +960,14 @@ class PlayHandler(threading.Thread):
             if log_enabled:
                 logger.warning(f'退出语音频道失败，频道: {self.channel_id}，错误: {exc}')
         finally:
+            try:
+                await self.requestor.close()
+            except Exception:
+                pass
             # /api/clear 会等待 play_list 被移除；因此必须在离开请求完成后
             # 再发布“退出完成”状态，避免前端过早显示已断开。
             play_list.pop(self.guild, None)
+            guild_transport_metrics.pop(self.guild, None)
             if self.guild in playlist_handle_status:
                 playlist_handle_status[self.guild] = False
         if log_enabled:
@@ -935,6 +1004,18 @@ class PlayHandler(threading.Thread):
 
                 audio_ssrc = res.get('audio_ssrc', 1111)
                 audio_pt = res.get('audio_pt', 111)
+                transport_metrics = {
+                    'rtp_ip': str(res.get('ip') or ''),
+                    'rtp_port': int(res.get('port') or 0),
+                    'frames_sent': 0,
+                    'late_frames': 0,
+                    'resyncs': 0,
+                    'max_lateness_ms': 0.0,
+                    'last_lateness_ms': 0.0,
+                    'first_sent_at': 0.0,
+                    'last_sent_at': 0.0,
+                }
+                guild_transport_metrics[self.guild] = transport_metrics
 
                 bitrate = int(res['bitrate'] / 1000)
                 bitrate *= 0.9 if bitrate > 100 else 1
@@ -965,30 +1046,34 @@ class PlayHandler(threading.Thread):
                         pass
 
                 volume_ramp = PCMVolumeRamp(get_guild_volume(self.guild))
-                next_transport_deadline = time.monotonic()
+                transport_pacer = PCMTransportPacer()
 
                 async def send_transport_frame(frame: bytes):
-                    """按 20ms 节拍发送一帧；落后时重置节拍，绝不追赶补发。"""
-                    nonlocal next_transport_deadline
+                    """按绝对 20ms 时钟发送一帧；小延迟自动抵扣，大延迟不突发追赶。"""
                     if not p or not p.stdin:
                         raise RuntimeError('RTP 编码器不可用')
                     if len(frame) < PCM_FRAME_BYTES:
                         frame = frame + bytes(PCM_FRAME_BYTES - len(frame))
                     elif len(frame) > PCM_FRAME_BYTES:
                         frame = frame[:PCM_FRAME_BYTES]
-                    delay = next_transport_deadline - time.monotonic()
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-                    elif delay < -PCM_FRAME_DURATION:
-                        next_transport_deadline = time.monotonic()
+                    lateness, resynced = await transport_pacer.wait()
                     output_frame = volume_ramp.process(frame, get_guild_volume(self.guild))
                     p.stdin.write(output_frame)
                     await p.stdin.drain()
-                    # 每次都从实际写完时刻继续，避免阻塞或暂停后出现 catch-up burst。
-                    next_transport_deadline = max(
-                        next_transport_deadline + PCM_FRAME_DURATION,
-                        time.monotonic() + PCM_FRAME_DURATION,
+                    sent_at = time.monotonic()
+                    transport_metrics['frames_sent'] += 1
+                    if not transport_metrics['first_sent_at']:
+                        transport_metrics['first_sent_at'] = sent_at
+                    transport_metrics['last_sent_at'] = sent_at
+                    transport_metrics['last_lateness_ms'] = lateness * 1000
+                    transport_metrics['max_lateness_ms'] = max(
+                        float(transport_metrics['max_lateness_ms']),
+                        lateness * 1000,
                     )
+                    if lateness > 0.005:
+                        transport_metrics['late_frames'] += 1
+                    if resynced:
+                        transport_metrics['resyncs'] += 1
 
                 async def wait_for_queue_during_cooldown():
                     """队列暂空时维持 RTP，冷却结束仍无新歌才真正离开频道。"""
@@ -1492,8 +1577,8 @@ class PlayHandler(threading.Thread):
                                 play_list[self.guild]['now_playing'] = None
                                 schedule_next_preload(self.guild)
                             
-                            # 执行智能清理
-                            smart_cleanup(self.guild)
+                            # 强制 GC 只允许发生在歌曲结束后的切换阶段，不能打断 RTP 热循环。
+                            run_transition_maintenance(self.guild)
                             
                             # 编码器保持到外层 3 秒冷却结束，期间新歌曲可直接复用连接。
                             if self.guild in play_list and len(play_list[self.guild]['play_list']) == 0:
@@ -1516,13 +1601,18 @@ class PlayHandler(threading.Thread):
     async def keepalive(self):
         while True:
             await asyncio.sleep(45)
-            if self.channel_id:
-                await self.requestor.keep_alive(self.channel_id)
-                if log_enabled:
-                    logger.info(f'发送保活请求，频道: {self.channel_id}')
-            
-            # 定期清理缓存和内存
-            cleanup_audio_cache()
+            # 正常播放持续发送 RTP，不需要 REST 保活。暂停时保留一次防御性保活，
+            # 即使请求失败也不能结束 keepalive 任务并连带取消正在运行的 push 任务。
+            if self.channel_id and guild_status.get(self.guild) == Status.PAUSE:
+                try:
+                    await self.requestor.keep_alive(self.channel_id)
+                    if log_enabled:
+                        logger.info(f'暂停期间发送语音保活请求，频道: {self.channel_id}')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if log_enabled:
+                        logger.warning(f'暂停期间语音保活失败，频道: {self.channel_id}，错误: {exc}')
 
 async def start():
     global original_loop

@@ -9,6 +9,7 @@ from flask import Flask
 
 import recommendation_service
 import recommendation_auth
+import routes
 from routes import register_routes
 
 
@@ -121,6 +122,40 @@ class RecommendationRoutesTest(unittest.TestCase):
         self.assertEqual(callback.status_code, 302)
         self.assertIn('/?oauth=error', callback.headers['Location'])
         exchange_code.assert_not_called()
+
+    def test_network_latency_segments_are_independent(self) -> None:
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'code': 0, 'data': {'id': 'bot'}}
+
+        ping = self.client.get('/api/network/ping')
+        self.assertEqual(ping.status_code, 200)
+
+        transport = {
+            'rtp_ip': '127.0.0.1',
+            'actual_fps': 49.98,
+            'target_fps': 50.0,
+            'late_frames': 2,
+            'resyncs': 1,
+            'max_lateness_ms': 8.4,
+        }
+        with (
+            patch.object(routes, 'BOT_TOKEN', 'test-token'),
+            patch.object(routes.KOOK_LATENCY_SESSION, 'get', return_value=Response()),
+            patch.object(routes, 'measure_icmp_latency', return_value=7.2),
+            patch.object(routes.kookvoice, 'get_voice_transport_metrics', return_value=transport),
+        ):
+            response = self.client.get('/api/network/latency?guild_id=guild-1')
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload['online'])
+        self.assertEqual(payload['voice_gateway_ms'], 7.2)
+        self.assertEqual(payload['transport']['actual_fps'], 49.98)
+        self.assertEqual(payload['transport']['target_fps'], 50.0)
 
 
 if __name__ == '__main__':

@@ -145,9 +145,18 @@ type MonitorLog = {
   raw: string
 }
 type BotLatency = {
-  kookMs: number
+  kookRestMs: number | null
+  voiceGatewayMs: number | null
   consoleMs: number
   measuredAt: number
+  kookError?: string
+  transport?: {
+    actual_fps: number
+    target_fps: number
+    late_frames: number
+    resyncs: number
+    max_lateness_ms: number
+  } | null
 }
 
 const FALLBACK_COVER = assetUrl('album-placeholder.png')
@@ -373,23 +382,53 @@ function formatUptime(seconds = 0) {
 
 const latencyQuality = computed(() => {
   if (!botLatency.value) return { label: '等待探测', className: '' }
-  if (botLatency.value.kookMs < 100) return { label: '优秀', className: 'is-good' }
-  if (botLatency.value.kookMs < 250) return { label: '正常', className: 'is-normal' }
+  const voiceMs = botLatency.value.voiceGatewayMs
+  if (voiceMs !== null) {
+    if (voiceMs < 30) return { label: '语音优秀', className: 'is-good' }
+    if (voiceMs < 80) return { label: '语音正常', className: 'is-normal' }
+    return { label: '语音偏高', className: 'is-slow' }
+  }
+  const restMs = botLatency.value.kookRestMs
+  if (restMs !== null && restMs < 150) return { label: 'API 正常', className: 'is-good' }
+  if (restMs !== null && restMs < 300) return { label: 'API 偏慢', className: 'is-normal' }
   return { label: '偏高', className: 'is-slow' }
 })
+
+async function measureConsoleLatency() {
+  const samples: number[] = []
+  for (let index = 0; index < 3; index += 1) {
+    const startedAt = performance.now()
+    await getJson(`/api/network/ping?sample=${Date.now()}-${index}`)
+    samples.push(performance.now() - startedAt)
+  }
+  samples.sort((left, right) => left - right)
+  return Math.round(samples[Math.floor(samples.length / 2)] || 0)
+}
 
 async function loadBotLatency(force = false) {
   const now = Date.now()
   if (botLatencyLoading.value || (!force && now - lastLatencyCheckedAt < 10_000)) return
   botLatencyLoading.value = true
   botLatencyError.value = ''
-  const startedAt = performance.now()
   try {
-    const data = await getJson<{ online: boolean; kook_ms: number; measured_at: number }>('/api/network/latency')
+    const [consoleMs, data] = await Promise.all([
+      measureConsoleLatency(),
+      getJson<{
+        online: boolean
+        kook_rest_ms: number | null
+        kook_error?: string
+        voice_gateway_ms: number | null
+        transport?: BotLatency['transport']
+        measured_at: number
+      }>(`/api/network/latency?guild_id=${encodeURIComponent(guildId.value)}`),
+    ])
     botLatency.value = {
-      kookMs: data.kook_ms,
-      consoleMs: Math.round(performance.now() - startedAt),
+      kookRestMs: data.kook_rest_ms,
+      voiceGatewayMs: data.voice_gateway_ms,
+      consoleMs,
       measuredAt: data.measured_at,
+      kookError: data.kook_error,
+      transport: data.transport,
     }
     lastLatencyCheckedAt = Date.now()
   } catch (error) {
@@ -1777,9 +1816,10 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
             <div v-if="botLatencyLoading && !botLatency" class="latency-loading"><LoaderCircle :size="15" class="continuous-spin" />正在探测链路</div>
             <div v-else-if="botLatencyError && !botLatency" class="latency-error">{{ botLatencyError }}</div>
             <template v-else-if="botLatency">
-              <div class="latency-row"><span>MusicBot → KOOK</span><strong>{{ botLatency.kookMs }} ms</strong></div>
               <div class="latency-row"><span>浏览器 → 控制台</span><strong>{{ botLatency.consoleMs }} ms</strong></div>
-              <div class="latency-foot"><span class="live-dot" />按需探测 · 10 秒内复用结果</div>
+              <div class="latency-row" :title="botLatency.kookError || '复用 HTTPS 连接测量 KOOK REST API 响应'"><span>MusicBot → KOOK API</span><strong>{{ botLatency.kookRestMs === null ? '—' : `${botLatency.kookRestMs} ms` }}</strong></div>
+              <div class="latency-row"><span>MusicBot → 语音网关</span><strong>{{ botLatency.voiceGatewayMs === null ? (connected ? '不可探测' : '未连接') : `${botLatency.voiceGatewayMs} ms` }}</strong></div>
+              <div class="latency-foot"><span class="live-dot" /><template v-if="botLatency.transport">发送 {{ botLatency.transport.actual_fps.toFixed(1) }} / {{ botLatency.transport.target_fps.toFixed(0) }} fps</template><template v-else>三段独立探测 · 10 秒复用</template></div>
             </template>
           </div>
         </div>

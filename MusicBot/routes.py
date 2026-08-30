@@ -3,11 +3,16 @@ import logging
 import asyncio
 import functools
 import hmac
+import ipaddress
 import json
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 import kookvoice
-from config import MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN
+import requests
+from config import BOT_TOKEN, MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN
 from utils import (
     search_music,
     search_music_page,
@@ -48,10 +53,35 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 LOG_DIRECTORY = Path(__file__).resolve().parent
+KOOK_LATENCY_SESSION = requests.Session()
+KOOK_LATENCY_LOCK = threading.Lock()
 
 # 全局变量
 guild_data = {}  # 存储服务器信息
 current_guild_id = None  # 当前选中的服务器ID
+
+
+def measure_icmp_latency(host: str):
+    """测量当前 RTP 网关的 ICMP RTT；不支持或被禁用时返回 None。"""
+    try:
+        ipaddress.ip_address(str(host))
+        command = ['ping', '-c', '1']
+        if sys.platform == 'darwin':
+            command.extend(['-W', '1000'])
+        else:
+            command.extend(['-W', '1'])
+        command.append(str(host))
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        match = re.search(r'time[=<]([0-9.]+)\s*ms', result.stdout)
+        return round(float(match.group(1)), 1) if match else None
+    except Exception:
+        return None
 
 # 异步函数运行器
 def run_async(coro):
@@ -355,61 +385,71 @@ def register_routes(app, bot, socketio=None):
             logger.error(f"获取服务器列表异常: {e}")
             return jsonify({'success': False, 'error': str(e)})
 
+    @app.route('/api/network/ping', methods=['GET'])
+    def network_ping():
+        """立即返回，供浏览器独立测量到 MusicBot 控制台的往返时间。"""
+        return jsonify({'success': True, 'server_time': time.time()})
+
     @app.route('/api/network/latency', methods=['GET'])
     def get_network_latency():
-        """测量 MusicBot 服务器到 KOOK REST API 的实际往返延迟。"""
-        try:
-            import requests
-            from config import BOT_TOKEN
-
-            if not BOT_TOKEN:
-                return jsonify({
-                    'success': False,
-                    'online': False,
-                    'error': 'MUSIC_BOT_TOKEN 未配置',
-                }), 503
-
-            started_at = time.perf_counter()
-            response = requests.get(
-                'https://www.kookapp.cn/api/v3/user/me',
-                headers={
-                    'Authorization': f'Bot {BOT_TOKEN}',
-                    'Content-Type': 'application/json',
-                },
-                timeout=5,
-            )
-            kook_ms = round((time.perf_counter() - started_at) * 1000)
-
-            if response.status_code != 200:
-                return jsonify({
-                    'success': False,
-                    'online': False,
-                    'kook_ms': kook_ms,
-                    'error': f'KOOK API 请求失败（HTTP {response.status_code}）',
-                }), 502
-
-            payload = response.json()
-            if payload.get('code') != 0:
-                return jsonify({
-                    'success': False,
-                    'online': False,
-                    'kook_ms': kook_ms,
-                    'error': payload.get('message', 'KOOK API 返回异常'),
-                }), 502
-
-            return jsonify({
-                'success': True,
-                'online': True,
-                'kook_ms': kook_ms,
-                'measured_at': time.time(),
-            })
-        except Exception as e:
-            logger.warning(f"KOOK 网络延迟探测失败: {e}")
+        """分别测量 KOOK REST 热连接和当前 voice/join RTP 网关。"""
+        if not BOT_TOKEN:
             return jsonify({
                 'success': False,
                 'online': False,
-                'error': f'无法连接 KOOK API：{e}',
-            }), 502
+                'error': 'MUSIC_BOT_TOKEN 未配置',
+            }), 503
+
+        kook_rest_ms = None
+        kook_error = ''
+        online = False
+        try:
+            started_at = time.perf_counter()
+            with KOOK_LATENCY_LOCK:
+                response = KOOK_LATENCY_SESSION.get(
+                    'https://www.kookapp.cn/api/v3/user/me',
+                    headers={
+                        'Authorization': f'Bot {BOT_TOKEN}',
+                        'Content-Type': 'application/json',
+                    },
+                    timeout=5,
+                )
+            kook_rest_ms = round((time.perf_counter() - started_at) * 1000)
+            if response.status_code != 200:
+                kook_error = f'KOOK API 请求失败（HTTP {response.status_code}）'
+            else:
+                payload = response.json()
+                online = payload.get('code') == 0
+                if not online:
+                    kook_error = payload.get('message', 'KOOK API 返回异常')
+        except Exception as e:
+            logger.warning(f"KOOK 网络延迟探测失败: {e}")
+            kook_error = f'无法连接 KOOK API：{e}'
+
+        guild_id = str(request.args.get('guild_id', '') or '')
+        transport = kookvoice.get_voice_transport_metrics(guild_id) if guild_id else {}
+        rtp_ip = str(transport.get('rtp_ip') or '')
+        voice_gateway_ms = measure_icmp_latency(rtp_ip) if rtp_ip else None
+        transport_public = {
+            'actual_fps': round(float(transport.get('actual_fps') or 0), 2),
+            'target_fps': round(float(transport.get('target_fps') or 50), 2),
+            'late_frames': int(transport.get('late_frames') or 0),
+            'resyncs': int(transport.get('resyncs') or 0),
+            'max_lateness_ms': round(float(transport.get('max_lateness_ms') or 0), 2),
+        } if transport else None
+
+        return jsonify({
+            'success': True,
+            'online': online,
+            # kook_ms 暂时保留，兼容旧前端滚动升级。
+            'kook_ms': kook_rest_ms,
+            'kook_rest_ms': kook_rest_ms,
+            'kook_error': kook_error,
+            'voice_gateway_ms': voice_gateway_ms,
+            'voice_connected': bool(transport),
+            'transport': transport_public,
+            'measured_at': time.time(),
+        })
     
     @app.route('/api/channels', methods=['GET'])
     def get_channels():
