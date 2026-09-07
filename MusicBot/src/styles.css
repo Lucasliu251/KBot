@@ -593,8 +593,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .recommendation-sort button { height: 24px; padding: 0 10px; border: 0; border-radius: 6px; color: #6f6d68; background: transparent; font-size: 9px; cursor: pointer; }
 .recommendation-sort button.is-active { color: #e6e2dc; background: #30302d; }
 .recommendation-identity { min-width: 0; display: flex; align-items: center; gap: 6px; color: #89867f; font-size: 9px; }
-.recommendation-identity > img { width: 22px; height: 22px; object-fit: cover; border-radius: 50%; }
-.recommendation-identity > span { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recommendation-identity > span:not(.user-avatar) { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recommendation-identity button { height: 25px; padding: 0 8px; display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 7px; color: #96938c; background: #262624; font-size: 9px; cursor: pointer; }
 .recommendation-identity > button:last-child:not(:first-child) { width: 25px; padding: 0; justify-content: center; color: #706e69; background: transparent; }
 .recommendation-identity button:disabled { opacity: 0.42; cursor: not-allowed; }
@@ -633,19 +632,22 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .recommend-control { height: 31px; padding: 0 9px; gap: 5px; border-radius: 9px; background: #272725; font-size: 9px; }
 .recommend-control:hover, .recommend-control.is-active { color: #ff8e84; background: var(--red-soft); }
 .recommend-control.is-compact { width: 31px; padding: 0; }
-.recommendation-card { min-height: 88px; margin-bottom: 4px; padding: 9px; display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; grid-template-rows: minmax(48px, auto) auto; align-items: center; column-gap: 8px; border-radius: 14px; background: transparent; transition: background 150ms ease; }
+.recommendation-card { height: 67px; padding: 8px; display: grid; grid-template-columns: minmax(0, 1fr) auto 28px; align-items: center; gap: 8px; border-radius: 13px; background: transparent; transition: background 150ms ease; }
 .recommendation-card:hover { background: #222220; }
-.recommendation-main { min-width: 0; padding: 0; display: grid; grid-template-columns: 50px minmax(0, 1fr); align-items: center; gap: 10px; grid-column: 1; grid-row: 1; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
-.recommendation-cover { position: relative; width: 50px; height: 50px; }
-.recommendation-cover > img:first-child { width: 50px; height: 50px; object-fit: cover; border-radius: 11px; }
+.recommendation-main { min-width: 0; padding: 0; display: grid; grid-template-columns: 48px minmax(0, 1fr); align-items: center; gap: 10px; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.recommendation-cover { position: relative; width: 48px; height: 48px; }
+.recommendation-cover > img:first-child { width: 48px; height: 48px; object-fit: cover; border-radius: 10px; }
 .recommendation-cover .recommendation-provider { position: absolute; right: -3px; bottom: -3px; width: 18px; height: 18px; object-fit: cover; border: 2px solid #222220; border-radius: 6px; background: #222220; }
 .recommendation-cover .recommendation-provider.is-qqmusic { border-radius: 50%; }
-.recommendation-social { min-width: 0; margin: 4px 0 0 60px; display: flex; align-items: center; gap: 7px; grid-column: 1; grid-row: 2; color: #66645f; font-size: 8px; }
-.recommendation-social > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.recommender-avatars { display: inline-flex; flex: 0 0 auto; padding-left: 4px; }
-.recommender-avatars img { width: 17px; height: 17px; margin-left: -4px; object-fit: cover; border: 2px solid #222220; border-radius: 50%; background: #30302d; }
-.recommendation-card .recommend-control { grid-column: 2; grid-row: 1 / span 2; }
-.recommendation-play { width: 28px; height: 31px; padding: 0; display: grid; place-items: center; grid-column: 3; grid-row: 1 / span 2; border: 0; color: #716f69; background: transparent; cursor: pointer; }
+.recommendation-meta { gap: 2px; }
+.recommendation-meta > strong { line-height: 16px; }
+.recommendation-meta .recommendation-artist { line-height: 12px; }
+.recommendation-meta .recommendation-social { height: 16px; min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; }
+.recommendation-social .recommendation-byline { min-width: 0; color: #8f8c85; font-size: 9px; }
+.recommendation-social .recommendation-time { flex: 0 0 auto; font-size: 8px; }
+.recommendation-social .recommender-avatars { display: inline-flex; flex: 0 0 auto; overflow: visible; padding-left: 3px; }
+.recommender-avatars .user-avatar { --avatar-size: 16px; margin-left: -3px; border: 1px solid #222220; }
+.recommendation-play { width: 28px; height: 31px; padding: 0; display: grid; place-items: center; border: 0; color: #716f69; background: transparent; cursor: pointer; }
 .recommendation-play:hover { color: var(--red); }
 .search-placeholder { height: 100%; min-height: 210px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: #56544f; }
 .search-placeholder strong { color: #888680; font-size: 13px; }

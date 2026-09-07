@@ -47,6 +47,7 @@ import {
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { assetUrl, getJson, postAdminJson, postJson } from './api'
+import UserAvatar from './UserAvatar.vue'
 
 type PlayMode = 'order' | 'repeat-one' | 'shuffle'
 type MusicProvider = 'netease' | 'bilibili' | 'qqmusic'
@@ -2163,7 +2164,7 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
             </div>
             <div class="recommendation-identity">
               <template v-if="recommendationAuthUser">
-                <img v-if="recommendationAuthUser.avatar" :src="recommendationAuthUser.avatar" alt="" />
+                <UserAvatar :src="recommendationAuthUser.avatar" :name="recommendationAuthUser.nickname || recommendationAuthUser.username" />
                 <span>{{ recommendationAuthUser.nickname || recommendationAuthUser.username }}</span>
                 <button title="退出推荐身份" @click="logoutRecommendationUser"><LogOut :size="13" /></button>
               </template>
@@ -2174,14 +2175,18 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
         <div ref="searchResultsBox" class="search-results" @scroll.passive="handleSearchScroll">
           <template v-if="searchMode === 'discover' && discoveryView === 'community'">
             <article v-for="track in recommendations" :key="`recommendation-${recommendationKey(track)}`" class="recommendation-card">
-              <button class="recommendation-main" :title="`播放《${track.name}》`" @click="addSong(recommendationAsSearchTrack(track))">
+              <button class="recommendation-main" :title="[track.name, track.artist, track.album, track.note ? `推荐：${track.note}` : ''].filter(Boolean).join(' · ')" @click="addSong(recommendationAsSearchTrack(track))">
                 <span class="recommendation-cover"><img :src="track.cover || FALLBACK_COVER" alt="" :referrerpolicy="coverReferrerPolicy(track.provider)" @error="coverFallback" /><img class="recommendation-provider" :class="`is-${track.provider || 'netease'}`" :src="providerIcon(track.provider || 'netease')" alt="" /></span>
-                <span class="result-meta"><strong>{{ track.name }}</strong><span>{{ track.artist || (track.provider === 'bilibili' ? '未知UP主' : '未知艺术家') }} · {{ track.album || PROVIDER_META[track.provider || 'netease'].name }}</span><em v-if="track.note">“{{ track.note }}”</em></span>
+                <span class="result-meta recommendation-meta">
+                  <strong>{{ track.name }}</strong>
+                  <span class="recommendation-artist">{{ track.artist || (track.provider === 'bilibili' ? '未知UP主' : '未知艺术家') }}</span>
+                  <span class="recommendation-social" :title="track.recommenders.map(person => person.nickname || person.username).join('、') + ' 推荐'">
+                    <span class="recommender-avatars"><UserAvatar v-for="person in track.recommenders.slice(0, 3)" :key="person.user_id" :src="person.avatar" :name="person.nickname || person.username" /></span>
+                    <span class="recommendation-byline">{{ track.recommenders[0]?.nickname || track.recommenders[0]?.username || 'KOOK 用户' }}<template v-if="track.recommendation_count > 1"> 等 {{ track.recommendation_count }} 人</template>推荐</span>
+                    <span class="recommendation-time">· {{ formatRelativeTime(track.latest_at) }}</span>
+                  </span>
+                </span>
               </button>
-              <div class="recommendation-social">
-                <span class="recommender-avatars"><img v-for="person in track.recommenders.slice(0, 3)" :key="person.user_id" :src="person.avatar || FALLBACK_COVER" :title="person.nickname || person.username" alt="" /></span>
-                <span>{{ track.recommenders[0]?.nickname || track.recommenders[0]?.username || 'KOOK 用户' }}<template v-if="track.recommendation_count > 1"> 等 {{ track.recommendation_count }} 人</template>推荐 · {{ formatRelativeTime(track.latest_at) }}</span>
-              </div>
               <button class="recommend-control" :class="{ 'is-active': isRecommended(track) }" :disabled="recommendationBusyKey === recommendationKey(track)" :title="isRecommended(track) ? '撤回我的推荐' : '我也推荐'" @click="toggleRecommendation(track)">
                 <LoaderCircle v-if="recommendationBusyKey === recommendationKey(track)" :size="15" class="continuous-spin" /><Megaphone v-else :size="15" /><span>{{ isRecommended(track) ? '已推荐' : '推荐' }}</span>
               </button>
