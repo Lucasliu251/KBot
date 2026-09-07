@@ -346,31 +346,73 @@ def _extract_audio(locator: str) -> dict[str, Any]:
         raise BilibiliDurationExceeded('Bilibili 单个视频或分P最长只能播放1小时')
     query = urlencode({'p': page}) if page > 1 else ''
     page_url = urlunparse(('https', 'www.bilibili.com', f'/video/{bvid}', '', query, ''))
-    options = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'noplaylist': True,
-        'format': 'bestaudio[acodec!=none]/bestaudio/best[acodec!=none]',
-        'socket_timeout': 15,
-        'cookiefile': str(_active_cookie_path()),
-        'http_headers': HEADERS,
-    }
-    with yt_dlp.YoutubeDL(options) as downloader:
-        info = downloader.extract_info(page_url, download=False)
-    duration = _duration_seconds(info.get('duration'))
+    try:
+        playurl_data = (_request_json('/x/player/playurl', {
+            'bvid': bvid,
+            'cid': (page_data or {}).get('cid') or target.get('cid'),
+            'qn': 80,
+            'fnval': 16,
+            'fnver': 0,
+            'fourk': 1,
+        }).get('data') or {})
+    except (BilibiliError, requests.RequestException) as exc:
+        logger.warning('Bilibili playurl接口不可用，尝试yt-dlp兜底: %s', exc)
+        playurl_data = {}
+    audio_streams = (playurl_data.get('dash') or {}).get('audio') or []
+
+    def stream_url(item: dict[str, Any]) -> str:
+        backups = item.get('backupUrl') or item.get('backup_url') or []
+        backup = backups[0] if isinstance(backups, list) and backups else backups
+        return str(
+            item.get('baseUrl')
+            or item.get('base_url')
+            or backup
+        ).strip()
+
+    # 优先选择兼容性最好的AAC音轨，再按带宽选择；避免Dolby等特殊轨道无法解码。
+    selected_stream = max(
+        audio_streams,
+        key=lambda item: (
+            str(item.get('codecs') or '').lower().startswith('mp4a'),
+            int(item.get('bandwidth') or 0),
+        ),
+        default={},
+    )
+    audio_url = stream_url(selected_stream)
+    if not audio_url:
+        durl = playurl_data.get('durl') or []
+        audio_url = str((durl[0] if durl else {}).get('url') or '').strip()
+
+    # 公开playurl接口是主路径；仅在特殊视频没有返回音轨时才退回yt-dlp。
+    fallback_info: dict[str, Any] = {}
+    if not audio_url:
+        options = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+            'noplaylist': True,
+            'format': 'bestaudio[acodec!=none]/bestaudio/best[acodec!=none]',
+            'socket_timeout': 15,
+            'cookiefile': str(_active_cookie_path()),
+            'http_headers': {**HEADERS, 'Referer': page_url},
+        }
+        with yt_dlp.YoutubeDL(options) as downloader:
+            fallback_info = downloader.extract_info(page_url, download=False)
+        if fallback_info.get('is_live') or fallback_info.get('live_status') == 'is_live':
+            raise BilibiliError('第一版暂不支持 Bilibili 直播')
+        audio_url = str(fallback_info.get('url') or '').strip()
+
+    duration = declared_duration or _duration_seconds(fallback_info.get('duration'))
     if duration > MAX_VIDEO_SECONDS:
         raise BilibiliDurationExceeded('Bilibili 单个视频或分P最长只能播放1小时')
-    if info.get('is_live') or info.get('live_status') == 'is_live':
-        raise BilibiliError('第一版暂不支持 Bilibili 直播')
-    audio_url = str(info.get('url') or '').strip()
     if not audio_url.startswith(('http://', 'https://')):
         raise BilibiliError('Bilibili 没有返回可播放音频地址')
-    headers = {
+    headers = {**HEADERS, 'Referer': page_url}
+    headers.update({
         str(key): str(value)
-        for key, value in (info.get('http_headers') or {}).items()
+        for key, value in (fallback_info.get('http_headers') or {}).items()
         if value is not None
-    }
+    })
     deadline_value = parse_qs(urlparse(audio_url).query).get('deadline', ['0'])[0]
     try:
         expires_at = float(deadline_value)
@@ -382,9 +424,9 @@ def _extract_audio(locator: str) -> dict[str, Any]:
         'url': audio_url,
         'expires_at': expires_at,
         'duration': duration,
-        'title': _strip_html(info.get('title')),
-        'artist': _strip_html(info.get('uploader')) or '未知UP主',
-        'cover': _cover_url(info.get('thumbnail')),
+        'title': _strip_html(view_data.get('title') or fallback_info.get('title')),
+        'artist': _strip_html((view_data.get('owner') or {}).get('name') or fallback_info.get('uploader')) or '未知UP主',
+        'cover': _cover_url(view_data.get('pic') or fallback_info.get('thumbnail')),
         'webpage_url': page_url,
         'headers': headers,
         'bvid': bvid,
@@ -400,6 +442,8 @@ def resolve_audio(locator: str) -> dict[str, Any]:
         raise BilibiliError('Bilibili 音频解析超时，请稍后重试') from exc
     except DownloadError as exc:
         raise BilibiliError(f'Bilibili 音频解析失败：{exc}') from exc
+    except requests.RequestException as exc:
+        raise BilibiliError(f'Bilibili 接口请求失败：{exc}') from exc
 
 
 def auth_status() -> dict[str, Any]:

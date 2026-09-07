@@ -200,6 +200,8 @@ const recommendationAuthConfigured = ref(false)
 const recommendationAuthLoading = ref(false)
 const recommendationBusyKey = ref('')
 const recommendedKeys = ref<Set<string>>(new Set())
+const recentlyAddedKeys = ref<Set<string>>(new Set())
+const addingSongKey = ref('')
 const searching = ref(false)
 const discovering = ref(false)
 const loadingMoreSearch = ref(false)
@@ -280,9 +282,13 @@ let lyricTargetId = ''
 let playbackAnchorPosition = position.value
 let playbackAnchorTime = performance.now()
 const lyricCache = new Map<string, LyricLine[]>()
+const addedIconTimers = new Map<string, number>()
 
 const current = computed(() => tracks.value.find((track) => track.playing))
 const queuedTracks = computed(() => tracks.value.filter((track) => !track.playing))
+const playlistTrackKeys = computed(() => new Set(
+  tracks.value.map((track) => `${track.provider || 'netease'}:${String(track.id)}`),
+))
 const duration = computed(() => current.value?.duration || 0)
 const progress = computed(() => duration.value > 0 ? Math.min(100, (position.value / duration.value) * 100) : 0)
 const channelName = computed(() => channels.value.find((channel) => channel.id === channelId.value)?.name || resolvedChannelName.value || '选择语音频道')
@@ -309,6 +315,33 @@ function providerIcon(provider: MusicProvider) {
 
 function recommendationKey(track: Pick<Track, 'id' | 'provider'> | SearchTrack) {
   return `${track.provider || 'netease'}:${String(track.id)}`
+}
+
+function searchTrackKey(track: SearchTrack) {
+  return `${track.provider || musicSource.value}:${String(track.id)}`
+}
+
+function isSongInPlaylist(track: SearchTrack) {
+  const key = searchTrackKey(track)
+  return playlistTrackKeys.value.has(key) || recentlyAddedKeys.value.has(key)
+}
+
+function markSongAdded(key: string) {
+  const keys = new Set(recentlyAddedKeys.value)
+  keys.add(key)
+  recentlyAddedKeys.value = keys
+  const previousTimer = addedIconTimers.get(key)
+  if (previousTimer) window.clearTimeout(previousTimer)
+  addedIconTimers.set(key, window.setTimeout(() => {
+    const nextKeys = new Set(recentlyAddedKeys.value)
+    nextKeys.delete(key)
+    recentlyAddedKeys.value = nextKeys
+    addedIconTimers.delete(key)
+  }, 5000))
+}
+
+function coverReferrerPolicy(provider?: MusicProvider) {
+  return provider === 'bilibili' ? 'no-referrer' : undefined
 }
 
 function recommendationPayload(track: Track | SearchTrack | RecommendationTrack) {
@@ -1184,6 +1217,8 @@ onBeforeUnmount(() => {
   stopQQLoginPoll()
   stopNeteaseLoginPoll()
   stopSettingsMonitor()
+  for (const timer of addedIconTimers.values()) window.clearTimeout(timer)
+  addedIconTimers.clear()
   window.removeEventListener('popstate', handlePopState)
   window.removeEventListener('pointerup', finishPointerDrag)
   document.body.classList.remove('is-queue-dragging')
@@ -1643,6 +1678,13 @@ async function addSong(song: SearchTrack) {
     notify('请先选择并连接语音频道')
     return
   }
+  const trackKey = searchTrackKey(song)
+  if (isSongInPlaylist(song)) {
+    notify(`《${song.name}》已在播放队列中`)
+    return
+  }
+  if (addingSongKey.value === trackKey) return
+  addingSongKey.value = trackKey
   try {
     const provider = song.provider || musicSource.value
     await postJson('/api/play', {
@@ -1656,9 +1698,11 @@ async function addSong(song: SearchTrack) {
       duration: (song.dt || 0) / 1000,
       provider,
     })
+    markSongAdded(trackKey)
     notify(`《${song.name}》已加入队列`)
     await loadPlaylist()
   } catch (error) { notify(error instanceof Error ? error.message : '添加失败') }
+  finally { addingSongKey.value = '' }
 }
 
 async function importPlaylist() {
@@ -1832,7 +1876,7 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
     <section class="console-grid">
       <section class="panel player-panel">
         <div class="cover-wrap">
-          <img class="album-cover" :src="current?.cover || FALLBACK_COVER" :alt="current ? `${current.name} 专辑封面` : '默认专辑封面'" @error="coverFallback" />
+          <img class="album-cover" :src="current?.cover || FALLBACK_COVER" :alt="current ? `${current.name} 专辑封面` : '默认专辑封面'" :referrerpolicy="coverReferrerPolicy(currentProvider)" @error="coverFallback" />
           <div class="playing-stamp"><span class="playing-dot" />{{ bootstrapping ? 'LOADING' : current ? (preparingPlayback ? 'BUFFERING' : isPlaying ? 'PLAYING' : 'PAUSED') : 'IDLE' }}</div>
         </div>
         <div class="track-meta">
@@ -1941,12 +1985,12 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
         <div class="queue-list">
           <article v-if="current" class="queue-card is-current">
             <span class="queue-playing-bars" aria-label="正在播放"><i /><i /><i /></span><span class="queue-number">NOW</span>
-            <img :src="current.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
+            <img :src="current.cover || FALLBACK_COVER" alt="" :referrerpolicy="coverReferrerPolicy(current.provider)" @error="coverFallback" />
             <div class="queue-track-meta"><strong>{{ current.name }}</strong><span>{{ current.artist }}</span></div><div class="queue-actions"><button class="queue-recommend" :class="{ 'is-active': isRecommended(current) }" :disabled="recommendationBusyKey === recommendationKey(current)" :title="isRecommended(current) ? '撤回我的推荐' : '推荐给大家'" @click.stop="toggleRecommendation(current)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(current)" :size="13" class="continuous-spin" /><Megaphone v-else :size="14" /></button><span class="queue-duration">{{ formatTime(current.duration) }}</span></div>
           </article>
           <article v-for="(track, index) in queuedTracks" :key="`${track.id}-${track.queue_index ?? index}`" class="queue-card" :class="{ 'is-dragging': dragIndex === index, 'is-drag-over': dragIndex !== null && dragTargetIndex === index && dragIndex !== index }" draggable="true" @dragstart="handleDragStart($event, index)" @dragend="cancelDrag" @dragenter.prevent="handleDragEnter(index)" @dragover.prevent @drop.prevent="dropQueue(index)" @pointerenter="handleDragEnter(index)">
             <GripVertical class="drag-handle" :size="17" aria-label="拖动调整顺序" @pointerdown="handlePointerDragStart($event, index)" /><span class="queue-number">{{ String(index + 1).padStart(2, '0') }}</span>
-            <img :src="track.cover || FALLBACK_COVER" alt="" @error="coverFallback" />
+            <img :src="track.cover || FALLBACK_COVER" alt="" :referrerpolicy="coverReferrerPolicy(track.provider)" @error="coverFallback" />
             <div class="queue-track-meta"><strong>{{ track.name }}</strong><span>{{ track.artist }}</span></div><div class="queue-actions"><button class="queue-recommend" :class="{ 'is-active': isRecommended(track) }" :disabled="recommendationBusyKey === recommendationKey(track)" :title="isRecommended(track) ? '撤回我的推荐' : '推荐给大家'" @pointerdown.stop @click.stop="toggleRecommendation(track)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(track)" :size="13" class="continuous-spin" /><Megaphone v-else :size="14" /></button><button class="queue-remove" :disabled="removingQueueIndex !== null" :title="`从队列移除《${track.name}》`" :aria-label="`从队列移除《${track.name}》`" @pointerdown.stop @click.stop="removeQueuedTrack(track, index)"><LoaderCircle v-if="removingQueueIndex === index" :size="13" class="continuous-spin" /><X v-else :size="14" /></button><span class="queue-duration">{{ formatTime(track.duration) }}</span></div>
           </article>
           <div v-if="!current && !queuedTracks.length" class="empty-queue"><Music2 :size="30" /><strong>播放队列为空</strong><span>搜索一首歌，让声音填满这里</span></div>
@@ -2131,7 +2175,7 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
           <template v-if="searchMode === 'discover' && discoveryView === 'community'">
             <article v-for="track in recommendations" :key="`recommendation-${recommendationKey(track)}`" class="recommendation-card">
               <button class="recommendation-main" :title="`播放《${track.name}》`" @click="addSong(recommendationAsSearchTrack(track))">
-                <span class="recommendation-cover"><img :src="track.cover || FALLBACK_COVER" alt="" @error="coverFallback" /><img class="recommendation-provider" :class="`is-${track.provider || 'netease'}`" :src="providerIcon(track.provider || 'netease')" alt="" /></span>
+                <span class="recommendation-cover"><img :src="track.cover || FALLBACK_COVER" alt="" :referrerpolicy="coverReferrerPolicy(track.provider)" @error="coverFallback" /><img class="recommendation-provider" :class="`is-${track.provider || 'netease'}`" :src="providerIcon(track.provider || 'netease')" alt="" /></span>
                 <span class="result-meta"><strong>{{ track.name }}</strong><span>{{ track.artist || (track.provider === 'bilibili' ? '未知UP主' : '未知艺术家') }} · {{ track.album || PROVIDER_META[track.provider || 'netease'].name }}</span><em v-if="track.note">“{{ track.note }}”</em></span>
               </button>
               <div class="recommendation-social">
@@ -2166,12 +2210,22 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
             </section>
             <article v-for="song in searchResults" :key="`${searchMode}-${song.provider || musicSource}-${song.id}`" class="search-result" :class="{ 'is-unavailable': song.playable === false }">
               <button class="search-result-main" :disabled="song.playable === false" :title="song.playable === false ? song.restriction : `加入《${song.name}》`" @click="addSong(song)">
-                <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" @error="coverFallback" />
+                <img :src="song.al?.picUrl || FALLBACK_COVER" alt="" :referrerpolicy="coverReferrerPolicy(song.provider || musicSource)" @error="coverFallback" />
                 <span class="result-meta"><strong>{{ song.name }}</strong><span>{{ song.playable === false ? song.restriction : `${song.ar?.map((artist) => artist.name).join(' / ') || (musicSource === 'bilibili' ? '未知UP主' : '未知艺术家')} · ${song.al?.name || (musicSource === 'bilibili' ? 'Bilibili 视频' : '未知专辑')}` }}</span></span>
               </button>
               <span class="result-duration">{{ formatTime((song.dt || 0) / 1000) }}</span>
               <button class="recommend-control is-compact" :class="{ 'is-active': isRecommended(song) }" :disabled="song.playable === false || recommendationBusyKey === recommendationKey(song)" :title="isRecommended(song) ? '撤回我的推荐' : '推荐给大家'" @click="toggleRecommendation(song)"><LoaderCircle v-if="recommendationBusyKey === recommendationKey(song)" :size="15" class="continuous-spin" /><Megaphone v-else :size="15" /></button>
-              <button class="result-add" :disabled="song.playable === false" title="加入播放队列" @click="addSong(song)"><CirclePlus :size="20" /></button>
+              <button
+                class="result-add"
+                :class="{ 'is-success': isSongInPlaylist(song) }"
+                :disabled="song.playable === false || addingSongKey === searchTrackKey(song) || isSongInPlaylist(song)"
+                :title="isSongInPlaylist(song) ? '已加入播放队列' : addingSongKey === searchTrackKey(song) ? '正在加入' : '加入播放队列'"
+                @click="addSong(song)"
+              >
+                <LoaderCircle v-if="addingSongKey === searchTrackKey(song)" :size="17" class="continuous-spin" />
+                <span v-else-if="isSongInPlaylist(song)" class="result-add-success"><Check :size="14" :stroke-width="2.8" /></span>
+                <CirclePlus v-else :size="20" />
+              </button>
             </article>
             <div v-if="discovering && !searchResults.length" class="search-placeholder"><LoaderCircle :size="26" class="continuous-spin" /><strong>正在加载{{ selectedProviderName }}热榜</strong><span>看看大家此刻都在听什么</span></div>
             <div v-else-if="!searchResults.length" class="search-placeholder">
