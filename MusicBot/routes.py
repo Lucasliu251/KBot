@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path
 import kookvoice
+from playback_settings import get_transition_settings, save_transition_settings
 import requests
 from config import BOT_TOKEN, MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN
 from utils import (
@@ -921,6 +922,18 @@ def register_routes(app, bot, socketio=None):
     @music_settings_required
     def music_settings_unlock():
         return jsonify({'success': True})
+
+    @app.route('/api/music/transitions', methods=['GET'])
+    def music_transitions():
+        return jsonify(success=True, transition=get_transition_settings())
+
+    @app.route('/api/music/transitions', methods=['POST'])
+    @music_settings_required
+    def update_music_transitions():
+        try:
+            return jsonify(success=True, transition=save_transition_settings(request.get_json(silent=True)))
+        except ValueError as exc:
+            return jsonify(success=False, error=str(exc)), 400
 
     @app.route('/api/netease/login/qrcode', methods=['POST'])
     @music_settings_required

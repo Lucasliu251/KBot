@@ -185,6 +185,10 @@ const showTranslation = ref(false)
 const syncOpen = ref(false)
 const searchOpen = ref(false)
 const settingsOpen = ref(false)
+const transitionSettings = ref({ enabled: true, seconds: 4 })
+const transitionLoading = ref(false)
+const transitionSaving = ref(false)
+const transitionError = ref('')
 const musicSource = ref<MusicProvider>('netease')
 const channelSwitcherOpen = ref(false)
 const searchMode = ref<SearchMode>('discover')
@@ -835,6 +839,30 @@ async function loadMusicProviders() {
   }
 }
 
+async function loadTransitionSettings() {
+  transitionLoading.value = true
+  transitionError.value = ''
+  try {
+    const data = await getJson<{ transition: { enabled: boolean; seconds: number } }>('/api/music/transitions')
+    transitionSettings.value = data.transition
+  } catch (error) {
+    transitionError.value = error instanceof Error ? error.message : '无法读取播放设置'
+  } finally { transitionLoading.value = false }
+}
+
+async function saveTransitionSettings() {
+  if (transitionSaving.value || transitionLoading.value) return
+  transitionSaving.value = true
+  transitionError.value = ''
+  try {
+    const data = await postAdminJson<{ transition: { enabled: boolean; seconds: number } }>('/api/music/transitions', transitionSettings.value, settingsToken.value)
+    transitionSettings.value = data.transition
+    notify('渐入渐出设置已保存，从下一首生效')
+  } catch (error) {
+    transitionError.value = settingsFailure(error, '保存失败')
+  } finally { transitionSaving.value = false }
+}
+
 async function unlockMusicSettings() {
   const token = settingsToken.value.trim()
   if (!token || settingsUnlocking.value) return
@@ -1259,7 +1287,7 @@ watch(settingsOpen, async (open) => {
     stopSettingsMonitor()
     return
   }
-  await loadMusicProviders()
+  await Promise.all([loadMusicProviders(), loadTransitionSettings()])
   if (!settingsUnlocked.value) return
   startSettingsMonitor()
   if (qqLoginIdentifier.value && !qqLoginTimer) {
@@ -2033,6 +2061,19 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
             <ShieldCheck :size="17" /><span>管理密钥只保留到当前浏览器会话；Cookie 和登录凭证不会返回到网页。</span>
             <button @click="lockMusicSettings">锁定</button>
           </div>
+
+          <section class="provider-settings-card transition-settings-card" aria-label="歌曲渐入渐出设置">
+            <div class="transition-heading">
+              <div><h3>歌曲渐入渐出</h3><p>当前歌曲渐弱，下一首渐强</p></div>
+              <label class="transition-toggle"><input v-model="transitionSettings.enabled" type="checkbox" role="switch" aria-label="开启渐入渐出" :disabled="transitionLoading || transitionSaving" /><span /></label>
+            </div>
+            <div class="transition-duration"><span>过渡时长</span><strong>{{ transitionSettings.seconds }} 秒</strong></div>
+            <input v-model.number="transitionSettings.seconds" class="range-input" type="range" min="1" max="12" step="1" aria-label="渐入渐出时长" :disabled="!transitionSettings.enabled || transitionLoading || transitionSaving" :style="{ '--range-progress': `${(transitionSettings.seconds - 1) / 11 * 100}%` }" />
+            <div class="transition-range-labels"><span>1秒</span><span>默认4秒</span><span>12秒</span></div>
+            <p class="transition-description">适用于所有音源，包含手动切歌。保存后从下一首生效；暂停、拖动进度和清空队列保持即时响应。</p>
+            <p v-if="transitionError" class="monitor-inline-error">{{ transitionError }}</p>
+            <div class="provider-settings-actions"><button class="provider-primary-action" :disabled="transitionLoading || transitionSaving" @click="saveTransitionSettings"><LoaderCircle v-if="transitionSaving" :size="15" class="continuous-spin" /><Check v-else :size="15" />{{ transitionSaving ? '保存中' : '保存设置' }}</button></div>
+          </section>
 
           <section class="system-monitor-card">
             <div class="system-monitor-head">

@@ -12,6 +12,7 @@ from array import array
 from enum import Enum, unique
 from typing import Dict, Union, List, Any, Optional, Coroutine as CoroutineType
 from asyncio import AbstractEventLoop
+from playback_settings import TrackFade, get_transition_settings
 try:
     from .requestor import VoiceRequestor
 except ImportError:
@@ -293,7 +294,7 @@ class PCMVolumeRamp:
         self.step = 0.0
         self.remaining = 0
 
-    def process(self, pcm_data: bytes, target_gain: float) -> bytes:
+    def process(self, pcm_data: bytes, target_gain: float, fade_gain: float = 1.0) -> bytes:
         target_gain = max(0.0, min(1.0, float(target_gain)))
         if abs(target_gain - self.target) > 0.0001:
             self.target = target_gain
@@ -304,7 +305,7 @@ class PCMVolumeRamp:
             self.remaining -= 1
             if self.remaining == 0:
                 self.current = self.target
-        return apply_pcm_gain(pcm_data, self.current)
+        return apply_pcm_gain(pcm_data, self.current * fade_gain)
 
 
 class PCMTransportPacer:
@@ -827,6 +828,9 @@ class Player:
             except:
                 pass
         schedule_next_preload(self.guild_id)
+        current = play_list[self.guild_id].get('now_playing')
+        if current and guild_status.get(self.guild_id) == Status.PLAYING:
+            current['_fade_out_requested'] = True
         guild_status[self.guild_id] = Status.SKIP
         if log_enabled:
             logger.info(f'跳过了 {skip_amount} 首歌曲，服务器: {self.guild_id}')
@@ -1048,7 +1052,7 @@ class PlayHandler(threading.Thread):
                 volume_ramp = PCMVolumeRamp(get_guild_volume(self.guild))
                 transport_pacer = PCMTransportPacer()
 
-                async def send_transport_frame(frame: bytes):
+                async def send_transport_frame(frame: bytes, fade_gain=1.0):
                     """按绝对 20ms 时钟发送一帧；小延迟自动抵扣，大延迟不突发追赶。"""
                     if not p or not p.stdin:
                         raise RuntimeError('RTP 编码器不可用')
@@ -1057,7 +1061,7 @@ class PlayHandler(threading.Thread):
                     elif len(frame) > PCM_FRAME_BYTES:
                         frame = frame[:PCM_FRAME_BYTES]
                     lateness, resynced = await transport_pacer.wait()
-                    output_frame = volume_ramp.process(frame, get_guild_volume(self.guild))
+                    output_frame = volume_ramp.process(frame, get_guild_volume(self.guild), fade_gain)
                     p.stdin.write(output_frame)
                     await p.stdin.drain()
                     sent_at = time.monotonic()
@@ -1329,6 +1333,25 @@ class PlayHandler(threading.Thread):
                             decoder_restart_attempts = 0
                             max_decoder_restart_attempts = 2
                             source_audio_bytes_sent = 0
+                            transition = get_transition_settings()
+                            fade_length = cached_duration if cache_complete else expected_duration - float(ss_value)
+                            fade = TrackFade(transition['seconds'] if transition['enabled'] else 0, fade_length)
+
+                            def end_for_skip(state):
+                                elapsed = source_audio_bytes_sent / PCM_BYTES_PER_SECOND
+                                if state == Status.SKIP:
+                                    current_info = play_list.get(self.guild, {}).get('now_playing')
+                                    if (current_info is music_info and music_info.pop('_fade_out_requested', False)
+                                            and fade.seconds and fade.skip_start is None):
+                                        fade.request_skip(elapsed)
+                                        guild_status[self.guild] = Status.PLAYING
+                                        return False
+                                    return True
+                                return fade.finished(elapsed)
+
+                            async def send_song_frame(frame):
+                                elapsed = source_audio_bytes_sent / PCM_BYTES_PER_SECOND
+                                await send_transport_frame(frame, fade.gain(elapsed))
 
                             def current_media_position():
                                 return float(ss_value) + source_audio_bytes_sent / PCM_BYTES_PER_SECOND
@@ -1396,7 +1419,7 @@ class PlayHandler(threading.Thread):
                                         await close_decoder()
                                         await terminate_process(p)
                                         return
-                                    if state == Status.SKIP:
+                                    if end_for_skip(state):
                                         guild_status[self.guild] = Status.END
                                         skip_song = True
                                         await close_decoder()
@@ -1465,7 +1488,7 @@ class PlayHandler(threading.Thread):
                                             state = guild_status.get(self.guild, Status.STOP)
                                             if state == Status.PAUSE:
                                                 break
-                                            if state == Status.SKIP:
+                                            if end_for_skip(state):
                                                 guild_status[self.guild] = Status.END
                                                 skip_song = True
                                                 await close_decoder()
@@ -1480,7 +1503,7 @@ class PlayHandler(threading.Thread):
                                             total_audio = total_audio[chunk_size:]
                                             if p and p.stdin:
                                                 try:
-                                                    await send_transport_frame(audio_slice)
+                                                    await send_song_frame(audio_slice)
                                                     source_audio_bytes_sent += len(audio_slice)
                                                     update_media_position()
                                                 except Exception as e:
@@ -1512,7 +1535,7 @@ class PlayHandler(threading.Thread):
                                             return
                                         else:
                                             final_source_bytes = len(total_audio)
-                                            await send_transport_frame(total_audio)
+                                            await send_song_frame(total_audio)
                                             source_audio_bytes_sent += final_source_bytes
                                             update_media_position()
                                         break
