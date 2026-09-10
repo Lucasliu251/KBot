@@ -1066,9 +1066,13 @@ async function loadPlaylist(selectedGuild = guildId.value) {
   if (!selectedGuild) return
   const requestVersion = ++playlistRequestVersion
   try {
-    const data = await getJson<{ playlist: Track[]; playing?: boolean; paused?: boolean; preparing?: boolean }>(`/api/playlist/current?guild_id=${encodeURIComponent(selectedGuild)}`)
+    const data = await getJson<{ playlist: Track[]; connected?: boolean; channel_id?: string; playing?: boolean; paused?: boolean; preparing?: boolean }>(`/api/playlist/current?guild_id=${encodeURIComponent(selectedGuild)}`)
     if (requestVersion !== playlistRequestVersion) return
     if (data.success === false) throw new Error(data.error)
+    if (selectedGuild === guildId.value && typeof data.connected === 'boolean') {
+      connectedChannelId.value = data.channel_id || ''
+      connected.value = data.connected && connectedChannelId.value === channelId.value
+    }
     const playlist = (data.playlist ?? []).map((track) => ({ ...track, id: String(track.id), duration: Number(track.duration || 0) }))
     const previousTrackId = current.value ? `${current.value.provider || 'netease'}:${current.value.id}` : ''
     const incomingCurrent = playlist.find((track) => track.playing)

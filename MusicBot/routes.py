@@ -1114,6 +1114,8 @@ def register_routes(app, bot, socketio=None):
                 return jsonify({
                     'success': True,
                     'playlist': playlist_data,
+                    'connected': bool(guild_playlist.get('voice_channel')) and status not in (kookvoice.Status.STOP, kookvoice.Status.EMPTY),
+                    'channel_id': guild_playlist.get('voice_channel', ''),
                     'playing': active,
                     'paused': paused,
                     'preparing': bool(now_playing) and not active and not paused,
@@ -1122,6 +1124,8 @@ def register_routes(app, bot, socketio=None):
                 return jsonify({
                     'success': True,
                     'playlist': [],
+                    'connected': False,
+                    'channel_id': '',
                     'playing': False,
                     'paused': False,
                     'preparing': False,

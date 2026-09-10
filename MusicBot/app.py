@@ -441,6 +441,7 @@ async def playlist_play(msg: Message, playlist_input: str):
 def start_bot_loop():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    companion = None
     
     try:
         # 验证Token
@@ -449,6 +450,12 @@ def start_bot_loop():
             sys.exit(1)
             
         # 启动机器人
+        try:
+            from .channel_companion import ChannelCompanion
+        except ImportError:
+            from channel_companion import ChannelCompanion
+        companion = ChannelCompanion(BOT_TOKEN, os.getenv('MUSIC_PUBLIC_URL', 'https://trashbox.tech/Music'))
+        companion.start()
         print("机器人开始运行...")
         loop.run_until_complete(bot.start())
         print("机器人已成功启动")
@@ -457,6 +464,8 @@ def start_bot_loop():
         print(f"机器人启动异常: {str(e)}")
         sys.exit(1)
     finally:
+        if companion:
+            companion.stop()
         loop.close()
     
     # 保持运行
