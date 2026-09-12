@@ -6,14 +6,14 @@ import threading
 from pathlib import Path
 
 PATH = Path(__file__).resolve().parent / 'data' / 'playback-settings.json'
-DEFAULTS = {'enabled': True, 'seconds': 4}
+DEFAULTS = {'enabled': True, 'seconds': 4, 'crossfade': True}
 _lock = threading.Lock()
 
 def _load():
     try:
         value = json.loads(PATH.read_text())
         if type(value['enabled']) is bool and type(value['seconds']) is int and 1 <= value['seconds'] <= 12:
-            return {key: value[key] for key in DEFAULTS}
+            return {**DEFAULTS, **{key: value[key] for key in DEFAULTS if key in value and type(value[key]) is type(DEFAULTS[key])}}
     except (OSError, ValueError, KeyError, TypeError):
         pass
     return dict(DEFAULTS)
@@ -27,7 +27,9 @@ def save_transition_settings(value):
     global _settings
     if not isinstance(value, dict) or type(value.get('enabled')) is not bool or type(value.get('seconds')) is not int or not 1 <= value['seconds'] <= 12:
         raise ValueError('渐入渐出时长必须为1–12秒，开关必须为布尔值')
-    next_value = {key: value[key] for key in DEFAULTS}
+    if 'crossfade' in value and type(value['crossfade']) is not bool:
+        raise ValueError('交叉切歌开关必须为布尔值')
+    next_value = {**_settings, **{key: value[key] for key in DEFAULTS if key in value}}
     with _lock:
         PATH.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix='.playback-', dir=PATH.parent)

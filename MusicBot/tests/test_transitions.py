@@ -34,20 +34,26 @@ class TransitionTests(unittest.TestCase):
             self.assertEqual(client.post('/api/music/transitions',headers=headers,json={'enabled':True,'seconds':13}).status_code,400)
             response=client.post('/api/music/transitions',headers=headers,json={'enabled':False,'seconds':12})
             self.assertEqual(response.status_code,200)
-            self.assertEqual(settings._load(), {'enabled':False,'seconds':12})
+            self.assertEqual(settings._load(), {'enabled':False,'seconds':12,'crossfade':True})
             self.assertEqual(client.get('/api/music/transitions').json['transition'],settings._load())
 
 class PlaybackFadeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pcm_fades_and_manual_skip_moves_to_next_track(self):
+        await self.check_playback(False)
+
+    async def test_crossfade_overlaps_and_resumes_without_replaying_prefix(self):
+        await self.check_playback(True)
+
+    async def check_playback(self, crossfade):
         guild='fade-test'
         frame=struct.pack('<h',10000)*(voice.PCM_FRAME_BYTES//2)
-        first={'file':'first','ss':0,'extra':{'duration':2}}
-        second={'file':'second','ss':0,'extra':{'duration':.2}}
+        first={'file':'first','ss':0,'extra':{'duration':4 if crossfade else 2}}
+        second={'file':'second','ss':0,'extra':{'duration':4 if crossfade else .2}}
         captured={'first':[],'second':[]}
         voice.play_list[guild]={'token':'unused','voice_channel':'local','now_playing':None,'play_list':[first,second]}
         voice.guild_status[guild]=voice.Status.END
         voice.guild_volume[guild]=1
-        for song,count in [(first,100),(second,10)]:
+        for song,count in [(first,200 if crossfade else 100),(second,200 if crossfade else 10)]:
             voice.audio_cache[voice.get_queue_item_cache_key(guild,song)]={'data':frame*count,'complete':True,'duration':count*.02,'owner_guild':guild}
 
         class Sink:
@@ -56,7 +62,7 @@ class PlaybackFadeTests(unittest.IsolatedAsyncioTestCase):
                 if current:
                     samples=captured[current['file']]
                     samples.append(struct.unpack_from('<h',data)[0])
-                    if current is first and len(samples)==10:
+                    if not crossfade and current is first and len(samples)==10:
                         voice.Player(guild).skip()
             async def drain(self): pass
         class Encoder:
@@ -70,8 +76,15 @@ class PlaybackFadeTests(unittest.IsolatedAsyncioTestCase):
         handler.requestor.join=AsyncMock(return_value={'ip':'127.0.0.1','port':1,'rtcp_port':2,'bitrate':64000})
         handler.requestor.leave=AsyncMock()
         try:
-            with patch.object(voice.asyncio,'create_subprocess_shell',AsyncMock(return_value=Encoder())), patch.object(voice,'schedule_next_preload'), patch.object(voice,'get_transition_settings',return_value={'enabled':True,'seconds':1}), patch.object(voice,'idle_disconnect_seconds',0):
-                await asyncio.wait_for(handler.push(),8)
+            with patch.object(voice.asyncio,'create_subprocess_shell',AsyncMock(return_value=Encoder())), patch.object(voice,'schedule_next_preload'), patch.object(voice,'get_transition_settings',return_value={'enabled':True,'seconds':1,'crossfade':crossfade}), patch.object(voice,'idle_disconnect_seconds',0):
+                await asyncio.wait_for(handler.push(),12)
+            if crossfade:
+                self.assertEqual(len(captured['first']),200)
+                self.assertEqual(len(captured['second']),175)
+                self.assertAlmostEqual(captured['second'][0],5000,delta=2)
+                self.assertAlmostEqual(captured['first'][-1],5000,delta=2)
+                self.assertNotIn('_crossfade_bytes', second)
+                return
             self.assertEqual(captured['first'][0],0)
             self.assertGreater(captured['first'][9],0)
             self.assertLess(captured['first'][-1],captured['first'][9])

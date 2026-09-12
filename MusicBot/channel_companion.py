@@ -34,26 +34,29 @@ def bar(ratio, width=12):
     return '━' * filled + '─' * (width - filled)
 
 
-def music_card(track, volume, status, channel, public_url):
+def music_card(track, volume, status, channel, public_url, mode='order'):
     extra = track.get('extra') or {}
     duration = number(extra.get('duration'))
     position = number(track.get('ss'))
     volume = min(1, number(volume))
-    metadata = '\n'.join(str(extra.get(key) or fallback)[:120] for key, fallback in (
+    title, artist, album = (str(extra.get(key) or fallback)[:100] for key, fallback in (
         ('title', '未知歌曲'), ('artist', '未知艺术家'), ('album', '未知专辑')))
+    metadata = f'{title} — {artist}\n{album}'
     top = {'type': 'section', 'text': {'type': 'plain-text', 'content': metadata}}
     cover = str(extra.get('cover') or '')
     if urlsplit(cover).scheme in ('https', 'http'):
         top.update(mode='left', accessory={'type': 'image', 'src': cover, 'size': 'sm'})
     progress = bar(position / duration if duration else 0)
-    detail = f'{status}  {timestamp(position)} / {timestamp(duration)}\n{progress}\n音量  {bar(volume, 8)}  {round(volume * 100)}%'
-    return [{'type': 'card', 'theme': 'secondary', 'size': 'lg', 'modules': [top, {
+    provider = {'netease': '网易云', 'qq': 'QQ音乐', 'qqmusic': 'QQ音乐', 'bilibili': 'Bilibili'}.get(extra.get('provider'), '网易云')
+    mode_label = {'order': '顺序播放', 'repeat-one': '单曲循环', 'shuffle': '随机播放'}.get(mode, '顺序播放')
+    detail = f'音源: {provider}  |  {mode_label}  |  音量: {round(volume * 100)}%\n{timestamp(position)}  {progress}  {timestamp(duration)}'
+    return [{'type': 'card', 'theme': 'info', 'size': 'sm', 'modules': [{
         'type': 'section', 'mode': 'right',
-        'text': {'type': 'plain-text', 'content': detail},
+        'text': {'type': 'plain-text', 'content': f'♫ 互联网垃圾桶 · {status}'},
         'accessory': {'type': 'button', 'theme': 'secondary', 'click': 'link',
                       'value': public_url.rstrip('/') + '/' + quote(str(channel), safe=''),
-                      'text': {'type': 'plain-text', 'content': '打开点歌台 ↗'}},
-    }]}]
+                      'text': {'type': 'plain-text', 'content': '网页面板 ↗'}},
+    }, top, {'type': 'context', 'elements': [{'type': 'plain-text', 'content': detail}]}]}]
 
 
 class KookAPI:
@@ -144,6 +147,7 @@ class ChannelCompanion:
             if track and track.get('start') and status in (kookvoice.Status.PLAYING, kookvoice.Status.PAUSE):
                 state['track'] = {**track, 'extra': dict(track.get('extra') or {})}
                 state['volume'] = kookvoice.guild_volume.get(guild, 0.4)
+                state['mode'] = kookvoice.guild_play_mode.get(guild, 'order')
                 if now >= state['card_at']:
                     state['card_at'] = now + 10
                     self.publish(state, '已暂停' if status == kookvoice.Status.PAUSE else '正在播放')
@@ -155,7 +159,7 @@ class ChannelCompanion:
     def publish(self, state, status):
         try:
             content = json.dumps(music_card(state['track'], state['volume'], status,
-                                           state['channel'], self.public_url), ensure_ascii=False)
+                                           state['channel'], self.public_url, state.get('mode', 'order')), ensure_ascii=False)
             if state['msg_id']:
                 self.api.call('POST', 'message/update', {'msg_id': state['msg_id'], 'content': content})
             else:

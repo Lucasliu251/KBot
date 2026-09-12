@@ -285,6 +285,22 @@ def apply_pcm_gain(pcm_data: bytes, gain: float) -> bytes:
     return samples.tobytes()
 
 
+def mix_pcm_frames(first, second, first_gain, second_gain):
+    """Mix little-endian stereo PCM before the shared volume ramp/Opus encoder."""
+    left, right = array('h'), array('h')
+    left.frombytes(first)
+    right.frombytes(second)
+    if sys.byteorder != 'little':
+        left.byteswap()
+        right.byteswap()
+    for index, sample in enumerate(left):
+        other = right[index] if index < len(right) else 0
+        left[index] = max(-32768, min(32767, round(sample * first_gain + other * second_gain)))
+    if sys.byteorder != 'little':
+        left.byteswap()
+    return left.tobytes()
+
+
 class PCMVolumeRamp:
     """在若干个 20ms 帧内平滑过渡音量，避免突变产生爆音。"""
 
@@ -980,6 +996,7 @@ class PlayHandler(threading.Thread):
     async def push(self):
         global playlist_handle_status
         playlist_handle_status[self.guild] = True
+        decoder_cleanup_tasks = set()
         try:
             await asyncio.sleep(1)
             if guild_status.get(self.guild) == Status.STOP:
@@ -1116,7 +1133,8 @@ class PlayHandler(threading.Thread):
                                 break
                         
                         if isinstance(music_info, dict) and 'file' in music_info:
-                            file = resolve_audio_source(music_info)
+                            # 已在混音中起播的缓存直接接棒；临时 URL 刷新留到续流时。
+                            file = (music_info.get('resolved_file') or music_info['file']) if music_info.get('_crossfade_bytes') else resolve_audio_source(music_info)
                             if not file:
                                 if log_enabled:
                                     logger.warning('无法解析歌曲播放地址，跳过当前歌曲')
@@ -1190,6 +1208,13 @@ class PlayHandler(threading.Thread):
                             cached_audio = cache_entry.get('data') if cache_entry else None
                             cache_complete = bool(cache_entry and cache_entry.get('complete'))
                             cached_duration = float(cache_entry.get('duration', 0)) if cache_entry else 0.0
+                            # 交叉段已送出的下一首采样不能重播，也不能重置渐入包络。
+                            cross_bytes = music_info.pop('_crossfade_bytes', 0) if cached_audio else 0
+                            cross_elapsed = cross_bytes / PCM_BYTES_PER_SECOND
+                            if cross_bytes:
+                                cached_audio = memoryview(cached_audio)[cross_bytes:]
+                                cached_duration -= cross_elapsed
+                                ss_value = float(ss_value) + cross_elapsed
                             continuation_offset = float(ss_value) + cached_duration
 
                             async def start_decoder(start_position):
@@ -1222,16 +1247,22 @@ class PlayHandler(threading.Thread):
                             decoder_buffer = None
                             continuation_started = False
 
-                            async def close_decoder():
+                            async def close_decoder(defer=False):
                                 """先停止后台读协程，再回收 FFmpeg，避免 stdout 读取任务泄漏。"""
                                 nonlocal p2, decoder_buffer
                                 old_buffer = decoder_buffer
                                 old_decoder = p2
                                 decoder_buffer = None
                                 p2 = None
-                                if old_buffer:
-                                    await old_buffer.close()
-                                await terminate_process(old_decoder)
+                                async def release(buffer, decoder):
+                                    if buffer:
+                                        await buffer.close()
+                                    await terminate_process(decoder)
+                                if defer and (old_buffer or old_decoder):
+                                    task = asyncio.create_task(release(old_buffer, old_decoder))
+                                    decoder_cleanup_tasks.add(task)
+                                else:
+                                    await release(old_buffer, old_decoder)
 
                             async def open_decoder(start_position):
                                 """启动持续预读的解码器；RTP 发送循环只消费内存缓冲。"""
@@ -1335,10 +1366,13 @@ class PlayHandler(threading.Thread):
                             source_audio_bytes_sent = 0
                             transition = get_transition_settings()
                             fade_length = cached_duration if cache_complete else expected_duration - float(ss_value)
-                            fade = TrackFade(transition['seconds'] if transition['enabled'] else 0, fade_length)
+                            fade = TrackFade(transition['seconds'] if transition['enabled'] else 0, fade_length + cross_elapsed)
+                            mixed_next = None
+                            mixed_cache = None
+                            mixed_bytes = 0
 
                             def end_for_skip(state):
-                                elapsed = source_audio_bytes_sent / PCM_BYTES_PER_SECOND
+                                elapsed = cross_elapsed + source_audio_bytes_sent / PCM_BYTES_PER_SECOND
                                 if state == Status.SKIP:
                                     current_info = play_list.get(self.guild, {}).get('now_playing')
                                     if (current_info is music_info and music_info.pop('_fade_out_requested', False)
@@ -1350,8 +1384,44 @@ class PlayHandler(threading.Thread):
                                 return fade.finished(elapsed)
 
                             async def send_song_frame(frame):
-                                elapsed = source_audio_bytes_sent / PCM_BYTES_PER_SECOND
-                                await send_transport_frame(frame, fade.gain(elapsed))
+                                nonlocal mixed_next, mixed_cache, mixed_bytes
+                                elapsed = cross_elapsed + source_audio_bytes_sent / PCM_BYTES_PER_SECOND
+                                end = fade.skip_start + fade.seconds if fade.skip_start is not None else fade.length
+                                queue = play_list.get(self.guild, {}).get('play_list', [])
+                                eligible = (transition.get('crossfade', False) and fade.seconds
+                                            and elapsed >= end - fade.seconds / 2)
+                                if (eligible and mixed_next is None and guild_play_mode.get(self.guild) == 'repeat-one'
+                                        and fade.skip_start is None):
+                                    replay = {key: value for key, value in music_info.items()
+                                              if key not in ('start', 'duration', '_fade_out_requested', '_crossfade_bytes')}
+                                    replay['ss'] = 0
+                                    with cache_lock:
+                                        repeat_cache = audio_cache.get(get_queue_item_cache_key(self.guild, replay))
+                                    if repeat_cache and len(repeat_cache.get('data', b'')) > (fade.seconds + 1) * PCM_BYTES_PER_SECOND:
+                                        queue.insert(0, replay)
+                                    else:
+                                        eligible = False
+                                if mixed_next is not None and (not queue or queue[0] is not mixed_next):
+                                    mixed_next.pop('_crossfade_bytes', None)
+                                    mixed_next = mixed_cache = None
+                                    mixed_bytes = 0
+                                if eligible and mixed_next is None and queue:
+                                    candidate = queue[0]
+                                    with cache_lock:
+                                        entry = audio_cache.get(get_queue_item_cache_key(self.guild, candidate))
+                                    # 只使用已完成预热的队首，不在实时发送线程启动网络请求。
+                                    if entry and len(entry.get('data', b'')) > (fade.seconds + 1) * PCM_BYTES_PER_SECOND:
+                                        mixed_next, mixed_cache = candidate, entry
+                                if mixed_next is not None:
+                                    next_frame = mixed_cache['data'][mixed_bytes:mixed_bytes + len(frame)]
+                                    length = float(mixed_cache.get('duration', 0)) if mixed_cache.get('complete') else float((mixed_next.get('extra') or {}).get('duration', 0)) - float(mixed_next.get('ss', 0))
+                                    next_fade = TrackFade(transition['seconds'], length)
+                                    output = mix_pcm_frames(frame, next_frame, fade.gain(elapsed), next_fade.gain(mixed_bytes / PCM_BYTES_PER_SECOND))
+                                    await send_transport_frame(output)
+                                    mixed_bytes += len(next_frame)
+                                    mixed_next['_crossfade_bytes'] = mixed_bytes
+                                else:
+                                    await send_transport_frame(frame, fade.gain(elapsed))
 
                             def current_media_position():
                                 return float(ss_value) + source_audio_bytes_sent / PCM_BYTES_PER_SECOND
@@ -1422,7 +1492,7 @@ class PlayHandler(threading.Thread):
                                     if end_for_skip(state):
                                         guild_status[self.guild] = Status.END
                                         skip_song = True
-                                        await close_decoder()
+                                        await close_decoder(defer=mixed_next is not None)
                                         break
                                     if state == Status.PAUSE:
                                         # 仅推进 RTP 传输时钟，不推进歌曲时钟或解码游标。
@@ -1491,7 +1561,7 @@ class PlayHandler(threading.Thread):
                                             if end_for_skip(state):
                                                 guild_status[self.guild] = Status.END
                                                 skip_song = True
-                                                await close_decoder()
+                                                await close_decoder(defer=mixed_next is not None)
                                                 break
                                             if state == Status.STOP:
                                                 if self.guild in play_list:
@@ -1568,7 +1638,7 @@ class PlayHandler(threading.Thread):
                                             except Exception as stderr_e:
                                                 logger.error(f'错误详情 - 读取编码器stderr失败: {stderr_e}')
                             finally:
-                                await close_decoder()
+                                await close_decoder(defer=mixed_next is not None)
                                 if cache_entry:
                                     with cache_lock:
                                         live_entry = audio_cache.get(cache_key)
@@ -1588,20 +1658,28 @@ class PlayHandler(threading.Thread):
                                     del history[:-50]
 
                                 mode = guild_play_mode.get(self.guild, 'order')
-                                if mode == 'repeat-one' and not skip_song:
+                                if mode == 'repeat-one' and not skip_song and mixed_next is None:
                                     replay_song = finished_song.copy()
                                     replay_song['ss'] = 0
                                     replay_song.pop('start', None)
                                     replay_song.pop('duration', None)
                                     play_list[self.guild]['play_list'].insert(0, replay_song)
                                 elif mode == 'shuffle' and len(play_list[self.guild]['play_list']) > 1:
-                                    random.shuffle(play_list[self.guild]['play_list'])
+                                    queue = play_list[self.guild]['play_list']
+                                    if mixed_next is None:
+                                        random.shuffle(queue)
+                                    else:
+                                        # 已开始混音的队首保持不动，其余歌曲继续随机排序。
+                                        remaining = queue[1:]
+                                        random.shuffle(remaining)
+                                        queue[1:] = remaining
 
                                 play_list[self.guild]['now_playing'] = None
                                 schedule_next_preload(self.guild)
                             
                             # 强制 GC 只允许发生在歌曲结束后的切换阶段，不能打断 RTP 热循环。
-                            run_transition_maintenance(self.guild)
+                            if mixed_next is None:
+                                run_transition_maintenance(self.guild)
                             
                             # 编码器保持到外层 3 秒冷却结束，期间新歌曲可直接复用连接。
                             if self.guild in play_list and len(play_list[self.guild]['play_list']) == 0:
@@ -1620,6 +1698,9 @@ class PlayHandler(threading.Thread):
         except Exception as e:
             if log_enabled:
                 logger.error(f'推流过程中出现错误: {str(e)}', exc_info=True)
+        finally:
+            if decoder_cleanup_tasks:
+                await asyncio.gather(*decoder_cleanup_tasks, return_exceptions=True)
 
     async def keepalive(self):
         while True:

@@ -108,12 +108,15 @@ class CompanionTests(unittest.TestCase):
         self.assertEqual(messages[0][1]['target_id'], 'voice-1')
         self.assertEqual(messages[1][1]['msg_id'], 'card-1')
         card = json.loads(messages[1][1]['content'])[0]
-        section = card['modules'][1]
-        self.assertIn('已暂停  0:30 / 3:00', section['text']['content'])
-        self.assertIn('40%', section['text']['content'])
+        section = card['modules'][0]
+        self.assertIn('已暂停', section['text']['content'])
+        detail = card['modules'][2]['elements'][0]['content']
+        self.assertIn('0:30', detail)
+        self.assertIn('3:00', detail)
+        self.assertIn('40%', detail)
         self.assertEqual(section['accessory']['value'], 'https://trashbox.tech/Music/voice-1')
         self.assertEqual(section['accessory']['type'], 'button')
-        self.assertEqual(len(card['modules']), 2)
+        self.assertEqual(len(card['modules']), 3)
 
     def test_disconnection_finishes_card_once(self):
         self.service.step()

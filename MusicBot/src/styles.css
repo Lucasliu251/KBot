@@ -679,6 +679,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .transition-toggle input:checked + span::after { transform: translateX(16px); }
 .transition-toggle input:focus-visible + span { outline: 2px solid var(--red); outline-offset: 3px; }
 .transition-settings-card { --provider-color: var(--red); }
+.transition-compact { display: flex; align-items: center; gap: 10px; font-size: 12px; white-space: nowrap; }
+.transition-compact .range-input { flex: 1; min-width: 40px; width: auto; margin: 0; }
+.transition-compact strong { color: var(--red); min-width: 28px; }
+.transition-settings-card.provider-settings-card { padding: 12px 14px; }
 .spin-once { animation: spin 460ms ease; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes fade-in { from { opacity: 0; } }
