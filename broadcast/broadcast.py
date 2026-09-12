@@ -3,8 +3,12 @@ import asyncio
 import aiohttp
 from khl import *
 from pathlib import Path
+import sys
 
-bot_token = '1/MzI4MDU=/k7tU+d3eOpsPrF5H1TK9Ug=='
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot_credentials import load_ini_token
+
+bot_token = load_ini_token(Path(__file__).with_name('config.ini'))
 bot = Bot(token=bot_token)
 
 

@@ -7,6 +7,10 @@ import aiohttp
 from urllib.parse import quote
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from bot_credentials import load_ini_token
 
 # 用 json 读取 config.json，装载到 config 里
 with (Path(__file__).resolve().parents[1] / 'config' / 'config.json').open('r', encoding='utf-8') as f:
@@ -14,7 +18,7 @@ with (Path(__file__).resolve().parents[1] / 'config' / 'config.json').open('r', 
 
 # init Bot
 KOOKtoken=config['token']
-bot = Bot('1/MzU0NTg=/UE3lb6btOJX4A1j/4uDNHg==') #测试机
+bot = Bot(load_ini_token(Path(__file__).with_name('config.ini'))) #测试机
 
 year, week, _ = datetime.now().isocalendar()
 

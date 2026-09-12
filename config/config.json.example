@@ -1,0 +1,8 @@
+{
+  "token": "your_wechat_monitor_bot_token_here",
+  "verify_token": "",
+  "encrypt_key": "",
+  "SPOTIPY_CLIENT_ID": "",
+  "SPOTIPY_CLIENT_SECRET": "",
+  "SPOTIPY_REDIRECT_URI": "http://localhost:8888/callback"
+}

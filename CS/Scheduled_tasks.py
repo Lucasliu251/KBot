@@ -13,6 +13,8 @@ from pathlib import Path
 
 CS_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = CS_DIR.parent
+sys.path.insert(0, str(PROJECT_DIR))
+from bot_credentials import load_ini_token
 DATA_DIR = CS_DIR / 'data'
 WEEK_DIR = DATA_DIR / 'week'
 # 默认指向同级仓库 TrashBox-Server/Backend；可用环境变量覆盖
@@ -77,7 +79,7 @@ def run_optional_script(script_path: Path, description: str) -> bool:
         return False
 year, week, _ = datetime.now().isocalendar()
 # 初始化Kook机器人
-bot = Bot(token='1/MzA5MDc=/lOziyhZw7gRaEn02qJfdeg==')
+bot = Bot(token=load_ini_token(CS_DIR / 'config.ini', 'Kook'))
 
 # 读取和解析数据文件
 def read_data_file(file_path):

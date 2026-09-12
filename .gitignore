@@ -1,6 +1,18 @@
 /CS/data
 
 /CS/config.ini
+/config/config.json
+/broadcast/config.ini
+/orderBot/config.ini
+
+# Local environment files, including backups and per-machine variants.
+.env
+.env.*
+!.env.example
+**/config.ini.*
+**/config.json.*
+!**/config.ini.example
+!**/config.json.example
 .serve.log
 .serve.pid
 .scheduled_tasks.lock
