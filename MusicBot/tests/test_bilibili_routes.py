@@ -6,6 +6,7 @@ from unittest.mock import patch
 from flask import Flask
 
 import routes
+import central_auth
 from routes import register_routes
 
 
@@ -15,6 +16,12 @@ class BilibiliRoutesTest(unittest.TestCase):
         app.config.update(TESTING=True, SECRET_KEY='bilibili-route-test')
         register_routes(app, object())
         self.client = app.test_client()
+        self.client.set_cookie('localhost', 'trashbox_session', 'test-session')
+        self.client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
+        payload = {'authenticated': True, 'user': {'id': 'user-1'}, 'csrf_token': 'test-csrf'}
+        patcher = patch.object(central_auth, 'read_session', return_value=payload)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_play_adds_resolved_bilibili_track_with_cover(self) -> None:
         captured = {}

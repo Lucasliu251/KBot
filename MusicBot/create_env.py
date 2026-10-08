@@ -12,9 +12,12 @@ changelog:
 from __future__ import annotations
 
 import os
+import secrets
 
 ENV_CONTENT = """# KOOK机器人配置
 MUSIC_BOT_TOKEN=your_music_bot_token_here
+# 仅本地认证 QA 使用 True/1；正常音乐服务保持 False。
+MUSIC_HTTP_ONLY=False
 
 # FFMPEG配置（可留空让程序从 macOS/Linux PATH 自动发现）
 FFMPEG_PATH=/usr/bin/ffmpeg
@@ -44,11 +47,11 @@ BILIBILI_EXTRACT_TIMEOUT=30
 BILIBILI_COOKIE_FILE=
 
 # Web控制台配置
-SECRET_KEY=change_this_to_a_random_string
-MUSIC_SETTINGS_TOKEN=change_this_to_another_random_string
-KOOK_OAUTH_CLIENT_ID=
-KOOK_OAUTH_CLIENT_SECRET=
-KOOK_OAUTH_REDIRECT_URI=https://your-domain.example/Music/api/auth/kook/callback
+SECRET_KEY=__GENERATED_FLASK_SECRET__
+MUSIC_SETTINGS_TOKEN=__GENERATED_MUSIC_SETTINGS_TOKEN__
+TRASHBOX_AUTH_SESSION_URL=http://127.0.0.1:2026/api/v1/auth/session
+TRASHBOX_LOGIN_URL=/login
+TRASHBOX_AUTH_FRONTEND_ORIGIN=
 MUSIC_SESSION_COOKIE_SECURE=False
 HOST=0.0.0.0
 PORT=8004
@@ -67,8 +70,11 @@ def create_env_file(target_path: str = ".env") -> str:
     if os.path.exists(target_path):
         raise FileExistsError(f"{target_path} 已存在，拒绝覆盖")
 
-    with open(target_path, "w", encoding="utf-8") as env_file:
-        env_file.write(ENV_CONTENT)
+    content = ENV_CONTENT.replace("__GENERATED_FLASK_SECRET__", secrets.token_urlsafe(32))
+    content = content.replace("__GENERATED_MUSIC_SETTINGS_TOKEN__", secrets.token_urlsafe(32))
+    descriptor = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as env_file:
+        env_file.write(content)
     return target_path
 
 

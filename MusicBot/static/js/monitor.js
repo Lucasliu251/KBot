@@ -178,6 +178,10 @@ class SystemMonitor {
         try {
             const response = await fetch(apiUrl('/api/system/status'));
             const data = await response.json();
+            if (response.status === 401 && data.login_required) {
+                window.location.assign(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+                return;
+            }
             
             if (data.success) {
                 this.updateMetrics(data);
@@ -297,6 +301,22 @@ class SystemMonitor {
         this.updateTerminalStatus('connecting');
         
         try {
+            const token = sessionStorage.getItem('musicSettingsToken') || '';
+            if (!token) throw new Error('请先在音乐后台的高级设置中输入管理密钥');
+            const validation = await fetch(apiUrl('/api/music/settings/unlock'), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': window.TRASHBOX_CSRF_TOKEN || '',
+                    'X-Music-Settings-Token': token,
+                },
+                body: JSON.stringify({}),
+            });
+            const validated = await validation.json();
+            if (!validation.ok || !validated.success) {
+                if (validation.status === 403) sessionStorage.removeItem('musicSettingsToken');
+                throw new Error(validated.error || '无法验证管理密钥，请重新解锁音乐后台');
+            }
             // 重置文件位置，从头开始读取
             this.lastFilePosition = 0;
             
@@ -320,9 +340,24 @@ class SystemMonitor {
 
     async fetchTerminalOutput() {
         try {
-            const response = await fetch(apiUrl(`/api/terminal/output?last_position=${this.lastFilePosition}`));
+            const response = await fetch(apiUrl(`/api/terminal/output?last_position=${this.lastFilePosition}`), {
+                headers: { 'X-Music-Settings-Token': sessionStorage.getItem('musicSettingsToken') || '' },
+            });
             const data = await response.json();
+            if (response.status === 401 && data.login_required) {
+                window.location.assign(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+                return;
+            }
             
+            if (response.status === 403) {
+                sessionStorage.removeItem('musicSettingsToken');
+                clearInterval(this.terminalUpdateInterval);
+                this.terminalUpdateInterval = null;
+                this.isTerminalConnected = false;
+                this.updateTerminalStatus('disconnected');
+                this.addTerminalLineDirect(data.error || '管理密钥已失效，请重新解锁音乐后台');
+                return;
+            }
             if (data.success) {
                 // 调试信息
                 console.log(`终端输出 - 文件大小: ${data.file_size}, 上次位置: ${this.lastFilePosition}, 新内容长度: ${data.output ? data.output.length : 0}`);
@@ -527,11 +562,16 @@ class SystemMonitor {
             const response = await fetch(apiUrl('/api/system/cleanup'), {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': window.TRASHBOX_CSRF_TOKEN || ''
                 }
             });
 
             const data = await response.json();
+            if (response.status === 401 && data.login_required) {
+                window.location.assign(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+                return;
+            }
             if (data.success) {
                 alert(`清理完成！\n清理前: ${data.details.cache_before} 个缓存项\n清理后: ${data.details.cache_after} 个缓存项\n实际清理: ${data.details.cache_cleared} 个缓存项\n释放了 ${data.details.memory_freed_mb} MB 内存`);
                 // 立即更新系统状态
@@ -557,12 +597,17 @@ class SystemMonitor {
             const response = await fetch(apiUrl('/api/system/cleanup/config'), {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': window.TRASHBOX_CSRF_TOKEN || ''
                 },
                 body: JSON.stringify({ threshold: newThreshold })
             });
 
             const data = await response.json();
+            if (response.status === 401 && data.login_required) {
+                window.location.assign(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+                return;
+            }
             if (data.success) {
                 alert(data.message);
                 // 立即更新系统状态
@@ -581,11 +626,16 @@ class SystemMonitor {
             const response = await fetch(apiUrl('/api/cache/test'), {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': window.TRASHBOX_CSRF_TOKEN || ''
                 }
             });
 
             const data = await response.json();
+            if (response.status === 401 && data.login_required) {
+                window.location.assign(`/login?return_to=${encodeURIComponent(window.location.pathname + window.location.search)}`);
+                return;
+            }
             if (data.success) {
                 alert(`测试缓存成功！\n${data.message}\n当前缓存数量: ${data.cache_count}`);
                 // 立即更新系统状态
@@ -620,3 +670,17 @@ $(window).on('beforeunload', () => {
         window.systemMonitor.destroy();
     }
 });
+
+
+// Monitoring polls never extend a session; visible navigation/interaction does.
+let lastSessionActivity = 0;
+async function recordSessionActivity() {
+    if (document.visibilityState !== 'visible' || !window.TRASHBOX_CSRF_TOKEN || Date.now() - lastSessionActivity < 60000) return;
+    lastSessionActivity = Date.now();
+    await fetch(apiUrl('/api/auth/activity'), {
+        method: 'POST', headers: { 'X-CSRF-Token': window.TRASHBOX_CSRF_TOKEN }
+    }).catch(() => {});
+}
+window.addEventListener('pointerdown', recordSessionActivity, { passive: true });
+window.addEventListener('keydown', recordSessionActivity, { passive: true });
+void recordSessionActivity();

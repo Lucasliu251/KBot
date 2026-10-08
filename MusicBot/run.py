@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import signal
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -24,11 +25,19 @@ logging.getLogger('werkzeug').setLevel(logging.ERROR)
 try:
     # 加载环境变量
     logger.info("正在加载环境变量...")
-    # 始终读取 MusicBot 自己的 .env，并覆盖父进程残留的旧机器人配置。
-    load_dotenv(dotenv_path=Path(__file__).with_name('.env'), override=True)
+    # Music 凭据来自自己的 .env；launcher 的监听地址和统一登录设置优先。
+    load_dotenv(dotenv_path=Path(__file__).with_name('.env'), override=False)
 
+    if os.environ.get("MUSIC_HTTP_ONLY", "False").lower() in ("true", "1", "yes", "on"):
+        logger.info("本机 HTTP/Socket QA 模式：跳过 KOOK Gateway 与音频连接")
     logger.info("正在启动本地网易云 API...")
     from local_netease_service import local_netease_service
+    def stop_music_service(signum, frame):
+        local_netease_service.stop()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_music_service)
+    signal.signal(signal.SIGINT, stop_music_service)
     local_netease_service.start()
 
     logger.info("正在初始化应用...")

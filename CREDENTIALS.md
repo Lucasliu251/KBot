@@ -5,14 +5,47 @@
 | 服务 | 本地文件 | 字段 | 模板 |
 | --- | --- | --- | --- |
 | 点歌机 | `MusicBot/.env` | `MUSIC_BOT_TOKEN` | `MusicBot/.env.example` |
-| CS 小助手与 GSI | `CS/config.ini` | `[Kook] Token` | `CS/config.ini.example` |
-| 微信监控 | `config/config.json` | `token` | `config/config.json.example` |
+| 数据榜单与 GSI | `.env` 优先，兼容 `CS/config.ini` | `DATA_BOT_TOKEN` / `[Kook] Token` | `.env.example` / `CS/config.ini.example` |
+| 主机器人常规功能 | `.env` 优先，兼容 `config/config.json` | `MAIN_BOT_TOKEN` / `token` | `.env.example` / `config/config.json.example` |
 | Broadcast | `broadcast/config.ini` | `[kook] Token` | `broadcast/config.ini.example` |
 | orderBot 测试机器人 | `orderBot/config.ini` | `[kook] Token` | `orderBot/config.ini.example` |
 
-MusicBot 的正常入口 `run.py` 明确从本目录加载 `.env`，覆盖同名的父进程环境变量。
+MusicBot 的正常入口 `run.py` 从本目录加载 `.env`；launcher 显式传入的监听地址和统一登录设置优先。音乐身份只读取 `MUSIC_BOT_TOKEN`，不会回退到主机器人 Token。
+主机器人与数据机器人分别使用根目录 `.env` 的 `MAIN_BOT_TOKEN` 和 `DATA_BOT_TOKEN`。GitBot 读取自己 `.env` 的 `MAIN_BOT_TOKEN`，共用主机器人身份。KOOK OAuth Client ID/Secret 只由 TrashBox Backend 管理。
 CS 和 Broadcast 不再从源码的硬编码值读取。不要把新密钥写回脚本、模板、日志或说明文档。
-orderBot 的测试机器人身份保持不变；它原本使用微信监控凭据发送部分 HTTP 请求的行为也未更改。
+orderBot 的测试机器人身份保持不变；其使用主机器人身份的 HTTP 请求也优先读取 `MAIN_BOT_TOKEN`，避免轮换后继续使用旧 JSON Token。
+
+## 本地与服务器启动职责
+
+Mac 的 TrashBox 根启动器管理网站、中央认证和 Music Web/音乐进程：
+
+```sh
+cd /Users/lucas/Develop/project/TrashBox
+./serve.sh start all
+# 只启动音乐：
+./serve.sh start music
+```
+
+该 `all` 不启动 KBot 主机器人和数据机器人。KBot 常规功能与 CS 榜单播报在独立 KBot 仓库中管理。
+Mac 调试这两个核心进程时，在 KBot 根目录用两个终端分别前台启动（依赖已安装时）：
+
+```sh
+./.venv/bin/python -u KBot.py
+# 另一个终端：
+./.venv/bin/python -u CS/Scheduled_tasks.py
+```
+
+Ubuntu 上海服务器的 KBot 启动器使用 Linux `setsid`，`main` 组包含主机器人和 CS 数据榜单进程：
+
+```sh
+cd /home/ubuntu/KBot
+./serve.sh start main
+./serve.sh start music
+./serve.sh status
+```
+
+Music 的统一会话接口由 TrashBox Backend 提供；根网站的启动器 `start all` 已负责中央认证、API 与 Music。
+以上命令是操作说明，不代表本轮已经启动或重启。将新凭据写入本地 `.env` 不会更新既有进程的环境；旧进程继续使用启动时读到的 Token，授权重启后才会加载新值。
 
 ## 更新服务器前
 

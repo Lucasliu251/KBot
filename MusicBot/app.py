@@ -75,7 +75,7 @@ app.wsgi_app = PrefixMiddleware(app.wsgi_app)
 # 尝试导入SocketIO，如果不可用则提供备用方案
 try:
     from flask_socketio import SocketIO, emit
-    socketio = SocketIO(app, cors_allowed_origins="*")
+    socketio = SocketIO(app)
     socketio_available = True
 except ImportError:
     logger.warning("flask_socketio未安装，将使用备用方案")
@@ -482,10 +482,14 @@ try:
 except ImportError:
     from routes import register_routes
 
-# 启动机器人线程
-bot_thread = threading.Thread(target=start_bot_loop)
-bot_thread.daemon = True
-bot_thread.start()
+# 正常启动音乐机器人；本地 QA 显式 HTTP_ONLY 时只初始化受保护的 Web/Socket 服务。
+bot_thread = None
+if not MUSIC_HTTP_ONLY:
+    bot_thread = threading.Thread(target=start_bot_loop)
+    bot_thread.daemon = True
+    bot_thread.start()
+else:
+    logger.info('MUSIC_HTTP_ONLY 已启用，KOOK Gateway 与音频连接保持关闭')
 
 def create_app():
     """
@@ -526,6 +530,7 @@ def debug():
             "playing_songs": playing_songs,
             "queued_songs": queued_songs,
             "token_valid": bool(BOT_TOKEN),
+            "music_http_only": MUSIC_HTTP_ONLY,
             "ffmpeg_path": os.path.exists(FFMPEG_PATH)
         })
     except Exception as e:

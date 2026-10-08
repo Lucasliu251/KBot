@@ -8,7 +8,7 @@ from unittest.mock import patch
 from flask import Flask
 
 import recommendation_service
-import recommendation_auth
+import central_auth
 import routes
 from routes import register_routes
 
@@ -24,20 +24,27 @@ class RecommendationRoutesTest(unittest.TestCase):
         app.config.update(TESTING=True, SECRET_KEY='recommendation-test-secret')
         register_routes(app, object())
         self.client = app.test_client()
+        self.auth = None
+        self.patcher = patch.object(central_auth, 'read_session', side_effect=lambda cookie: self.auth if cookie else None)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+        self.member = patch.object(central_auth, 'guild_member', side_effect=lambda payload, guild_id: guild_id == 'guild-1')
+        self.member.start()
+        self.addCleanup(self.member.stop)
 
     def tearDown(self) -> None:
         recommendation_service.DB_PATH = self.original_db_path
         self.temp_directory.cleanup()
 
     def _login(self) -> None:
-        with self.client.session_transaction() as session:
-            session['recommendation_user'] = {
-                'id': 'user-1',
-                'username': 'lucas',
-                'nickname': 'Lucas',
-                'avatar': '',
-            }
-            session['recommendation_guild_ids'] = ['guild-1']
+        self.auth = {
+            'authenticated': True,
+            'user': {'id': 'user-1', 'display_name': 'Lucas', 'avatar_url': '', 'alias_ids': []},
+            'identities': [{'provider': 'kook', 'subject': 'platform-user-1'}],
+            'csrf_token': 'test-csrf',
+        }
+        self.client.set_cookie('localhost', 'trashbox_session', 'test-session')
+        self.client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
 
     def test_login_membership_idempotency_and_withdrawal(self) -> None:
         track = {
@@ -91,39 +98,24 @@ class RecommendationRoutesTest(unittest.TestCase):
         empty_board = self.client.get('/api/recommendations?guild_id=guild-1')
         self.assertEqual(empty_board.get_json()['items'], [])
 
-    def test_oauth_state_return_path_and_session_identity(self) -> None:
-        with patch.object(recommendation_auth, 'authorization_url', return_value='https://www.kookapp.cn/oauth-test'):
-            start = self.client.get('/api/auth/kook/url?return_to=/Music/123')
+    def test_legacy_oauth_urls_use_central_login(self) -> None:
+        start = self.client.get('/api/auth/kook/url?return_to=/Music/123')
         self.assertEqual(start.status_code, 200)
-        with self.client.session_transaction() as session:
-            state = session['kook_oauth_state']
-            self.assertEqual(session['kook_oauth_return_to'], '/Music/123')
-
-        identity = {'id': 'oauth-user', 'username': 'OAuth', 'nickname': 'OAuth', 'avatar': ''}
-        with (
-            patch.object(recommendation_auth, 'exchange_code', return_value='short-lived-token'),
-            patch.object(recommendation_auth, 'fetch_identity', return_value=(identity, ['guild-1'])),
-        ):
-            callback = self.client.get(f'/api/auth/kook/callback?code=valid-code&state={state}')
+        self.assertEqual(start.get_json()['authorization_url'], '/login?return_to=%2FMusic%2F123')
+        callback = self.client.get('/api/auth/kook/callback?code=old-code&state=old-state')
         self.assertEqual(callback.status_code, 302)
-        self.assertTrue(callback.headers['Location'].endswith('/Music/123?oauth=success'))
+        self.assertTrue(callback.headers['Location'].endswith('/login?return_to=%2FMusic%2F'))
         with self.client.session_transaction() as session:
-            self.assertEqual(session['recommendation_user']['id'], 'oauth-user')
-            self.assertNotIn('short-lived-token', str(dict(session)))
+            self.assertNotIn('recommendation_user', session)
+            self.assertNotIn('kook_oauth_state', session)
 
-    def test_oauth_rejects_external_return_and_invalid_state(self) -> None:
-        with patch.object(recommendation_auth, 'authorization_url', return_value='https://www.kookapp.cn/oauth-test'):
-            self.client.get('/api/auth/kook/url?return_to=https://evil.example/steal')
-        with self.client.session_transaction() as session:
-            self.assertEqual(session['kook_oauth_return_to'], '/')
-
-        with patch.object(recommendation_auth, 'exchange_code') as exchange_code:
-            callback = self.client.get('/api/auth/kook/callback?code=valid-code&state=wrong-state')
-        self.assertEqual(callback.status_code, 302)
-        self.assertIn('/?oauth=error', callback.headers['Location'])
-        exchange_code.assert_not_called()
+    def test_login_redirect_restricts_return_to_to_music(self) -> None:
+        for value in ('https://evil.example/steal', '//evil.example/', '/account'):
+            response = self.client.get('/api/auth/kook/url', query_string={'return_to': value})
+            self.assertEqual(response.get_json()['authorization_url'], '/login?return_to=%2FMusic%2F')
 
     def test_network_latency_segments_are_independent(self) -> None:
+        self._login()
         class Response:
             status_code = 200
 

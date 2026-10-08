@@ -1,7 +1,8 @@
 
 // Authorization token that must have been created previously. See : https://developer.spotify.com/documentation/web-api/concepts/authorization
-const token = 'BQBCRL1TVF6KKfn6M2tD9k6dFaaIZlyxeQSTnLO21o-rhiKFUD1K6XQ2HS_ZjC32FP-58xG5zAHWGdvdaa5It0iswcEenqvmvgUsh1QwBgFpbW6nn4MCQiOwfArVwehn5IpB5dQAB0CCwRaf0BIdiMlxToUi-M6wMuN0MQ5JXlVKYTSUORv2rw4ADFzGxtc6MrEA2Pnwlya4AMDTHqseW3_4VfTOn-HCE3X51jIzDEt4Jlc31_9LG9YcKXFb4ER5FLBhYTtJ7R9Yft72J5VHfQoPt0dQ';
+const token = typeof process !== 'undefined' ? process.env.SPOTIFY_ACCESS_TOKEN || '' : '';
 async function fetchWebApi(endpoint, method, body) {
+  if (!token) throw new Error('SPOTIFY_ACCESS_TOKEN must be supplied by the server environment');
   const res = await fetch(`https://api.spotify.com/${endpoint}`, {
     headers: {
       Authorization: `Bearer ${token}`,

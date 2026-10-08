@@ -17,7 +17,7 @@ from bot_credentials import load_ini_token
 
 # API地址
 API_URL = os.getenv("GSI_API_URL", "http://127.0.0.1:3000/gsi")
-botoken = load_ini_token(PROJECT_DIR / 'CS' / 'config.ini', 'Kook')
+botoken = load_ini_token(PROJECT_DIR / 'CS' / 'config.ini', 'Kook', 'DATA_BOT_TOKEN')
 
 # 启动KOOK机器人并发送消息
 bot = Bot(token=botoken)  # 替换为你的KOOK机器人token

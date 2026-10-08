@@ -46,7 +46,7 @@ import {
   X,
 } from '@lucide/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { assetUrl, getJson, postAdminJson, postJson } from './api'
+import { assetUrl, getAdminJson, getJson, postAdminJson, postJson } from './api'
 import UserAvatar from './UserAvatar.vue'
 
 type PlayMode = 'order' | 'repeat-one' | 'shuffle'
@@ -203,6 +203,7 @@ const recommendationTotal = ref(0)
 const recommendationAuthUser = ref<RecommendationAuthUser | null>(null)
 const recommendationAuthConfigured = ref(false)
 const recommendationAuthLoading = ref(false)
+const recommendationIdentityConflicts = ref<{ title?: string; record_count: number }[]>([])
 const recommendationBusyKey = ref('')
 const recommendedKeys = ref<Set<string>>(new Set())
 const recentlyAddedKeys = ref<Set<string>>(new Set())
@@ -512,14 +513,14 @@ async function loadTerminalLogs() {
   const box = terminalLogBox.value
   const stickToBottom = !box || box.scrollHeight - box.scrollTop - box.clientHeight < 36
   try {
-    const data = await getJson<{ logs: MonitorLog[] }>('/api/logs?type=debug&lines=120')
+    const data = await getAdminJson<{ logs: MonitorLog[] }>('/api/logs?type=debug&lines=120', settingsToken.value)
     terminalLogs.value = data.logs ?? []
     if (stickToBottom) {
       await nextTick()
       if (terminalLogBox.value) terminalLogBox.value.scrollTop = terminalLogBox.value.scrollHeight
     }
   } catch (error) {
-    terminalLogsError.value = error instanceof Error ? error.message : '无法读取服务日志'
+    terminalLogsError.value = settingsFailure(error, '无法读取服务日志')
   } finally {
     terminalLogsLoading.value = false
   }
@@ -597,7 +598,12 @@ async function loadRecommendationAuth() {
       configured: boolean
       authenticated: boolean
       user?: RecommendationAuthUser
+      csrf_token?: string
+      record_conflicts?: { title?: string; record_count: number }[]
     }>('/api/auth/kook/status')
+    window.TRASHBOX_CSRF_TOKEN = data.csrf_token || ''
+    window.dispatchEvent(new Event('music-session-ready'))
+    recommendationIdentityConflicts.value = data.record_conflicts || []
     recommendationAuthConfigured.value = Boolean(data.configured)
     recommendationAuthUser.value = data.authenticated && data.user ? data.user : null
   } catch {
@@ -617,7 +623,7 @@ function oauthReturnPath() {
 
 async function beginRecommendationLogin(track?: ReturnType<typeof recommendationPayload>) {
   if (!recommendationAuthConfigured.value) {
-    notify('推荐登录尚未配置，请联系管理员配置 KOOK OAuth')
+    notify('推荐登录尚未配置，请联系管理员检查统一登录服务')
     return
   }
   if (track && guildId.value) {
@@ -630,17 +636,18 @@ async function beginRecommendationLogin(track?: ReturnType<typeof recommendation
     window.location.assign(data.authorization_url)
   } catch (error) {
     recommendationAuthLoading.value = false
-    notify(error instanceof Error ? error.message : '无法打开 KOOK 登录')
+    notify(error instanceof Error ? error.message : '无法打开 账号登录')
   }
 }
 
 async function logoutRecommendationUser() {
   try {
     await postJson('/api/auth/kook/logout', {})
+    window.location.assign(`/login?return_to=${encodeURIComponent(oauthReturnPath())}`)
     recommendationAuthUser.value = null
     recommendedKeys.value = new Set()
     await loadRecommendationBoard()
-    notify('已退出推荐身份')
+    notify('已退出登录')
   } catch (error) {
     notify(error instanceof Error ? error.message : '退出失败')
   }
@@ -723,7 +730,7 @@ async function setRecommendation(
   }
   if (!recommendationAuthUser.value) {
     if (active) await beginRecommendationLogin(payload)
-    else notify('请先使用 KOOK 登录')
+    else notify('请先使用 账号登录')
     return
   }
   const key = `${payload.provider}:${payload.id}`
@@ -769,14 +776,14 @@ async function selectRecommendationSort(sort: RecommendationSort) {
 async function finishRecommendationLoginReturn() {
   const url = new URL(window.location.href)
   const outcome = url.searchParams.get('oauth')
-  if (!outcome) return
+  if (!outcome && !sessionStorage.getItem('pendingMusicRecommendation')) return
   const message = url.searchParams.get('message') || ''
   url.searchParams.delete('oauth')
   url.searchParams.delete('message')
   window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
-  if (outcome !== 'success') {
+  if (outcome && outcome !== 'success') {
     sessionStorage.removeItem('pendingMusicRecommendation')
-    notify(message || 'KOOK 登录没有完成')
+    notify(message || '账号登录没有完成')
     return
   }
   await loadRecommendationAuth()
@@ -788,10 +795,10 @@ async function finishRecommendationLoginReturn() {
       if (pending.guild_id === guildId.value) await setRecommendation(pending.track, true)
       else notify('登录成功，请在原服务器重新推荐歌曲')
     } catch {
-      notify('KOOK 登录成功')
+      notify('账号登录成功')
     }
   } else {
-    notify('KOOK 登录成功')
+    notify('账号登录成功')
   }
 }
 
@@ -1214,6 +1221,7 @@ async function handlePopState() {
 }
 
 onMounted(async () => {
+  await loadRecommendationAuth()
   try {
     const data = await getJson<{ guilds: Guild[] }>('/api/guilds')
     guilds.value = data.guilds ?? []
@@ -1234,7 +1242,6 @@ onMounted(async () => {
     bootstrapping.value = false
     if (!current.value) lyricState.value = 'empty'
   }
-  await loadRecommendationAuth()
   await finishRecommendationLoginReturn()
   if (guildId.value) await loadRecommendationBoard()
   window.addEventListener('popstate', handlePopState)
@@ -2206,12 +2213,13 @@ async function removeQueuedTrack(track: Track, visualIndex: number) {
               <button :class="{ 'is-active': recommendationSort === 'popular' }" @click="selectRecommendationSort('popular')">人气</button>
             </div>
             <div class="recommendation-identity">
+              <span v-if="recommendationIdentityConflicts.length" :title="recommendationIdentityConflicts.map(item => item.title || '历史歌曲').join('、')">{{ recommendationIdentityConflicts.length }} 项历史记录有差异，已保留</span>
               <template v-if="recommendationAuthUser">
                 <UserAvatar :src="recommendationAuthUser.avatar" :name="recommendationAuthUser.nickname || recommendationAuthUser.username" />
                 <span>{{ recommendationAuthUser.nickname || recommendationAuthUser.username }}</span>
-                <button title="退出推荐身份" @click="logoutRecommendationUser"><LogOut :size="13" /></button>
+                <button title="退出互联网垃圾桶账号" @click="logoutRecommendationUser"><LogOut :size="13" /></button>
               </template>
-              <button v-else :disabled="recommendationAuthLoading || !recommendationAuthConfigured" :title="recommendationAuthConfigured ? '使用 KOOK 身份登录' : '管理员尚未配置 KOOK OAuth'" @click="beginRecommendationLogin()"><LogIn :size="14" />{{ recommendationAuthLoading ? '读取中' : recommendationAuthConfigured ? 'KOOK 登录' : '推荐未配置' }}</button>
+              <button v-else :disabled="recommendationAuthLoading || !recommendationAuthConfigured" :title="recommendationAuthConfigured ? '使用 互联网垃圾桶账号登录' : '管理员尚未配置 统一登录服务'" @click="beginRecommendationLogin()"><LogIn :size="14" />{{ recommendationAuthLoading ? '读取中' : recommendationAuthConfigured ? '账号登录' : '推荐未配置' }}</button>
             </div>
           </div>
         </section>

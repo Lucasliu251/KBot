@@ -12,6 +12,7 @@
     <div id="root"></div>
     <script>
       window.APP_BASE = {{ request.script_root|tojson }};
+      window.TRASHBOX_CSRF_TOKEN = {{ g.trashbox_auth.csrf_token|default('')|tojson }};
       window.MUSIC_CONSOLE_ASSET_BASE = {{ url_for('static', filename='music-console/assets')|tojson }};
       window.INITIAL_CHANNEL_ID = {{ initial_channel_id|default('')|tojson }};
     </script>

@@ -39,18 +39,15 @@ MUSIC_API_BASE=http://127.0.0.1:8005
 MUSIC_PRELOAD_SECONDS=600
 MUSIC_STREAM_BUFFER_SECONDS=45
 MUSIC_STARTUP_BUFFER_SECONDS=8
-KOOK_OAUTH_CLIENT_ID=你的_KOOK_OAuth_Client_ID
-KOOK_OAUTH_CLIENT_SECRET=你的_KOOK_OAuth_Client_Secret
-KOOK_OAUTH_REDIRECT_URI=https://你的域名/Music/api/auth/kook/callback
+TRASHBOX_AUTH_SESSION_URL=http://127.0.0.1:2026/api/v1/auth/session
+TRASHBOX_LOGIN_URL=/login
+TRASHBOX_AUTH_FRONTEND_ORIGIN=
 MUSIC_SESSION_COOKIE_SECURE=True
 ```
 
 机器人需要先被邀请进 KOOK 服务器，并拥有查看、加入目标语音频道的权限。服务器和语音频道会自动出现在网页选择器中，不需要把 ID 写进源码。
 
-“大家推荐”还需在 [KOOK 开发者中心](https://developer.kookapp.cn/) 为应用配置 OAuth2：
-将上面的回调地址加入允许列表，授权范围需要 `get_user_info` 和
-`get_user_guilds`。Client Secret 只放在服务器 `.env`，不要提交到 Git，也不要
-发送给浏览器。若 OAuth 尚未配置，用户仍可查看推荐榜和正常点歌，只是不能投票。
+“大家推荐”要求主站账号关联 KOOK，Music 会用音乐机器人检查服务器成员身份。主机器人 OAuth 的 Client ID、Client Secret 与回调只配置在 TrashBox Backend；Music 不再单独交换授权码。
 生产环境必须使用 HTTPS、随机的 `SECRET_KEY`，并设置
 `MUSIC_SESSION_COOKIE_SECURE=True`。
 
@@ -139,3 +136,28 @@ MUSIC_PUBLIC_URL=https://trashbox.tech/Music
 交接后继续消费下一首剩余的采样，不重播开头，也不重新预热。两首共用音量平滑和 RTP 编码器。
 关闭时恢复顺次淡出、淡入。没有下一首或队首缓存尚不足时自动退回普通过渡，不阻塞音频发送等待下载。
 交叉交接期间不强制 GC，旧解码器异步回收；维护会留到没有交叉接棒的切换阶段。
+
+
+## TrashBox 统一登录
+
+所有控制台页面、Music API 和 SocketIO 使用主站 `trashbox_session`，每次读取验证均不延长会话。
+`TRASHBOX_AUTH_SESSION_URL` 默认为本机 2026 端口的 `/api/v1/auth/session`；未登录返回主站 `/login?return_to=/Music/...`。
+写操作必须提供中央 `X-CSRF-Token`。只有用户实际在前台导航或交互时，页面才调用中央 activity 更新闲置时间。
+本机统一 launcher 设置 `TRASHBOX_AUTH_FRONTEND_ORIGIN=http://127.0.0.1:5175`，Music 代理同源的登录/账号/认证资源及 `/api/v1/web-auth/challenges*` 小程序二维码接口；生产由 Nginx 提供这些路径。
+推荐继续要求关联 KOOK 并通过音乐机器人的 `guild/user-list?filter_user_id=...` 验证服务器成员身份。
+历史推荐仅按中央服务验证过的 KOOK subject 和合并账号 alias_ids 关联；原 SQLite 行均保留，重复推荐按中央账号计数，归属冲突返回错误。
+`GET /healthz` 为不含账号或运行数据的本机启动探活接口。
+
+
+## 本机认证 QA 模式
+
+上海服务器音乐机器人仍运行时，本机可只验证统一登录、页面、API 和 SocketIO：
+
+```sh
+cd /Users/lucas/Develop/project/TrashBox
+MUSIC_HTTP_ONLY=1 ./serve.sh start all
+```
+
+开关由 launcher 继承，`run.py` 不覆盖它；缺省 False 保持正常音乐行为。
+该模式跳过 KOOK Gateway 线程和频道伴随服务，并让音频播放控制 API 返回明确的 QA 提示，避免测试点击启动新的语音连接。
+`/healthz` 的 `music_http_only` 字段用于确认测试模式；服务器正常运行时保持 False。

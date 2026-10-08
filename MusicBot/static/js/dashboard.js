@@ -82,7 +82,7 @@ function initializeApp() {
 // 初始化Socket.IO
 function initializeSocketIO() {
     if (typeof io !== 'undefined') {
-        socket = io({ path: `${appBase()}/socket.io` });
+        socket = io({ path: `${appBase()}/socket.io`, auth: { csrf_token: window.TRASHBOX_CSRF_TOKEN || '' } });
         
         socket.on('connect', function() {
             console.log('Socket.IO连接成功');

@@ -18,9 +18,11 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8004"))
 
 # MusicBot 独立使用的 KOOK 机器人 Token。
-# 保留 BOT_TOKEN 回退仅用于兼容旧部署；其它 KBot 功能不会读取本配置文件。
-MUSIC_BOT_TOKEN = os.environ.get("MUSIC_BOT_TOKEN") or os.environ.get("BOT_TOKEN", "")
+# 只接受 MUSIC_BOT_TOKEN，避免继承主机器人身份。
+MUSIC_BOT_TOKEN = os.environ.get("MUSIC_BOT_TOKEN", "")
 BOT_TOKEN = MUSIC_BOT_TOKEN
+# 仅本地 HTTP/Socket QA：不开 KOOK Gateway 或音频连接，生产默认关闭。
+MUSIC_HTTP_ONLY = os.environ.get("MUSIC_HTTP_ONLY", "False").lower() in ("true", "1", "yes", "on")
 
 # 下一首歌曲默认预解码 10 分钟。PCM 为 48kHz / 16-bit / stereo，约 110 MiB；
 # 每个频道仍然只预载队首下一首，不会把整个歌单同时放进内存。
@@ -82,15 +84,15 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "kook_web_music_secret_key")
 # 音乐账号设置后台的管理密钥；未单独配置时沿用 Flask SECRET_KEY。
 MUSIC_SETTINGS_TOKEN = os.environ.get("MUSIC_SETTINGS_TOKEN", "").strip() or SECRET_KEY
 
-# KOOK OAuth：用于识别“谁推荐了歌曲”，不与机器人 Token 混用。
-KOOK_OAUTH_CLIENT_ID = os.environ.get("KOOK_OAUTH_CLIENT_ID", "").strip()
-KOOK_OAUTH_CLIENT_SECRET = os.environ.get("KOOK_OAUTH_CLIENT_SECRET", "").strip()
-KOOK_OAUTH_REDIRECT_URI = os.environ.get("KOOK_OAUTH_REDIRECT_URI", "").strip()
-KOOK_OAUTH_AUTHORIZE_URL = os.environ.get(
-    "KOOK_OAUTH_AUTHORIZE_URL",
-    "https://www.kookapp.cn/app/oauth2/authorize",
-).strip()
-KOOK_OAUTH_SCOPES = "get_user_info get_user_guilds"
+# Music 使用主站登录；OAuth 客户端凭据仅由 TrashBox Backend 保管。
+TRASHBOX_AUTH_SESSION_URL = os.environ.get(
+    "TRASHBOX_AUTH_SESSION_URL", "http://127.0.0.1:2026/api/v1/auth/session"
+).rstrip("/")
+TRASHBOX_AUTH_API_BASE = TRASHBOX_AUTH_SESSION_URL.rsplit("/session", 1)[0]
+TRASHBOX_LOGIN_URL = os.environ.get("TRASHBOX_LOGIN_URL", "/login").strip() or "/login"
+# 仅本地 launcher 设置此值，让 :8004 上的登录/账号页面保持同源。
+TRASHBOX_AUTH_FRONTEND_ORIGIN = os.environ.get("TRASHBOX_AUTH_FRONTEND_ORIGIN", "").rstrip("/")
+
 MUSIC_SESSION_COOKIE_SECURE = os.environ.get(
     "MUSIC_SESSION_COOKIE_SECURE",
     "False",

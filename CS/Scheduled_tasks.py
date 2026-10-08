@@ -79,7 +79,7 @@ def run_optional_script(script_path: Path, description: str) -> bool:
         return False
 year, week, _ = datetime.now().isocalendar()
 # 初始化Kook机器人
-bot = Bot(token=load_ini_token(CS_DIR / 'config.ini', 'Kook'))
+bot = Bot(token=load_ini_token(CS_DIR / 'config.ini', 'Kook', 'DATA_BOT_TOKEN'))
 
 # 读取和解析数据文件
 def read_data_file(file_path):

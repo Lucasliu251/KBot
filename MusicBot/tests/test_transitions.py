@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 from flask import Flask
 import playback_settings as settings
 import routes
+import central_auth
 
 voice = importlib.import_module('kookvoice.kookvoice')
 
@@ -28,6 +29,12 @@ class TransitionTests(unittest.TestCase):
         app = Flask(__name__)
         routes.register_routes(app, object())
         client = app.test_client()
+        client.set_cookie('localhost', 'trashbox_session', 'test-session')
+        client.environ_base['HTTP_X_CSRF_TOKEN'] = 'test-csrf'
+        payload = {'authenticated': True, 'user': {'id': 'test-user'}, 'csrf_token': 'test-csrf'}
+        auth_patcher = patch.object(central_auth, 'read_session', return_value=payload)
+        auth_patcher.start()
+        self.addCleanup(auth_patcher.stop)
         with tempfile.TemporaryDirectory() as tmp, patch.object(settings, 'PATH', Path(tmp) / 'settings.json'), patch.object(settings, '_settings', dict(settings.DEFAULTS)), patch.object(routes, 'MUSIC_SETTINGS_TOKEN', 'test-only'):
             self.assertEqual(client.post('/api/music/transitions', json={'enabled':False,'seconds':12}).status_code,403)
             headers={'X-Music-Settings-Token':'test-only'}

@@ -10,14 +10,17 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from bot_credentials import load_ini_token
+from bot_credentials import load_ini_token, role_token
 
 # 用 json 读取 config.json，装载到 config 里
-with (Path(__file__).resolve().parents[1] / 'config' / 'config.json').open('r', encoding='utf-8') as f:
-    config = json.load(f)
+config_path = Path(__file__).resolve().parents[1] / 'config' / 'config.json'
+config = {}
+if config_path.is_file():
+    with config_path.open('r', encoding='utf-8') as f:
+        config = json.load(f)
 
 # init Bot
-KOOKtoken=config['token']
+KOOKtoken = role_token('MAIN_BOT_TOKEN', config.get('token', ''))
 bot = Bot(load_ini_token(Path(__file__).with_name('config.ini'))) #测试机
 
 year, week, _ = datetime.now().isocalendar()

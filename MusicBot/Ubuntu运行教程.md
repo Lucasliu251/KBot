@@ -133,9 +133,9 @@ MUSIC_API_BASE=http://127.0.0.1:8005
 # Web控制台配置
 SECRET_KEY=请替换为随机长字符串
 MUSIC_SETTINGS_TOKEN=请替换为另一个随机长字符串
-KOOK_OAUTH_CLIENT_ID=你的KOOK OAuth Client ID
-KOOK_OAUTH_CLIENT_SECRET=你的KOOK OAuth Client Secret
-KOOK_OAUTH_REDIRECT_URI=https://你的域名/Music/api/auth/kook/callback
+TRASHBOX_AUTH_SESSION_URL=http://127.0.0.1:2026/api/v1/auth/session
+TRASHBOX_LOGIN_URL=/login
+TRASHBOX_AUTH_FRONTEND_ORIGIN=
 MUSIC_SESSION_COOKIE_SECURE=True
 HOST=0.0.0.0
 PORT=8004
@@ -234,8 +234,8 @@ http://你的服务器IP:8004
 | NETEASE_API_PORT | 内置网易云API本机端口 | 8005 |
 | MUSIC_API_BASE | 网易云API基础URL | http://127.0.0.1:8005 |
 | SECRET_KEY | Web应用密钥 | 可自定义 |
-| KOOK_OAUTH_CLIENT_ID / SECRET | “大家推荐”的 KOOK OAuth 应用凭证 | 推荐功能需要 |
-| KOOK_OAUTH_REDIRECT_URI | KOOK OAuth 回调，需与开发者后台一致 | 推荐功能需要 |
+| TRASHBOX_AUTH_SESSION_URL | 主站会话校验接口 | http://127.0.0.1:2026/api/v1/auth/session |
+| TRASHBOX_LOGIN_URL | 未登录时跳转的主站登录入口 | /login |
 | MUSIC_SESSION_COOKIE_SECURE | 仅通过 HTTPS 发送登录会话 Cookie | 生产环境 True |
 | HOST | 服务器监听地址 | 0.0.0.0 |
 | PORT | MusicBot服务器端口 | 8004 |

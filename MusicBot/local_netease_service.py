@@ -78,6 +78,9 @@ class LocalNeteaseService:
         child_env = os.environ.copy()
         # sidecar 通过每个本机 HTTP 请求接收所需 Cookie，不需要继承其它机器人密钥。
         for secret_name in (
+            "MAIN_BOT_TOKEN",
+            "DATA_BOT_TOKEN",
+            "KOOK_OAUTH_CLIENT_SECRET",
             "BOT_TOKEN",
             "MUSIC_BOT_TOKEN",
             "MUSIC_SETTINGS_TOKEN",

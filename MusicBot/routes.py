@@ -1,4 +1,4 @@
-from flask import render_template, request, jsonify, redirect, url_for, Blueprint, abort, session
+from flask import render_template, request, jsonify, redirect, abort, g, Response
 import logging
 import asyncio
 import functools
@@ -13,7 +13,8 @@ from pathlib import Path
 import kookvoice
 from playback_settings import get_transition_settings, save_transition_settings
 import requests
-from config import BOT_TOKEN, MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN
+from config import (BOT_TOKEN, MUSIC_IDLE_DISCONNECT_SECONDS, MUSIC_SETTINGS_TOKEN, MUSIC_HTTP_ONLY,
+                    TRASHBOX_AUTH_API_BASE, TRASHBOX_AUTH_FRONTEND_ORIGIN)
 from utils import (
     search_music,
     search_music_page,
@@ -33,8 +34,7 @@ from utils import (
     MusicAPIError,
 )
 import threading
-import secrets
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlencode
 
 try:
     from . import qqmusic_service as qqmusic
@@ -47,9 +47,9 @@ except ImportError:
     import bilibili_service as bilibili
 
 try:
-    from . import recommendation_auth, recommendation_service
+    from . import central_auth, recommendation_service
 except ImportError:
-    import recommendation_auth
+    import central_auth
     import recommendation_service
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,90 @@ def run_async(coro):
 def register_routes(app, bot, socketio=None):
     """注册所有路由"""
 
+    @app.before_request
+    def require_trashbox_login():
+        # Public assets and the local auth proxy must remain available to login.
+        if (request.endpoint == 'static' or request.path == '/healthz'
+                or request.path == '/login' or request.path.startswith('/auth/')
+                or request.path.startswith('/api/v1/auth/')
+                or request.path.startswith('/api/v1/web-auth/')
+                or request.path in ('/api/auth/kook/status', '/api/auth/kook/url', '/api/auth/kook/callback')):
+            return None
+        try:
+            payload = central_auth.current_session()
+        except central_auth.AuthUnavailable as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 503
+        if not payload:
+            target = central_auth.login_url(central_auth.request_return_to())
+            if request.path.startswith('/api/') or request.path.startswith('/socket.io'):
+                return jsonify({'success': False, 'login_required': True, 'login_url': target,
+                                'error': '请先登录互联网垃圾桶'}), 401
+            return redirect(target)
+        if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+            if not central_auth.valid_csrf(payload, request.headers.get('X-CSRF-Token', '')):
+                return jsonify({'success': False, 'error': '登录校验已更新，请刷新页面后重试'}), 403
+        if MUSIC_HTTP_ONLY and request.path in {
+            '/api/join', '/api/leave', '/api/play', '/api/playlist', '/api/skip',
+            '/api/seek', '/api/volume', '/api/play-mode', '/api/previous',
+            '/api/queue/reorder', '/api/pause', '/api/resume', '/api/stop',
+            '/api/clear', '/api/remove',
+        }:
+            return jsonify({'success': False, 'error': '本机 HTTP QA 模式未启动 KOOK 音频连接，播放控制暂不可用'}), 503
+        return None
+
+    @app.route('/healthz')
+    def healthz():
+        return jsonify({'status': 'ok', 'music_http_only': MUSIC_HTTP_ONLY})
+
+    def proxy_auth(target):
+        if not TRASHBOX_AUTH_FRONTEND_ORIGIN:
+            abort(404)
+        headers = {key: request.headers[key] for key in ('Content-Type', 'X-CSRF-Token') if key in request.headers}
+        cookies = {name: request.cookies[name] for name in ('trashbox_session', 'trashbox_oauth', 'trashbox_qr') if name in request.cookies}
+        try:
+            upstream = requests.request(request.method, target, params=request.args,
+                                        data=request.get_data(), headers=headers, cookies=cookies,
+                                        timeout=8, allow_redirects=False)
+        except requests.RequestException:
+            return jsonify({'success': False, 'error': '统一登录服务暂时不可用'}), 503
+        response = Response(upstream.content, status=upstream.status_code)
+        for name in ('Content-Type', 'Cache-Control', 'Location'):
+            if name in upstream.headers:
+                response.headers[name] = upstream.headers[name]
+        # OAuth state/session cookies belong to the shared origin, never /Music.
+        for cookie in upstream.raw.headers.getlist('Set-Cookie'):
+            response.headers.add('Set-Cookie', cookie)
+        return response
+
+    @app.route('/login')
+    @app.route('/account')
+    def central_auth_page():
+        return proxy_auth(TRASHBOX_AUTH_FRONTEND_ORIGIN + request.path)
+
+    @app.route('/auth/<path:asset>')
+    def central_auth_asset(asset):
+        return proxy_auth(TRASHBOX_AUTH_FRONTEND_ORIGIN + '/auth/' + asset)
+
+    @app.route('/api/v1/auth/<path:action>', methods=['GET', 'POST', 'DELETE', 'OPTIONS'])
+    def central_auth_api(action):
+        return proxy_auth(TRASHBOX_AUTH_API_BASE + '/' + action)
+
+    @app.route('/api/v1/web-auth/<path:action>', methods=['GET', 'POST', 'OPTIONS'])
+    def central_web_auth_api(action):
+        return proxy_auth(TRASHBOX_AUTH_API_BASE.rsplit('/auth', 1)[0] + '/web-auth/' + action)
+
+    @app.route('/api/auth/activity', methods=['POST'])
+    def music_auth_activity():
+        # Called only on foreground navigation/user interaction, never a music poll.
+        try:
+            response = requests.post(TRASHBOX_AUTH_API_BASE + '/activity',
+                                     cookies={central_auth.COOKIE_NAME: request.cookies.get(central_auth.COOKIE_NAME, '')},
+                                     headers={'X-CSRF-Token': request.headers.get('X-CSRF-Token', '')},
+                                     timeout=4, allow_redirects=False)
+        except requests.RequestException:
+            return jsonify({'success': False, 'error': '统一登录服务暂时不可用'}), 503
+        return Response(status=response.status_code)
+
     def music_settings_required(view):
         """Protect credential-changing endpoints without exposing account secrets."""
         @functools.wraps(view)
@@ -172,80 +256,57 @@ def register_routes(app, bot, socketio=None):
             status = 502
         return jsonify({'success': False, 'error': str(exc)}), status
 
-    def safe_return_to(value):
-        raw = str(value or '/').strip()
-        parsed = urlsplit(raw)
-        if parsed.scheme or parsed.netloc or not parsed.path.startswith('/') or parsed.path.startswith('//'):
-            return '/'
-        return urlunsplit(('', '', parsed.path, parsed.query, ''))
-
-    def append_query(url, **values):
-        parsed = urlsplit(url)
-        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        query.update({key: str(value) for key, value in values.items()})
-        return urlunsplit(('', '', parsed.path, urlencode(query), ''))
-
     def recommendation_user():
-        value = session.get('recommendation_user')
-        return value if isinstance(value, dict) and value.get('id') else None
+        payload = central_auth.current_session()
+        user = central_auth.identity(payload)
+        if user:
+            # Alias claims are exact identities verified by the central service.
+            g.recommendation_conflicts = recommendation_service.claim_identity(
+                user, central_auth.verified_aliases(payload))
+        return user
 
     def render_console(channel_id=''):
         return render_template('dashboard.html', initial_channel_id=str(channel_id or ''))
 
     @app.route('/api/auth/kook/status', methods=['GET'])
     def kook_auth_status():
-        return jsonify({
-            'success': True,
-            'configured': recommendation_auth.oauth_configured(),
-            'authenticated': bool(recommendation_user()),
-            'user': recommendation_user(),
-        })
+        try:
+            payload = central_auth.current_session()
+            user = recommendation_user() if payload else None
+            return jsonify({
+                'success': True, 'configured': True, 'authenticated': bool(user), 'user': user,
+                'kook_linked': bool(central_auth.kook_subject(payload)),
+                'csrf_token': (payload or {}).get('csrf_token', ''),
+                'record_conflicts': getattr(g, 'recommendation_conflicts', []),
+            })
+        except recommendation_service.IdentityConflict as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 409
+        except central_auth.AuthUnavailable as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 503
 
     @app.route('/api/auth/kook/url', methods=['GET'])
     def kook_auth_url():
-        try:
-            state = recommendation_auth.new_state()
-            return_to = safe_return_to(request.args.get('return_to') or '/')
-            session['kook_oauth_state'] = state
-            session['kook_oauth_return_to'] = return_to
-            session.permanent = True
-            return jsonify({
-                'success': True,
-                'authorization_url': recommendation_auth.authorization_url(state),
-            })
-        except recommendation_auth.KookOAuthError as exc:
-            return jsonify({'success': False, 'error': str(exc)}), 503
+        return jsonify({'success': True, 'authorization_url': central_auth.login_url(request.args.get('return_to', ''))})
 
     @app.route('/api/auth/kook/callback', methods=['GET'])
     def kook_oauth_callback():
-        return_to = safe_return_to(session.pop('kook_oauth_return_to', '/'))
-        expected_state = str(session.pop('kook_oauth_state', '') or '')
-        supplied_state = str(request.args.get('state', '') or '')
-        code = str(request.args.get('code', '') or '')
-        error = str(request.args.get('error', '') or '')
-        if error:
-            return redirect(append_query(return_to, oauth='error', message=error))
-        if not expected_state or not supplied_state or not secrets.compare_digest(expected_state, supplied_state):
-            return redirect(append_query(return_to, oauth='error', message='OAuth state 校验失败'))
-        if not code:
-            return redirect(append_query(return_to, oauth='error', message='KOOK 未返回授权码'))
-        try:
-            token = recommendation_auth.exchange_code(code)
-            identity, guild_ids = recommendation_auth.fetch_identity(token)
-            recommendation_service.upsert_user(identity)
-            session['recommendation_user'] = identity
-            session['recommendation_guild_ids'] = guild_ids
-            session.permanent = True
-            return redirect(append_query(return_to, oauth='success'))
-        except Exception as exc:
-            logger.error('KOOK OAuth 登录失败: %s', exc)
-            return redirect(append_query(return_to, oauth='error', message='KOOK 登录失败'))
+        # Old bookmarks/callback configuration restart the central login flow.
+        return redirect(central_auth.login_url(request.args.get('return_to', '')))
 
     @app.route('/api/auth/kook/logout', methods=['POST'])
     def kook_auth_logout():
-        session.pop('recommendation_user', None)
-        session.pop('recommendation_guild_ids', None)
-        return jsonify({'success': True})
+        try:
+            upstream = requests.post(TRASHBOX_AUTH_API_BASE + '/logout',
+                                     cookies={central_auth.COOKIE_NAME: request.cookies.get(central_auth.COOKIE_NAME, '')},
+                                     headers={'X-CSRF-Token': request.headers.get('X-CSRF-Token', '')},
+                                     timeout=4, allow_redirects=False)
+        except requests.RequestException:
+            return jsonify({'success': False, 'error': '统一登录服务暂时不可用'}), 503
+        if upstream.status_code not in (200, 204):
+            return jsonify({'success': False, 'error': '退出登录失败'}), upstream.status_code
+        response = jsonify({'success': True, 'login_url': central_auth.login_url()})
+        response.delete_cookie(central_auth.COOKIE_NAME, path='/')
+        return response
 
     @app.route('/api/recommendations', methods=['GET'])
     def recommendation_board():
@@ -257,7 +318,10 @@ def register_routes(app, bot, socketio=None):
             offset = max(0, int(request.args.get('offset', 0)))
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': '分页参数无效'}), 400
-        user = recommendation_user() or {}
+        try:
+            user = recommendation_user() or {}
+        except recommendation_service.IdentityConflict as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 409
         result = recommendation_service.list_board(
             guild_id,
             viewer_user_id=str(user.get('id') or ''),
@@ -269,18 +333,28 @@ def register_routes(app, bot, socketio=None):
 
     @app.route('/api/recommendations/toggle', methods=['POST'])
     def recommendation_toggle():
-        user = recommendation_user()
+        try:
+            user = recommendation_user()
+        except recommendation_service.IdentityConflict as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 409
         if not user:
             return jsonify({
                 'success': False,
-                'error': '请先使用 KOOK 登录后推荐',
+                'error': '请先登录互联网垃圾桶后推荐',
                 'login_required': True,
             }), 401
         data = request.json or {}
         guild_id = str(data.get('guild_id', '') or '')
-        allowed_guilds = {str(item) for item in (session.get('recommendation_guild_ids') or [])}
-        if guild_id not in allowed_guilds:
-            return jsonify({'success': False, 'error': '你不在这个 KOOK 服务器中'}), 403
+        payload = central_auth.current_session()
+        if not central_auth.kook_subject(payload):
+            return jsonify({'success': False, 'identity_required': True,
+                            'account_url': '/account?' + urlencode({'return_to': central_auth.request_return_to()}),
+                            'error': '请在账号设置中关联 KOOK 后推荐'}), 403
+        try:
+            if not central_auth.guild_member(payload, guild_id):
+                return jsonify({'success': False, 'error': '你不在这个 KOOK 服务器中'}), 403
+        except central_auth.AuthUnavailable as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 503
         try:
             result = recommendation_service.toggle(
                 guild_id,
@@ -1480,6 +1554,7 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/logs', methods=['GET'])
+    @music_settings_required
     def get_logs():
         """获取日志信息"""
         try:
@@ -1563,6 +1638,7 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/logs/clear', methods=['POST'])
+    @music_settings_required
     def clear_logs():
         """清空日志文件"""
         try:
@@ -1662,6 +1738,7 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/terminal/output', methods=['GET'])
+    @music_settings_required
     def get_terminal_output():
         """获取终端输出"""
         try:
@@ -1713,6 +1790,7 @@ def register_routes(app, bot, socketio=None):
             return jsonify({'success': False, 'error': str(e)})
     
     @app.route('/api/terminal/command', methods=['POST'])
+    @music_settings_required
     def execute_terminal_command():
         """执行终端命令"""
         try:
@@ -1801,27 +1879,68 @@ def register_routes(app, bot, socketio=None):
     
     # 如果SocketIO可用，注册SocketIO事件
     if socketio:
+        from flask_socketio import join_room, leave_room
+        connected_sessions = {}
+        connection_lock = threading.Lock()
+
+        def watch_socket_session(sid, cookie):
+            while True:
+                socketio.sleep(30)
+                with connection_lock:
+                    if connected_sessions.get(sid) != cookie:
+                        return
+                try:
+                    valid = central_auth.read_session(cookie)
+                except central_auth.AuthUnavailable:
+                    valid = None
+                if not valid:
+                    socketio.server.disconnect(sid, namespace='/')
+                    with connection_lock:
+                        connected_sessions.pop(sid, None)
+                    return
+
         @socketio.on('connect')
-        def handle_connect():
-            logger.info('客户端已连接')
-        
+        def handle_connect(auth=None):
+            try:
+                payload = central_auth.current_session()
+            except central_auth.AuthUnavailable:
+                return False
+            if not central_auth.valid_csrf(payload, (auth or {}).get('csrf_token', '')):
+                return False
+            cookie = request.cookies.get(central_auth.COOKIE_NAME, '')
+            with connection_lock:
+                connected_sessions[request.sid] = cookie
+            socketio.start_background_task(watch_socket_session, request.sid, cookie)
+            logger.info('已登录客户端连接')
+
         @socketio.on('disconnect')
         def handle_disconnect():
-            logger.info('客户端已断开连接')
-        
+            with connection_lock:
+                connected_sessions.pop(request.sid, None)
+
+        def socket_authenticated():
+            try:
+                return bool(central_auth.current_session())
+            except central_auth.AuthUnavailable:
+                return False
+
         @socketio.on('join_room')
         def handle_join_room(data):
-            guild_id = data.get('guild_id')
+            if not socket_authenticated():
+                socketio.server.disconnect(request.sid, namespace='/')
+                return False
+            guild_id = str((data or {}).get('guild_id') or '')
             if guild_id:
-                socketio.join_room(guild_id)
-                logger.info(f'客户端加入房间: {guild_id}')
-        
+                join_room(guild_id)
+
         @socketio.on('leave_room')
         def handle_leave_room(data):
-            guild_id = data.get('guild_id')
+            if not socket_authenticated():
+                socketio.server.disconnect(request.sid, namespace='/')
+                return False
+            guild_id = str((data or {}).get('guild_id') or '')
             if guild_id:
-                socketio.leave_room(guild_id)
-                logger.info(f'客户端离开房间: {guild_id}')
+                leave_room(guild_id)
 
 # 辅助函数
 async def get_guild_list(bot):

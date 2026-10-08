@@ -2,8 +2,10 @@ import configparser
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+import os
 
-from bot_credentials import load_ini_token
+from bot_credentials import load_ini_token, role_token
 from scripts.check_kook_secrets import token_lines
 
 
@@ -39,6 +41,15 @@ class CredentialTests(unittest.TestCase):
             for index, path in enumerate(paths):
                 path.write_text(f'[kook]\nToken = dummy-{index}\n')
             self.assertEqual([load_ini_token(path) for path in paths], ['dummy-0', 'dummy-1'])
+
+    def test_role_environment_overrides_only_the_selected_role(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.ini'
+            path.write_text('[Kook]\nToken=legacy-data\n')
+            with patch.dict(os.environ, {'MAIN_BOT_TOKEN': 'dummy-main', 'DATA_BOT_TOKEN': 'dummy-data'}):
+                self.assertEqual(role_token('MAIN_BOT_TOKEN', 'legacy-main'), 'dummy-main')
+                self.assertEqual(load_ini_token(path, 'Kook', 'DATA_BOT_TOKEN'), 'dummy-data')
+                self.assertEqual(load_ini_token(path, 'Kook'), 'legacy-data')
 
     def test_secret_detection_and_non_token_control(self):
         # Assemble a synthetic format fixture, never a functioning credential.

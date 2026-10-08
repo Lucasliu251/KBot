@@ -6,6 +6,7 @@ declare global {
     APP_BASE?: string
     MUSIC_CONSOLE_ASSET_BASE?: string
     INITIAL_CHANNEL_ID?: string
+    TRASHBOX_CSRF_TOKEN?: string
   }
 }
 

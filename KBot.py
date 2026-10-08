@@ -18,13 +18,17 @@ from pathlib import Path
 
 
 
-# 用 json 读取 config.json，装载到 config 里
-with (Path(__file__).resolve().parent / 'config' / 'config.json').open('r', encoding='utf-8') as f:
-    config = json.load(f)
+# MAIN_BOT_TOKEN 来自根目录 .env；兼容此前未提交的本地 JSON 配置。
+config_path = Path(__file__).resolve().parent / 'config' / 'config.json'
+config = {}
+if config_path.is_file():
+    with config_path.open('r', encoding='utf-8') as f:
+        config = json.load(f)
 
 # init Bot
 # bot.run() 必须在全部 @bot.command 注册之后调用，见文件末尾。
-KOOKtoken=config['token']
+from bot_credentials import role_token
+KOOKtoken = role_token('MAIN_BOT_TOKEN', config.get('token', ''))
 bot = Bot(KOOKtoken)
 
 
